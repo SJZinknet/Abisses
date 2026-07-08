@@ -1,0 +1,24 @@
+name: Validation Python
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  syntax:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Vérifier la syntaxe
+        run: python -m py_compile gestion_bisses.py lancer_gestion_bisses.py publier_mise_a_jour.py

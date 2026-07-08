@@ -1,0 +1,31 @@
+# Données locales et données métier
+Gestion_Bisses_Data/
+Export_Platform/
+Export_JPG/
+_A_VERIFIER_AVANT_SUPPRESSION/
+_RAPPORTS_NETTOYAGE_GESTION_BISSES/
+category_migrations/
+*.local.json
+settings.local.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Sauvegardes ponctuelles
+*.bak
+*.tmp
+*_BACKUP_*/
+*_backup_*/

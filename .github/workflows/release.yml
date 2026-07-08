@@ -1,0 +1,38 @@
+name: Publication d'une version
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Préparer l'archive
+        run: |
+          mkdir -p package
+          cp gestion_bisses.py package/
+          cp lancer_gestion_bisses.py package/
+          cp installer_dependances.bat package/
+          cp lancer_gestion_bisses.bat package/
+          cp requirements.txt package/
+          cp README.md package/
+          cp VERSION package/
+          zip -r "gestion-bisses-${GITHUB_REF_NAME}.zip" package
+
+      - name: Créer la Release GitHub
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            "gestion-bisses-${GITHUB_REF_NAME}.zip" \
+            --generate-notes \
+            --title "Gestion Bisses ${GITHUB_REF_NAME}"
