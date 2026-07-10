@@ -9,6 +9,9 @@ import copy
 import shutil
 import sys
 import subprocess
+import tempfile
+import queue
+import threading
 import time
 import csv
 import tkinter as tk
@@ -32,11 +35,18 @@ class BisseManagerApp:
         self.root.minsize(1280, 760)
 
         # Données globales du logiciel
-        # Ces fichiers ne décrivent pas un bisse précis : ils restent donc
-        # à côté de gestion_bisses.py, dans Gestion_Bisses_Data/.
+        # GitHub contient le code. Le dossier Gestion_Bisses_Data peut être
+        # choisi librement par poste et son chemin est enregistré dans
+        # settings.local.json, ignoré par Git.
         self.app_folder = self.get_application_folder()
-        self.app_data_folder = os.path.join(self.app_folder, "Gestion_Bisses_Data")
+        self.default_app_data_folder = os.path.join(self.app_folder, "Gestion_Bisses_Data")
+        self.local_settings_path = os.path.join(self.app_folder, "settings.local.json")
+        self.app_data_folder = self.resolve_app_data_folder_at_startup()
         os.makedirs(self.app_data_folder, exist_ok=True)
+
+        # Infobulles légères, notamment pour les longs chemins de Mes bisses.
+        self.tooltip_window = None
+        self.tooltip_text = ""
 
         # Référentiel global des catégories de segments.
         self.segment_categories_file = os.path.join(
@@ -340,6 +350,78 @@ class BisseManagerApp:
             self.log_toggle_button.config(text="▲ Réduire le journal")
             self.log_visible_var.set(True)
 
+
+    def hide_text_tooltip(self, _event=None):
+        if getattr(self, "tooltip_window", None) is not None:
+            try:
+                self.tooltip_window.destroy()
+            except Exception:
+                pass
+        self.tooltip_window = None
+        self.tooltip_text = ""
+
+    def show_text_tooltip(self, text, x_root, y_root, wraplength=720):
+        text = str(text or "").strip()
+        if not text:
+            self.hide_text_tooltip()
+            return
+
+        if self.tooltip_window is not None and self.tooltip_text == text:
+            try:
+                self.tooltip_window.geometry(f"+{x_root + 18}+{y_root + 18}")
+            except Exception:
+                pass
+            return
+
+        self.hide_text_tooltip()
+        self.tooltip_text = text
+
+        tip = tk.Toplevel(self.root)
+        tip.wm_overrideredirect(True)
+        tip.wm_geometry(f"+{x_root + 18}+{y_root + 18}")
+        tip.attributes("-topmost", True)
+
+        frame = tk.Frame(tip, bg="#fff7d6", bd=1, relief="solid")
+        frame.pack(fill="both", expand=True)
+
+        tk.Label(
+            frame,
+            text=text,
+            justify="left",
+            anchor="w",
+            bg="#fff7d6",
+            fg="#222222",
+            padx=8,
+            pady=5,
+            wraplength=wraplength
+        ).pack()
+
+        self.tooltip_window = tip
+
+    def show_workspace_folder_tooltip(self, event, tree, entry_by_iid):
+        try:
+            row_id = tree.identify_row(event.y)
+            column_id = tree.identify_column(event.x)
+            columns = list(tree["columns"])
+            folder_column = f"#{columns.index('folder') + 1}"
+        except Exception:
+            self.hide_text_tooltip()
+            return
+
+        if not row_id or column_id != folder_column:
+            self.hide_text_tooltip()
+            return
+
+        entry = entry_by_iid.get(row_id, {})
+        folder = entry.get("folder", "")
+        if not folder:
+            self.hide_text_tooltip()
+            return
+
+        source_exists = os.path.isdir(folder)
+        text = folder if source_exists else f"{folder}\n\nDossier source introuvable sur cet ordinateur."
+        self.show_text_tooltip(text, event.x_root, event.y_root)
+
     def clear_main_frame(self):
         self.stop_swisstopo_auto_watch("photo")
         self.stop_swisstopo_auto_watch("gpx")
@@ -473,13 +555,259 @@ class BisseManagerApp:
         except Exception:
             return "."
 
+
+    # ============================================================
+    # DOSSIER LOCAL DES DONNÉES DU LOGICIEL
+    # ============================================================
+
+    def read_local_settings(self):
+        path = getattr(self, "local_settings_path", "")
+        if not path or not os.path.exists(path):
+            return {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def write_local_settings(self, data):
+        path = getattr(self, "local_settings_path", "")
+        if not path:
+            return
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            payload = data if isinstance(data, dict) else {}
+            payload["updated_at"] = datetime.now().isoformat(timespec="seconds")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False)
+        except Exception as exc:
+            try:
+                messagebox.showwarning(
+                    "Paramètres locaux",
+                    f"Impossible d'enregistrer settings.local.json :\n{exc}"
+                )
+            except Exception:
+                pass
+
+    def normalize_app_data_folder_choice(self, folder, create=False):
+        """
+        Normalise le choix utilisateur.
+
+        - Si l'utilisateur choisit directement un ancien Gestion_Bisses_Data,
+          on l'utilise tel quel.
+        - Si l'utilisateur choisit un dossier parent qui contient déjà
+          Gestion_Bisses_Data, on utilise ce sous-dossier.
+        - Pour une création, choisir un dossier parent crée
+          parent/Gestion_Bisses_Data.
+        """
+        if not folder:
+            return ""
+
+        folder = os.path.abspath(folder)
+        base = os.path.basename(folder).lower()
+
+        if base == "gestion_bisses_data":
+            return folder
+
+        child = os.path.join(folder, "Gestion_Bisses_Data")
+        if os.path.isdir(child):
+            return child
+
+        # Certains anciens dossiers peuvent avoir un autre nom mais contenir
+        # déjà la structure attendue.
+        markers = [
+            "bisses_workspace.json",
+            "segment_categories.json",
+            "projects",
+            "bisses_library.json",
+        ]
+        if any(os.path.exists(os.path.join(folder, marker)) for marker in markers):
+            return folder
+
+        if create:
+            return child
+
+        return folder
+
+    def is_app_data_folder_nonempty(self, folder):
+        if not folder or not os.path.isdir(folder):
+            return False
+        markers = [
+            "bisses_workspace.json",
+            "segment_categories.json",
+            "projects",
+            "bisses_library.json",
+            "category_migrations",
+        ]
+        return any(os.path.exists(os.path.join(folder, marker)) for marker in markers)
+
+    def choose_existing_app_data_folder(self):
+        initial = os.path.expanduser("~")
+        configured = self.read_local_settings().get("app_data_folder")
+        if configured and os.path.isdir(configured):
+            initial = configured
+
+        selected = filedialog.askdirectory(
+            title="Choisir l'ancien dossier Gestion_Bisses_Data",
+            initialdir=initial
+        )
+        if not selected:
+            return ""
+
+        return self.normalize_app_data_folder_choice(selected, create=False)
+
+    def choose_new_app_data_folder_parent(self):
+        selected = filedialog.askdirectory(
+            title="Choisir où créer Gestion_Bisses_Data",
+            initialdir=os.path.expanduser("~")
+        )
+        if not selected:
+            return ""
+
+        return self.normalize_app_data_folder_choice(selected, create=True)
+
+    def prompt_app_data_folder_at_startup(self):
+        """
+        Premier lancement v50 : ne crée plus silencieusement un dossier de
+        données près du code GitHub. L'utilisateur choisit explicitement entre
+        un ancien dossier existant et une nouvelle création.
+        """
+        default_folder = getattr(self, "default_app_data_folder", "") or os.path.join(
+            self.get_application_folder(),
+            "Gestion_Bisses_Data"
+        )
+
+        message = (
+            "Gestion Bisses doit choisir le dossier des données locales du logiciel.\n\n"
+            "Ces données ne sont pas le code GitHub : elles contiennent Mes bisses, "
+            "les projets, les catégories globales, la bibliothèque et les sauvegardes.\n\n"
+            "Voulez-vous utiliser un ancien dossier Gestion_Bisses_Data existant ?\n\n"
+            "Oui = choisir un dossier existant\n"
+            "Non = créer un nouveau Gestion_Bisses_Data\n"
+            "Annuler = utiliser le dossier par défaut près du logiciel"
+        )
+
+        answer = messagebox.askyesnocancel(
+            "Dossier des données Gestion Bisses",
+            message
+        )
+
+        if answer is True:
+            chosen = self.choose_existing_app_data_folder()
+            if chosen:
+                return chosen
+
+        elif answer is False:
+            chosen = self.choose_new_app_data_folder_parent()
+            if chosen:
+                os.makedirs(chosen, exist_ok=True)
+                return chosen
+
+        # Repli explicite et non destructeur.
+        os.makedirs(default_folder, exist_ok=True)
+        return default_folder
+
+    def resolve_app_data_folder_at_startup(self):
+        settings = self.read_local_settings()
+        configured = settings.get("app_data_folder", "")
+
+        if configured:
+            folder = os.path.abspath(os.path.expanduser(configured))
+            os.makedirs(folder, exist_ok=True)
+            return folder
+
+        folder = self.prompt_app_data_folder_at_startup()
+        folder = os.path.abspath(os.path.expanduser(folder))
+        os.makedirs(folder, exist_ok=True)
+
+        settings["app_data_folder"] = folder
+        settings["app_data_folder_chosen_at"] = datetime.now().isoformat(timespec="seconds")
+        self.write_local_settings(settings)
+        return folder
+
+    def switch_app_data_folder(self, folder, persist=True, refresh=True):
+        if not folder:
+            return False
+
+        folder = os.path.abspath(os.path.expanduser(folder))
+        os.makedirs(folder, exist_ok=True)
+
+        self.app_data_folder = folder
+        self.segment_categories_file = os.path.join(
+            self.app_data_folder,
+            "segment_categories.json"
+        )
+
+        if persist:
+            settings = self.read_local_settings()
+            settings["app_data_folder"] = folder
+            settings["app_data_folder_chosen_at"] = datetime.now().isoformat(timespec="seconds")
+            self.write_local_settings(settings)
+
+        self.ensure_global_segment_categories_file()
+
+        if refresh:
+            try:
+                self.refresh_global_category_interfaces()
+            except Exception:
+                pass
+            try:
+                if self.settings_window and self.settings_window.winfo_exists():
+                    self.settings_window.destroy()
+                    self.settings_window = None
+            except Exception:
+                pass
+            try:
+                self.show_workspace_home()
+            except Exception:
+                pass
+
+        return True
+
+    def choose_existing_app_data_folder_dialog(self):
+        chosen = self.choose_existing_app_data_folder()
+        if not chosen:
+            return
+
+        warning = ""
+        if not self.is_app_data_folder_nonempty(chosen):
+            warning = (
+                "\n\nAttention : ce dossier ne semble pas contenir de projets "
+                "Gestion Bisses existants."
+            )
+
+        if messagebox.askyesno(
+            "Changer le dossier des données",
+            (
+                f"Utiliser ce dossier pour les données locales du logiciel ?\n\n"
+                f"{chosen}{warning}\n\n"
+                "Le dossier actuel ne sera pas supprimé."
+            )
+        ):
+            self.switch_app_data_folder(chosen, persist=True, refresh=True)
+
+    def create_new_app_data_folder_dialog(self):
+        chosen = self.choose_new_app_data_folder_parent()
+        if not chosen:
+            return
+
+        if messagebox.askyesno(
+            "Créer un nouveau dossier de données",
+            (
+                f"Créer / utiliser ce nouveau dossier ?\n\n{chosen}\n\n"
+                "Le dossier actuel ne sera pas supprimé."
+            )
+        ):
+            self.switch_app_data_folder(chosen, persist=True, refresh=True)
+
     def get_app_data_path(self, filename):
         """
         Chemin d'un fichier global du logiciel.
         """
         folder = getattr(self, "app_data_folder", "")
         if not folder:
-            folder = os.path.join(self.get_application_folder(), "Gestion_Bisses_Data")
+            folder = self.resolve_app_data_folder_at_startup()
             self.app_data_folder = folder
         os.makedirs(folder, exist_ok=True)
         return os.path.join(folder, filename)
@@ -2516,11 +2844,40 @@ class BisseManagerApp:
             fg="#555555"
         ).pack(fill="x", pady=(6, 12))
 
+        row = tk.Frame(info_tab)
+        row.pack(fill="x", pady=(0, 10))
+
         tk.Button(
-            info_tab,
+            row,
             text="📂 Ouvrir Gestion_Bisses_Data",
             command=self.open_app_data_folder
-        ).pack(anchor="w")
+        ).pack(side="left", padx=(0, 6))
+
+        tk.Button(
+            row,
+            text="🔗 Utiliser un dossier existant",
+            command=self.choose_existing_app_data_folder_dialog
+        ).pack(side="left", padx=6)
+
+        tk.Button(
+            row,
+            text="➕ Créer un nouveau dossier",
+            command=self.create_new_app_data_folder_dialog
+        ).pack(side="left", padx=6)
+
+        tk.Label(
+            info_tab,
+            text=(
+                "Recommandation : garder GitHub pour le code seulement, et utiliser "
+                "un Gestion_Bisses_Data local stable, par exemple l'ancien dossier "
+                "qui contient déjà vos projets et catégories. Le dossier actuel n'est "
+                "jamais supprimé lors d'un changement."
+            ),
+            justify="left",
+            anchor="w",
+            wraplength=820,
+            fg="#666666"
+        ).pack(fill="x", pady=(16, 0))
 
         tk.Label(
             info_tab,
@@ -5620,43 +5977,594 @@ class BisseManagerApp:
                 candidates.append(os.path.abspath(path))
         return candidates
 
-    def add_multiple_bisse_folders_to_workspace_dialog(self):
-        """
-        Ajoute en une fois plusieurs dossiers bisses à Mes bisses.
-        L'utilisateur choisit un dossier parent ; le logiciel propose ensuite
-        les sous-dossiers détectés.
-        """
-        parent = filedialog.askdirectory(
-            title="Choisir le dossier parent contenant plusieurs dossiers bisses",
-            initialdir=self.get_default_collection_root()
+
+    def ask_multiple_directories_windows(self, title, initialdir=None):
+        '''
+        Sélecteur Windows natif permettant la sélection multiple de dossiers.
+
+        tkinter.filedialog.askdirectory ne sait pas sélectionner plusieurs
+        dossiers. Sous Windows, on passe donc par IFileOpenDialog avec les
+        options FOS_PICKFOLDERS + FOS_ALLOWMULTISELECT, appelé dans un petit
+        script PowerShell temporaire. Retourne :
+        - list[str] si la fenêtre fonctionne, même liste vide si annulé ;
+        - None si la méthode Windows échoue, afin de déclencher le repli.
+        '''
+        if os.name != "nt":
+            return None
+
+        powershell = (
+            shutil.which("powershell.exe")
+            or shutil.which("powershell")
         )
-        if not parent:
+        if not powershell:
+            return None
+
+        initialdir = initialdir or self.get_default_collection_root() or self.app_folder
+        initialdir = os.path.abspath(initialdir) if initialdir else ""
+
+        ps_script = r'''
+param(
+    [string]$Title,
+    [string]$InitialDirectory
+)
+
+$ErrorActionPreference = "Stop"
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$OutputEncoding = [Console]::OutputEncoding
+
+Add-Type -Language CSharp -TypeDefinition @"
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+
+namespace GestionBissesFolderPicker
+{
+    [ComImport]
+    [Guid("DC1C5A9C-E88A-4DDE-A5A1-60F82A20AEF7")]
+    public class FileOpenDialog
+    {
+    }
+
+    [StructLayout(LayoutKind.Sequential, Pack = 4)]
+    public struct PROPERTYKEY
+    {
+        public Guid fmtid;
+        public uint pid;
+    }
+
+    [ComImport]
+    [Guid("43826D1E-E718-42EE-BC55-A1E261C37BFE")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface IShellItem
+    {
+        void BindToHandler(IntPtr pbc, ref Guid bhid, ref Guid riid, out IntPtr ppv);
+        void GetParent(out IShellItem ppsi);
+        void GetDisplayName(uint sigdnName, out IntPtr ppszName);
+        void GetAttributes(uint sfgaoMask, out uint psfgaoAttribs);
+        void Compare(IShellItem psi, uint hint, out int piOrder);
+    }
+
+    [ComImport]
+    [Guid("B63EA76D-1F85-456F-A19C-48159EFA858B")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface IShellItemArray
+    {
+        void BindToHandler(IntPtr pbc, ref Guid bhid, ref Guid riid, out IntPtr ppvOut);
+        void GetPropertyStore(int flags, ref Guid riid, out IntPtr ppv);
+        void GetPropertyDescriptionList(ref PROPERTYKEY keyType, ref Guid riid, out IntPtr ppv);
+        void GetAttributes(uint AttribFlags, uint sfgaoMask, out uint psfgaoAttribs);
+        void GetCount(out uint pdwNumItems);
+        void GetItemAt(uint dwIndex, out IShellItem ppsi);
+        void EnumItems(out IntPtr ppenumShellItems);
+    }
+
+    [ComImport]
+    [Guid("D57C7288-D4AD-4768-BE02-9D969532D960")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface IFileOpenDialog
+    {
+        [PreserveSig]
+        int Show(IntPtr parent);
+
+        void SetFileTypes(uint cFileTypes, IntPtr rgFilterSpec);
+        void SetFileTypeIndex(uint iFileType);
+        void GetFileTypeIndex(out uint piFileType);
+        void Advise(IntPtr pfde, out uint pdwCookie);
+        void Unadvise(uint dwCookie);
+        void SetOptions(uint fos);
+        void GetOptions(out uint pfos);
+        void SetDefaultFolder(IShellItem psi);
+        void SetFolder(IShellItem psi);
+        void GetFolder(out IShellItem ppsi);
+        void GetCurrentSelection(out IShellItem ppsi);
+        void SetFileName([MarshalAs(UnmanagedType.LPWStr)] string pszName);
+        void GetFileName([MarshalAs(UnmanagedType.LPWStr)] out string pszName);
+        void SetTitle([MarshalAs(UnmanagedType.LPWStr)] string pszTitle);
+        void SetOkButtonLabel([MarshalAs(UnmanagedType.LPWStr)] string pszText);
+        void SetFileNameLabel([MarshalAs(UnmanagedType.LPWStr)] string pszLabel);
+        void GetResult(out IShellItem ppsi);
+        void AddPlace(IShellItem psi, uint fdap);
+        void SetDefaultExtension([MarshalAs(UnmanagedType.LPWStr)] string pszDefaultExtension);
+        void Close(int hr);
+        void SetClientGuid(ref Guid guid);
+        void ClearClientData();
+        void SetFilter(IntPtr pFilter);
+        void GetResults(out IShellItemArray ppenum);
+        void GetSelectedItems(out IShellItemArray ppsai);
+    }
+
+    public static class NativeMethods
+    {
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode, PreserveSig = false)]
+        public static extern void SHCreateItemFromParsingName(
+            string pszPath,
+            IntPtr pbc,
+            [MarshalAs(UnmanagedType.LPStruct)] Guid riid,
+            out IShellItem ppv
+        );
+    }
+
+    public static class FolderPicker
+    {
+        const uint FOS_PICKFOLDERS = 0x00000020;
+        const uint FOS_FORCEFILESYSTEM = 0x00000040;
+        const uint FOS_ALLOWMULTISELECT = 0x00000200;
+        const uint FOS_PATHMUSTEXIST = 0x00000800;
+        const uint FOS_NOCHANGEDIR = 0x00000008;
+        const uint SIGDN_FILESYSPATH = 0x80058000;
+        const int ERROR_CANCELLED = unchecked((int)0x800704C7);
+
+        public static string[] Pick(string title, string initialDirectory)
+        {
+            IFileOpenDialog dialog = null;
+            IShellItemArray results = null;
+            List<string> paths = new List<string>();
+
+            try
+            {
+                dialog = (IFileOpenDialog)new FileOpenDialog();
+
+                uint options;
+                dialog.GetOptions(out options);
+                dialog.SetOptions(
+                    options
+                    | FOS_PICKFOLDERS
+                    | FOS_ALLOWMULTISELECT
+                    | FOS_FORCEFILESYSTEM
+                    | FOS_PATHMUSTEXIST
+                    | FOS_NOCHANGEDIR
+                );
+
+                if (!String.IsNullOrWhiteSpace(title))
+                {
+                    dialog.SetTitle(title);
+                }
+
+                if (!String.IsNullOrWhiteSpace(initialDirectory) && System.IO.Directory.Exists(initialDirectory))
+                {
+                    Guid shellItemGuid = typeof(IShellItem).GUID;
+                    IShellItem folder;
+                    NativeMethods.SHCreateItemFromParsingName(
+                        initialDirectory,
+                        IntPtr.Zero,
+                        shellItemGuid,
+                        out folder
+                    );
+                    dialog.SetFolder(folder);
+                    Marshal.ReleaseComObject(folder);
+                }
+
+                int hr = dialog.Show(IntPtr.Zero);
+                if (hr == ERROR_CANCELLED)
+                {
+                    return new string[0];
+                }
+                if (hr != 0)
+                {
+                    Marshal.ThrowExceptionForHR(hr);
+                }
+
+                dialog.GetResults(out results);
+
+                uint count;
+                results.GetCount(out count);
+
+                for (uint i = 0; i < count; i++)
+                {
+                    IShellItem item;
+                    results.GetItemAt(i, out item);
+
+                    IntPtr rawPath = IntPtr.Zero;
+                    try
+                    {
+                        item.GetDisplayName(SIGDN_FILESYSPATH, out rawPath);
+                        string path = Marshal.PtrToStringUni(rawPath);
+                        if (!String.IsNullOrWhiteSpace(path))
+                        {
+                            paths.Add(path);
+                        }
+                    }
+                    finally
+                    {
+                        if (rawPath != IntPtr.Zero)
+                        {
+                            Marshal.FreeCoTaskMem(rawPath);
+                        }
+                        if (item != null)
+                        {
+                            Marshal.ReleaseComObject(item);
+                        }
+                    }
+                }
+
+                return paths.ToArray();
+            }
+            finally
+            {
+                if (results != null)
+                {
+                    Marshal.ReleaseComObject(results);
+                }
+                if (dialog != null)
+                {
+                    Marshal.ReleaseComObject(dialog);
+                }
+            }
+        }
+    }
+}
+"@
+
+[GestionBissesFolderPicker.FolderPicker]::Pick($Title, $InitialDirectory) | ForEach-Object {
+    [Console]::WriteLine($_)
+}
+'''
+
+        script_path = ""
+        try:
+            fd, script_path = tempfile.mkstemp(
+                suffix="_gestion_bisses_multi_folders.ps1",
+                text=True
+            )
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(ps_script)
+
+            command = [
+                powershell,
+                "-NoProfile",
+                "-STA",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                script_path,
+                "-Title",
+                title or "Choisir un ou plusieurs dossiers bisses",
+                "-InitialDirectory",
+                initialdir
+            ]
+
+            result = subprocess.run(
+                command,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                capture_output=True,
+                check=False
+            )
+
+            if result.returncode != 0:
+                return None
+
+            folders = []
+            seen = set()
+            for line in (result.stdout or "").splitlines():
+                folder = line.strip()
+                if not folder or not os.path.isdir(folder):
+                    continue
+                folder_abs = os.path.abspath(folder)
+                key = os.path.normcase(folder_abs)
+                if key in seen:
+                    continue
+                seen.add(key)
+                folders.append(folder_abs)
+
+            return folders
+
+        except Exception:
+            return None
+
+        finally:
+            if script_path and os.path.exists(script_path):
+                try:
+                    os.remove(script_path)
+                except Exception:
+                    pass
+
+    def ask_multiple_directories(self, title, initialdir=None):
+        '''
+        Boîte de dialogue pour choisir plusieurs dossiers.
+
+        - Windows : vraie sélection multiple dans l'explorateur.
+        - Repli : sélection d'un seul dossier, comme avant.
+        '''
+        selected = self.ask_multiple_directories_windows(title, initialdir)
+        if selected is not None:
+            return selected
+
+        folder = filedialog.askdirectory(
+            title=title,
+            initialdir=initialdir or self.get_default_collection_root()
+        )
+        return [os.path.abspath(folder)] if folder else []
+
+    def build_workspace_candidates_from_selected_folders(self, selected_folders):
+        '''
+        Convertit la sélection de l'utilisateur en dossiers bisses à proposer.
+
+        Si un dossier sélectionné ressemble déjà à un dossier bisse, on le garde.
+        Sinon, on inspecte ses sous-dossiers immédiats, ce qui conserve l'ancien
+        comportement « choisir un dossier parent ».
+        '''
+        candidates = []
+        seen = set()
+
+        for folder in selected_folders or []:
+            if not folder or not os.path.isdir(folder):
+                continue
+
+            folder_abs = os.path.abspath(folder)
+            children = self.find_bisse_folders_in_parent(folder_abs)
+
+            if self.looks_like_bisse_folder(folder_abs):
+                proposed = [folder_abs]
+            elif children:
+                proposed = children
+            else:
+                # Sélection directe d'un dossier encore vide ou non initialisé.
+                proposed = [folder_abs]
+
+            for candidate in proposed:
+                candidate_abs = os.path.abspath(candidate)
+                key = os.path.normcase(candidate_abs)
+                if key in seen:
+                    continue
+                seen.add(key)
+                candidates.append(candidate_abs)
+
+        candidates.sort(
+            key=lambda path: (
+                self.get_bisse_summary_from_folder(path).get("title", "")
+                or os.path.basename(path)
+            ).lower()
+        )
+        return candidates
+
+
+    def add_folders_to_workspace_bulk(self, folders, show_summary=True):
+        """
+        Ajoute vraiment les dossiers à Mes bisses, puis vérifie que chaque
+        chemin sélectionné est présent dans bisses_workspace.json.
+
+        Cette étape évite que la sélection multiple s'arrête à la fenêtre de
+        choix des dossiers sans persister la liste.
+        """
+        folders = [os.path.abspath(folder) for folder in (folders or []) if folder and os.path.isdir(folder)]
+
+        if not folders:
+            if show_summary:
+                messagebox.showwarning("Mes bisses", "Aucun dossier valide à ajouter.")
+            return 0, []
+
+        added = 0
+        failures = []
+
+        for folder in folders:
+            try:
+                self.add_folder_to_workspace(folder)
+                added += 1
+            except Exception as exc:
+                failures.append((folder, str(exc)))
+                self.log(f"❌ Ajout impossible dans Mes bisses : {folder} — {exc}")
+
+        # Vérification / réparation directe de la liste workspace.
+        # Normalement add_folder_to_workspace suffit. Ce bloc garantit au moins
+        # une entrée par dossier sélectionné si un cas limite a empêché la
+        # création du project_id.
+        workspace = self.read_workspace()
+        bisses = workspace.setdefault("bisses", [])
+        now = datetime.now().isoformat(timespec="seconds")
+
+        existing_folders = {
+            os.path.normcase(os.path.abspath(entry.get("folder", "")))
+            for entry in bisses
+            if entry.get("folder")
+        }
+
+        repaired = 0
+        for folder in folders:
+            key = os.path.normcase(os.path.abspath(folder))
+            if key in existing_folders:
+                continue
+
+            bisses.append({
+                "project_id": "",
+                "folder": os.path.abspath(folder),
+                "first_opened_at": now,
+                "last_opened_at": now
+            })
+            existing_folders.add(key)
+            repaired += 1
+
+        if repaired:
+            self.write_workspace(workspace)
+            self.log(f"🛠️ {repaired} entrée(s) Mes bisses réparée(s) après ajout multiple.")
+
+        # Rafraîchissement explicite de l'accueil.
+        try:
+            self.show_workspace_home()
+        except Exception as exc:
+            self.log(f"⚠️ Rafraîchissement Mes bisses impossible : {exc}")
+
+        if show_summary:
+            if failures:
+                details = "\n".join(f"• {folder}\n  {error}" for folder, error in failures[:8])
+                if len(failures) > 8:
+                    details += f"\n… {len(failures) - 8} autre(s) erreur(s)"
+                messagebox.showwarning(
+                    "Ajout partiel",
+                    (
+                        f"{added} dossier(s) ajouté(s) ou mis à jour.\n"
+                        f"{len(failures)} échec(s).\n\n{details}"
+                    )
+                )
+            else:
+                messagebox.showinfo(
+                    "Mes bisses",
+                    f"{len(folders)} dossier(s) ajouté(s) ou mis à jour dans Mes bisses."
+                )
+
+        return added, failures
+
+
+    def start_async_multiple_directory_selection(self, title, initialdir=None):
+        """
+        Lance la sélection multiple Windows hors du fil Tkinter principal.
+        Cela évite l'impression « ne répond pas » pendant la préparation du
+        dialogue système.
+        """
+        wait = tk.Toplevel(self.root)
+        wait.title("Sélection des dossiers")
+        wait.geometry("430x135")
+        wait.resizable(False, False)
+        wait.transient(self.root)
+        wait.grab_set()
+
+        tk.Label(
+            wait,
+            text="Ouverture de l'explorateur Windows…",
+            font=("Arial", 11, "bold")
+        ).pack(pady=(16, 4))
+
+        tk.Label(
+            wait,
+            text=(
+                "Sélectionnez un ou plusieurs dossiers bisses.\n"
+                "Le logiciel reste actif pendant l'ouverture de la fenêtre."
+            ),
+            justify="center",
+            fg="#555555"
+        ).pack(pady=(0, 10))
+
+        bar = ttk.Progressbar(wait, mode="indeterminate", length=280)
+        bar.pack()
+        bar.start(10)
+
+        result_queue = queue.Queue()
+
+        def worker():
+            try:
+                folders = self.ask_multiple_directories_windows(title, initialdir)
+                result_queue.put(("ok", folders))
+            except Exception as exc:
+                result_queue.put(("error", str(exc)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+        def poll():
+            try:
+                status, value = result_queue.get_nowait()
+            except queue.Empty:
+                if wait.winfo_exists():
+                    wait.after(100, poll)
+                return
+
+            try:
+                bar.stop()
+                wait.grab_release()
+                wait.destroy()
+            except Exception:
+                pass
+
+            if status == "ok" and value is not None:
+                self.log(f"📁 Sélection multiple Windows : {len(value)} dossier(s).")
+                self.process_multiple_bisse_folder_selection(value)
+                return
+
+            if status == "error":
+                self.log(f"⚠️ Sélection multiple Windows indisponible : {value}")
+
+            # Repli sur la sélection simple Tkinter, exécutée dans le fil principal.
+            folder = filedialog.askdirectory(
+                title=title,
+                initialdir=initialdir or self.get_default_collection_root()
+            )
+            self.process_multiple_bisse_folder_selection(
+                [os.path.abspath(folder)] if folder else []
+            )
+
+        wait.after(100, poll)
+
+    def process_multiple_bisse_folder_selection(self, selected_roots):
+        selected_roots = [
+            os.path.abspath(folder)
+            for folder in (selected_roots or [])
+            if folder and os.path.isdir(folder)
+        ]
+        if not selected_roots:
             return
 
-        candidates = self.find_bisse_folders_in_parent(parent)
+        self.log(
+            "📁 Ajouter plusieurs — sélection brute : "
+            + " | ".join(selected_roots)
+        )
+
+        candidates = self.build_workspace_candidates_from_selected_folders(selected_roots)
+        self.log(
+            "📁 Ajouter plusieurs — candidats : "
+            + " | ".join(candidates)
+        )
+
         if not candidates:
             messagebox.showwarning(
-                "Aucun dossier bisse détecté",
+                "Aucun dossier",
                 (
-                    "Aucun sous-dossier reconnu comme dossier bisse n'a été trouvé.\n\n"
-                    "Un dossier est reconnu s'il contient catalogue.json, Photos/, "
-                    "Fichiers GPX/, Export_JPG/ ou Export_Platform/."
+                    "Aucun dossier sélectionnable n'a été trouvé.\n\n"
+                    "Dossiers reçus :\n"
+                    + "\n".join(f"• {folder}" for folder in selected_roots)
                 )
             )
             return
 
+        direct_multi_selection = len(selected_roots) > 1
+        direct_single_bisse = (
+            len(selected_roots) == 1
+            and len(candidates) == 1
+            and os.path.normcase(os.path.abspath(selected_roots[0]))
+                == os.path.normcase(os.path.abspath(candidates[0]))
+        )
+
+        if direct_multi_selection or direct_single_bisse:
+            self.add_folders_to_workspace_bulk(candidates, show_summary=True)
+            return
+
+        self.show_multiple_bisse_folder_confirmation(selected_roots, candidates)
+
+    def show_multiple_bisse_folder_confirmation(self, selected_roots, candidates):
         window = tk.Toplevel(self.root)
         window.title("Ajouter plusieurs bisses à Mes bisses")
         window.geometry("980x620")
         window.transient(self.root)
         window.grab_set()
 
+        selected_text = (
+            f"{len(selected_roots)} dossier parent sélectionné.\n"
+            f"{len(candidates)} sous-dossier(s) proposé(s) pour Mes bisses.\n\n"
+            "Décochez ceux que vous ne voulez pas ajouter."
+        )
+
         tk.Label(
             window,
-            text=(
-                f"{len(candidates)} dossier(s) bisse détecté(s) dans :\n{parent}\n\n"
-                "Décochez ceux que vous ne voulez pas ajouter."
-            ),
+            text=selected_text,
             justify="left",
             anchor="w"
         ).pack(fill="x", padx=12, pady=(10, 8))
@@ -5690,13 +6598,26 @@ class BisseManagerApp:
 
             tk.Checkbutton(row, variable=var).pack(side="left")
 
+            detected_parts = []
+            if summary.get("has_catalog"):
+                detected_parts.append("catalogue OK")
+            else:
+                detected_parts.append("sans catalogue")
+
+            if not self.looks_like_bisse_folder(folder):
+                detected_parts.append("dossier sélectionné directement")
+
             label = (
                 f"{summary.get('title') or os.path.basename(folder)}"
                 f" · {summary.get('id') or self.slugify(os.path.basename(folder))}"
-                f" · {'catalogue OK' if summary.get('has_catalog') else 'sans catalogue'}"
+                f" · {' · '.join(detected_parts)}"
                 f"\n{folder}"
             )
-            tk.Label(row, text=label, justify="left", anchor="w").pack(side="left", fill="x", expand=True)
+            tk.Label(row, text=label, justify="left", anchor="w").pack(
+                side="left",
+                fill="x",
+                expand=True
+            )
 
         buttons = tk.Frame(window, padx=12, pady=10)
         buttons.pack(fill="x")
@@ -5711,15 +6632,8 @@ class BisseManagerApp:
                 messagebox.showwarning("Aucune sélection", "Aucun dossier n'est sélectionné.")
                 return
 
-            for folder in selected:
-                self.add_folder_to_workspace(folder)
-
             window.destroy()
-            self.show_workspace_home()
-            messagebox.showinfo(
-                "Mes bisses",
-                f"{len(selected)} dossier(s) ajouté(s) à Mes bisses."
-            )
+            self.add_folders_to_workspace_bulk(selected, show_summary=True)
 
         tk.Button(buttons, text="Tout sélectionner", command=lambda: set_all(True)).pack(side="left")
         tk.Button(buttons, text="Tout désélectionner", command=lambda: set_all(False)).pack(side="left", padx=6)
@@ -5731,6 +6645,29 @@ class BisseManagerApp:
             bg="#2c3e50",
             fg="white"
         ).pack(side="right", padx=(0, 8))
+
+    def add_multiple_bisse_folders_to_workspace_dialog(self):
+        """
+        Ajoute plusieurs dossiers bisses à Mes bisses.
+
+        v50 : sous Windows, la sélection multiple est lancée hors du fil
+        principal Tkinter pour éviter l'impression « ne répond pas ».
+        """
+        title = (
+            "Choisir un ou plusieurs dossiers bisses "
+            "(ou un dossier parent contenant plusieurs bisses)"
+        )
+        initialdir = self.get_default_collection_root()
+
+        if os.name == "nt":
+            self.start_async_multiple_directory_selection(title, initialdir)
+            return
+
+        selected_roots = self.ask_multiple_directories(
+            title=title,
+            initialdir=initialdir
+        )
+        self.process_multiple_bisse_folder_selection(selected_roots)
 
     def get_workspace_entries(self):
         """
@@ -6408,7 +7345,7 @@ class BisseManagerApp:
                 "source": 115,
                 "status": 120,
                 "last_opened": 135,
-                "folder": 360
+                "folder": 640
             }
 
             for col in columns:
@@ -6417,6 +7354,8 @@ class BisseManagerApp:
 
             for col in ("photos", "segments", "publication", "source", "status"):
                 tree.column(col, anchor="center")
+
+            tree.column("folder", minwidth=500, stretch=True)
 
             yscroll = ttk.Scrollbar(table_frame, orient="vertical", command=tree.yview)
             xscroll = ttk.Scrollbar(table_frame, orient="horizontal", command=tree.xview)
@@ -6555,6 +7494,12 @@ class BisseManagerApp:
                 self.show_update_selected_bisses_from_library_dialog(folders)
 
             tree.bind("<Double-1>", lambda _event: open_selected())
+            tree.bind(
+                "<Motion>",
+                lambda event, t=tree, mapping=entry_by_iid: self.show_workspace_folder_tooltip(event, t, mapping)
+            )
+            tree.bind("<Leave>", self.hide_text_tooltip)
+            tree.bind("<ButtonPress>", self.hide_text_tooltip)
 
         actions = tk.LabelFrame(outer, text="Actions sur la sélection", padx=8, pady=6)
         actions.grid(row=4, column=0, sticky="ew", pady=(6, 0))
@@ -12696,6 +13641,36 @@ class BisseManagerApp:
 
         return None
 
+
+    def restore_photo_navigation_focus(self, _event=None):
+        """
+        Après une édition de texte, un clic sur l'image ou la carte rend de
+        nouveau les flèches gauche/droite disponibles pour changer de photo.
+        """
+        try:
+            if self.viewer_canvas is not None and self.viewer_canvas.winfo_exists():
+                self.viewer_canvas.focus_set()
+                return None
+        except Exception:
+            pass
+
+        try:
+            if self.map_widget is not None and self.map_widget.winfo_exists():
+                self.map_widget.focus_set()
+                return None
+        except Exception:
+            pass
+
+        try:
+            self.root.focus_set()
+        except Exception:
+            pass
+        return None
+
+    def viewer_canvas_click_start_pan(self, event):
+        self.restore_photo_navigation_focus()
+        return self.viewer_start_pan(event)
+
     def fit_gpx_workshop_map_to_content(self):
         if not self.gpx_editor_map:
             return
@@ -15181,6 +16156,13 @@ class BisseManagerApp:
         self.map_widget.add_left_click_map_command(
             lambda coords: self.handle_photo_map_background_click("photo", coords)
         )
+        try:
+            self.map_widget.configure(takefocus=1)
+            self.map_widget.bind("<Button-1>", self.restore_photo_navigation_focus, add="+")
+            self.map_widget.bind("<Left>", self.handle_photo_navigation_key)
+            self.map_widget.bind("<Right>", self.handle_photo_navigation_key)
+        except Exception:
+            pass
 
     def build_viewer_panel(self, parent):
         top = tk.Frame(parent, bg="#222222")
@@ -15211,7 +16193,7 @@ class BisseManagerApp:
         canvas_frame = tk.Frame(parent, bg="#222222")
         canvas_frame.pack(fill="both", expand=True)
 
-        self.viewer_canvas = tk.Canvas(canvas_frame, bg="#222222", highlightthickness=0)
+        self.viewer_canvas = tk.Canvas(canvas_frame, bg="#222222", highlightthickness=0, takefocus=1)
         self.viewer_canvas.pack(side="left", fill="both", expand=True)
 
         v_scroll = tk.Scrollbar(canvas_frame, orient="vertical", command=self.viewer_canvas.yview)
@@ -15223,8 +16205,10 @@ class BisseManagerApp:
         self.viewer_canvas.configure(yscrollcommand=v_scroll.set, xscrollcommand=h_scroll.set)
 
         self.viewer_canvas.bind("<MouseWheel>", self.viewer_mousewheel)
-        self.viewer_canvas.bind("<ButtonPress-1>", self.viewer_start_pan)
+        self.viewer_canvas.bind("<ButtonPress-1>", self.viewer_canvas_click_start_pan)
         self.viewer_canvas.bind("<B1-Motion>", self.viewer_do_pan)
+        self.viewer_canvas.bind("<Left>", self.handle_photo_navigation_key)
+        self.viewer_canvas.bind("<Right>", self.handle_photo_navigation_key)
         self.viewer_canvas.bind("<Button-4>", lambda event: self.viewer_change_zoom(1.10))
         self.viewer_canvas.bind("<Button-5>", lambda event: self.viewer_change_zoom(0.90))
 
@@ -15643,6 +16627,9 @@ class BisseManagerApp:
         return time.monotonic() <= deadline
 
     def handle_photo_map_background_click(self, context, _coords=None):
+        if context == "photo":
+            self.restore_photo_navigation_focus()
+
         if self.consume_photo_map_click_guard(context):
             return
         if self.photo_spider_state.get(context) is not None:
@@ -15655,6 +16642,7 @@ class BisseManagerApp:
     def open_photo_from_context(self, context, photo):
         self.mark_photo_marker_interaction(context)
         if context == "photo":
+            self.restore_photo_navigation_focus()
             self.select_photo_on_map(photo)
         else:
             self.show_gpx_photo_quick_view(photo)
@@ -16145,6 +17133,11 @@ class BisseManagerApp:
 
         if center_map:
             self.center_map_on_photo_if_needed(self.map_widget, lat, lon)
+
+        try:
+            self.root.after(20, self.restore_photo_navigation_focus)
+        except Exception:
+            pass
 
     def load_photo_in_viewer(self, image_path):
         self.viewer_original_image = None
