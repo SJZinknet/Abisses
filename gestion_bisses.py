@@ -166,7 +166,23 @@ class BisseManagerApp:
         self.rename_prefix_var = tk.StringVar(value="")
         self.rename_year_var = tk.StringVar(value=str(datetime.now().year))
         self.rename_start_var = tk.IntVar(value=1)
+        self.rename_order_mode_var = tk.StringVar(value="datetime")
+        self.rename_reverse_var = tk.BooleanVar(value=False)
+        self.rename_gps_group_radius_var = tk.DoubleVar(value=12.0)
         self.rename_plan = []
+        self.rename_map_widget = None
+        self.rename_map_markers = []
+        self.rename_map_paths = []
+        self.rename_map_icon_cache = {}
+        self.rename_map_after_id = None
+        self.rename_map_refresh_after_id = None
+        self.rename_map_zoom_refresh_after_id = None
+        self.rename_map_last_signature = None
+        self.rename_map_initializing = False
+        self.rename_map_fit_done = False
+        self.rename_map_selected_plan_index = None
+        self.rename_tree_selection_guard = False
+        self.rename_map_hit_targets = []
 
         # Atelier GPX restructuré
         self.gpx_editor_map = None
@@ -423,6 +439,10 @@ class BisseManagerApp:
         self.show_text_tooltip(text, event.x_root, event.y_root)
 
     def clear_main_frame(self):
+        try:
+            self.stop_rename_map_watch()
+        except Exception:
+            pass
         self.stop_swisstopo_auto_watch("photo")
         self.stop_swisstopo_auto_watch("gpx")
         self.stop_photo_layer_watch("photo")
@@ -7616,6 +7636,915 @@ namespace GestionBissesFolderPicker
     # ANALYSE DU DOSSIER
     # ============================================================
 
+
+    # ============================================================
+    # V51 — ORDRE INTELLIGENT DES PHOTOS POUR LE RENOMMAGE
+    # ============================================================
+
+    def get_entry_gps_latlon(self, entry):
+        coords = (entry or {}).get("gps_coordinates") or {}
+        try:
+            lat = float(coords.get("lat"))
+            lon = float(coords.get("lon"))
+            if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+                return None
+            return lat, lon
+        except Exception:
+            return None
+
+    def rename_order_mode_label(self, mode=None):
+        mode = mode or self.rename_order_mode_var.get()
+        return {
+            "datetime": "Date / heure",
+            "gps": "Position GPS des photos",
+            "reference": "Tracé de référence"
+        }.get(mode, mode)
+
+    def rename_plan_sort_text(self):
+        mode = self.rename_order_mode_var.get()
+        reverse = " inversé" if self.rename_reverse_var.get() else ""
+
+        if mode == "datetime":
+            return f"Tri : date / heure{reverse}"
+        if mode == "gps":
+            return f"Tri : position GPS autonome{reverse}"
+        if mode == "reference":
+            return f"Tri : tracé de référence si disponible{reverse}"
+        return f"Tri : {mode}{reverse}"
+
+    def rename_photo_date_key(self, item):
+        dt = item.get("date")
+        if isinstance(dt, datetime):
+            return dt
+        return datetime.max
+
+    def cluster_rename_photos_by_gps(self, items, radius_m=None):
+        """
+        Regroupe les photos très proches avant de chercher le chemin spatial.
+
+        Cela évite que des images prises au même endroit, notamment à l'aller
+        puis au retour, se dispersent dans l'ordre final.
+        """
+        try:
+            radius = float(radius_m if radius_m is not None else self.rename_gps_group_radius_var.get())
+        except Exception:
+            radius = 12.0
+        radius = max(0.0, radius)
+
+        clusters = []
+
+        for item in sorted(items, key=lambda p: (self.rename_photo_date_key(p), os.path.basename(p["source_path"]).lower())):
+            gps = item.get("gps")
+            if not gps:
+                continue
+            lat, lon = gps
+
+            best = None
+            best_distance = None
+            for cluster in clusters:
+                d = self.haversine_distance_m(lat, lon, cluster["lat"], cluster["lon"])
+                if d <= radius and (best_distance is None or d < best_distance):
+                    best = cluster
+                    best_distance = d
+
+            if best is None:
+                clusters.append({
+                    "items": [item],
+                    "lat": lat,
+                    "lon": lon
+                })
+            else:
+                best["items"].append(item)
+                count = len(best["items"])
+                best["lat"] = sum(p["gps"][0] for p in best["items"]) / count
+                best["lon"] = sum(p["gps"][1] for p in best["items"]) / count
+
+        for cluster in clusters:
+            cluster["items"].sort(
+                key=lambda p: (self.rename_photo_date_key(p), os.path.basename(p["source_path"]).lower())
+            )
+
+        return clusters
+
+    def farthest_rename_cluster_pair(self, clusters):
+        if len(clusters) < 2:
+            return (0, 0)
+
+        best = (0, 1)
+        best_distance = -1.0
+
+        for i, a in enumerate(clusters):
+            for j in range(i + 1, len(clusters)):
+                b = clusters[j]
+                d = self.haversine_distance_m(a["lat"], a["lon"], b["lat"], b["lon"])
+                if d > best_distance:
+                    best_distance = d
+                    best = (i, j)
+
+        return best
+
+    def sort_by_gps_autonomous(self, items):
+        """
+        Ordre géographique autonome.
+
+        Principe :
+        1. regrouper les photos très proches ;
+        2. partir de la zone de la première photo chronologique, si possible ;
+        3. avancer de proche en proche entre les groupes ;
+        4. garder les photos d'un même groupe ensemble.
+
+        Le résultat ne dépend pas d'un GPX préparé, mais reste contrôlable et
+        inversable sur la carte de renommage.
+        """
+        gps_items = [item for item in items if item.get("gps")]
+        no_gps = [item for item in items if not item.get("gps")]
+
+        if len(gps_items) <= 1:
+            ordered = sorted(gps_items, key=lambda p: (self.rename_photo_date_key(p), os.path.basename(p["source_path"]).lower()))
+            ordered.extend(sorted(no_gps, key=lambda p: (self.rename_photo_date_key(p), os.path.basename(p["source_path"]).lower())))
+            return ordered
+
+        clusters = self.cluster_rename_photos_by_gps(gps_items)
+        if not clusters:
+            return sorted(items, key=lambda p: (self.rename_photo_date_key(p), os.path.basename(p["source_path"]).lower()))
+
+        earliest = min(gps_items, key=lambda p: (self.rename_photo_date_key(p), os.path.basename(p["source_path"]).lower()))
+        start_index = None
+        for i, cluster in enumerate(clusters):
+            if earliest in cluster["items"]:
+                start_index = i
+                break
+
+        if start_index is None:
+            a, b = self.farthest_rename_cluster_pair(clusters)
+            # Choix déterministe ; le bouton « Inverser » donne le contrôle réel.
+            start_index = min(a, b, key=lambda idx: (clusters[idx]["lat"], clusters[idx]["lon"]))
+
+        remaining = set(range(len(clusters)))
+        current = start_index
+        ordered_clusters = []
+
+        while remaining:
+            if current not in remaining:
+                current = min(remaining)
+            ordered_clusters.append(clusters[current])
+            remaining.remove(current)
+
+            if not remaining:
+                break
+
+            current_cluster = clusters[current]
+            current = min(
+                remaining,
+                key=lambda idx: (
+                    self.haversine_distance_m(
+                        current_cluster["lat"],
+                        current_cluster["lon"],
+                        clusters[idx]["lat"],
+                        clusters[idx]["lon"]
+                    ),
+                    clusters[idx]["lat"],
+                    clusters[idx]["lon"]
+                )
+            )
+
+        ordered = []
+        for cluster in ordered_clusters:
+            ordered.extend(cluster["items"])
+
+        if self.rename_reverse_var.get():
+            ordered.reverse()
+
+        ordered.extend(sorted(no_gps, key=lambda p: (self.rename_photo_date_key(p), os.path.basename(p["source_path"]).lower())))
+        return ordered
+
+    def get_reference_trace_points_for_rename(self):
+        """
+        Récupère un tracé de référence si l'atelier GPX contient déjà des
+        segments ordonnés. Ce mode reste optionnel : sans tracé, on retombe sur
+        le tri GPS autonome.
+        """
+        container = self.catalog_container or {}
+        points = []
+
+        workshop = container.get("gpx_workshop", {}) or {}
+        segments = workshop.get("segments", []) or []
+
+        if segments:
+            for segment in sorted(segments, key=self.gpx_segment_sort_key):
+                for part in segment.get("parts", []) or []:
+                    part_points = [
+                        (float(p[0]), float(p[1]))
+                        for p in part.get("points", []) or []
+                        if p and len(p) >= 2
+                    ]
+                    if len(part_points) >= 2:
+                        if points and points[-1] == part_points[0]:
+                            points.extend(part_points[1:])
+                        else:
+                            points.extend(part_points)
+
+        if len(points) >= 2:
+            return points
+
+        manual = (container.get("gpx_traces", {}) or {}).get("manual_segments", []) or []
+        for record in manual:
+            for part in record.get("segments", []) or []:
+                part_points = [
+                    (float(p[0]), float(p[1]))
+                    for p in part
+                    if p and len(p) >= 2
+                ]
+                if len(part_points) >= 2:
+                    if points and points[-1] == part_points[0]:
+                        points.extend(part_points[1:])
+                    else:
+                        points.extend(part_points)
+
+        return points if len(points) >= 2 else []
+
+    def latlon_to_local_xy_m(self, lat, lon, lat0=None):
+        lat0 = float(lat0 if lat0 is not None else lat)
+        x = float(lon) * 111320.0 * math.cos(math.radians(lat0))
+        y = float(lat) * 110540.0
+        return x, y
+
+    def project_photo_on_reference_trace(self, lat, lon, trace_points):
+        if not trace_points or len(trace_points) < 2:
+            return None
+
+        photo_x, photo_y = self.latlon_to_local_xy_m(lat, lon, lat)
+        cumulative = 0.0
+        best = None
+
+        for a, b in zip(trace_points[:-1], trace_points[1:]):
+            a_lat, a_lon = float(a[0]), float(a[1])
+            b_lat, b_lon = float(b[0]), float(b[1])
+            ref_lat = (a_lat + b_lat + lat) / 3.0
+
+            ax, ay = self.latlon_to_local_xy_m(a_lat, a_lon, ref_lat)
+            bx, by = self.latlon_to_local_xy_m(b_lat, b_lon, ref_lat)
+            px, py = self.latlon_to_local_xy_m(lat, lon, ref_lat)
+
+            dx = bx - ax
+            dy = by - ay
+            seg_len = math.hypot(dx, dy)
+
+            if seg_len <= 0:
+                continue
+
+            t = ((px - ax) * dx + (py - ay) * dy) / (seg_len * seg_len)
+            t = max(0.0, min(1.0, t))
+            proj_x = ax + t * dx
+            proj_y = ay + t * dy
+            dist = math.hypot(px - proj_x, py - proj_y)
+            along = cumulative + t * seg_len
+
+            if best is None or dist < best[1]:
+                best = (along, dist)
+
+            cumulative += seg_len
+
+        return best
+
+    def sort_by_reference_trace(self, items):
+        trace_points = self.get_reference_trace_points_for_rename()
+        if len(trace_points) < 2:
+            self.log("ℹ️ Aucun tracé de référence disponible : repli sur l'ordre GPS autonome.")
+            return self.sort_by_gps_autonomous(items)
+
+        projected = []
+        no_projection = []
+
+        for item in items:
+            gps = item.get("gps")
+            if not gps:
+                no_projection.append(item)
+                continue
+
+            projection = self.project_photo_on_reference_trace(gps[0], gps[1], trace_points)
+            if projection is None:
+                no_projection.append(item)
+                continue
+
+            item["trace_along_m"] = projection[0]
+            item["trace_distance_m"] = projection[1]
+            projected.append(item)
+
+        projected.sort(
+            key=lambda p: (
+                p.get("trace_along_m", float("inf")),
+                p.get("trace_distance_m", float("inf")),
+                self.rename_photo_date_key(p),
+                os.path.basename(p["source_path"]).lower()
+            ),
+            reverse=bool(self.rename_reverse_var.get())
+        )
+
+        no_projection.sort(
+            key=lambda p: (self.rename_photo_date_key(p), os.path.basename(p["source_path"]).lower())
+        )
+
+        return projected + no_projection
+
+    def sort_rename_candidates(self, sortable):
+        mode = self.rename_order_mode_var.get()
+
+        if mode == "gps":
+            return self.sort_by_gps_autonomous(sortable)
+
+        if mode == "reference":
+            return self.sort_by_reference_trace(sortable)
+
+        ordered = sorted(
+            sortable,
+            key=lambda p: (p["date"], os.path.basename(p["source_path"]).lower())
+        )
+        if self.rename_reverse_var.get():
+            ordered.reverse()
+        return ordered
+
+    def clear_rename_order_map(self):
+        for marker in getattr(self, "rename_map_markers", []):
+            try:
+                marker.delete()
+            except Exception:
+                pass
+        self.rename_map_markers = []
+
+        for path in getattr(self, "rename_map_paths", []):
+            try:
+                path.delete()
+            except Exception:
+                pass
+        self.rename_map_paths = []
+        self.rename_map_hit_targets = []
+
+    def get_rename_map_marker_icon(self, number, selected=False):
+        cache_key = ("marker", int(number), bool(selected), "v51")
+        if cache_key in self.rename_map_icon_cache:
+            return self.rename_map_icon_cache[cache_key]
+
+        label = f"{int(number):03d}" if int(number) < 1000 else str(int(number))
+        size = 48 if not selected else 54
+        image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+
+        fill = "#e53935" if selected else "#1976d2"
+        outline = "#8e1b17" if selected else "#0b4f8a"
+
+        draw.ellipse((2, 2, size - 3, size - 3), fill="#ffffff", outline="#ffffff")
+        draw.ellipse((5, 5, size - 6, size - 6), fill=fill, outline=outline, width=3)
+
+        try:
+            font = ImageFont.truetype("arialbd.ttf", 14 if len(label) <= 3 else 11)
+        except Exception:
+            try:
+                font = ImageFont.truetype("arial.ttf", 14 if len(label) <= 3 else 11)
+            except Exception:
+                font = ImageFont.load_default()
+
+        bbox = draw.textbbox((0, 0), label, font=font)
+        draw.text(
+            ((size - (bbox[2] - bbox[0])) / 2, (size - (bbox[3] - bbox[1])) / 2 - 1),
+            label,
+            fill="#ffffff",
+            font=font
+        )
+
+        icon = ImageTk.PhotoImage(image)
+        self.rename_map_icon_cache[cache_key] = icon
+        return icon
+
+    def rename_cluster_label_from_numbers(self, numbers):
+        nums = sorted(int(n) for n in numbers if n)
+        if not nums:
+            return "—"
+
+        if nums == list(range(nums[0], nums[-1] + 1)):
+            return f"{nums[0]:03d}–{nums[-1]:03d}"
+
+        if len(nums) <= 3:
+            return ", ".join(f"{n:03d}" for n in nums)
+
+        return f"{nums[0]:03d}…{nums[-1]:03d}"
+
+    def get_rename_map_cluster_icon(self, numbers, selected=False):
+        label = self.rename_cluster_label_from_numbers(numbers)
+        count = len(numbers)
+        cache_key = ("cluster", tuple(sorted(numbers)), bool(selected), "v51")
+        if cache_key in self.rename_map_icon_cache:
+            return self.rename_map_icon_cache[cache_key]
+
+        width = max(96, min(180, 20 + len(label) * 12))
+        height = 56
+        image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+
+        fill = "#c62828" if selected else "#123c69"
+        outline = "#7f1717" if selected else "#f9c74f"
+
+        try:
+            font_main = ImageFont.truetype("arialbd.ttf", 16)
+            font_sub = ImageFont.truetype("arial.ttf", 11)
+        except Exception:
+            font_main = ImageFont.load_default()
+            font_sub = ImageFont.load_default()
+
+        draw.rounded_rectangle(
+            (2, 2, width - 3, height - 3),
+            radius=14,
+            fill="#ffffff",
+            outline="#ffffff",
+            width=2
+        )
+        draw.rounded_rectangle(
+            (6, 6, width - 7, height - 7),
+            radius=11,
+            fill=fill,
+            outline=outline,
+            width=3
+        )
+
+        bbox = draw.textbbox((0, 0), label, font=font_main)
+        draw.text(
+            ((width - (bbox[2] - bbox[0])) / 2, 11),
+            label,
+            fill="#ffffff",
+            font=font_main
+        )
+
+        sub = f"{count} photos"
+        sub_bbox = draw.textbbox((0, 0), sub, font=font_sub)
+        draw.text(
+            ((width - (sub_bbox[2] - sub_bbox[0])) / 2, 34),
+            sub,
+            fill="#f9e79f",
+            font=font_sub
+        )
+
+        icon = ImageTk.PhotoImage(image)
+        self.rename_map_icon_cache[cache_key] = icon
+        return icon
+
+    def build_rename_map_clusters(self, plan, zoom, threshold_px=52):
+        clusters = []
+
+        for plan_index, p in enumerate(plan):
+            if p.get("skip"):
+                continue
+            gps = p.get("gps")
+            if not gps:
+                continue
+
+            lat, lon = gps
+            x, y = self.latlon_to_world_pixel(lat, lon, zoom)
+            item = {
+                "plan_index": plan_index,
+                "plan": p,
+                "lat": lat,
+                "lon": lon,
+                "x": x,
+                "y": y,
+                "number": int(p.get("order_number") or 0)
+            }
+
+            best = None
+            best_distance = None
+            for cluster in clusters:
+                d = math.hypot(x - cluster["center_x"], y - cluster["center_y"])
+                if d <= threshold_px and (best_distance is None or d < best_distance):
+                    best = cluster
+                    best_distance = d
+
+            if best is None:
+                clusters.append({
+                    "items": [item],
+                    "sum_x": x,
+                    "sum_y": y,
+                    "center_x": x,
+                    "center_y": y
+                })
+            else:
+                best["items"].append(item)
+                best["sum_x"] += x
+                best["sum_y"] += y
+                count = len(best["items"])
+                best["center_x"] = best["sum_x"] / count
+                best["center_y"] = best["sum_y"] / count
+
+        for cluster in clusters:
+            lat, lon = self.world_pixel_to_latlon(cluster["center_x"], cluster["center_y"], zoom)
+            cluster["lat"] = lat
+            cluster["lon"] = lon
+            cluster["numbers"] = [item["number"] for item in cluster["items"]]
+            cluster["min_number"] = min(cluster["numbers"] or [0])
+
+        return sorted(clusters, key=lambda c: c["min_number"])
+
+    def fit_rename_order_map(self):
+        if not self.rename_map_widget:
+            return
+
+        points = []
+        for p in self.rename_plan:
+            gps = p.get("gps")
+            if gps:
+                points.append(gps)
+
+        if not points:
+            return
+
+        lats = [p[0] for p in points]
+        lons = [p[1] for p in points]
+        min_lat, max_lat = min(lats), max(lats)
+        min_lon, max_lon = min(lons), max(lons)
+        center_lat = (min_lat + max_lat) / 2
+        center_lon = (min_lon + max_lon) / 2
+
+        try:
+            if min_lat == max_lat and min_lon == max_lon:
+                self.rename_map_widget.set_position(center_lat, center_lon)
+                self.rename_map_widget.set_zoom(17)
+            else:
+                self.rename_map_widget.fit_bounding_box(
+                    (max_lat, min_lon),
+                    (min_lat, max_lon)
+                )
+        except Exception:
+            self.rename_map_widget.set_position(center_lat, center_lon)
+            span = max(max_lat - min_lat, max_lon - min_lon)
+            if span < 0.002:
+                zoom = 18
+            elif span < 0.005:
+                zoom = 17
+            elif span < 0.01:
+                zoom = 16
+            elif span < 0.03:
+                zoom = 15
+            elif span < 0.08:
+                zoom = 14
+            elif span < 0.15:
+                zoom = 13
+            elif span < 0.3:
+                zoom = 12
+            else:
+                zoom = 11
+            self.rename_map_widget.set_zoom(zoom)
+
+    def select_rename_plan_row(self, plan_index, center_map=False, zoom_map=False, defer_map_refresh=False, refresh_map=False):
+        self.rename_map_selected_plan_index = plan_index
+
+        if self.rename_tree:
+            try:
+                children = list(self.rename_tree.get_children())
+                if 0 <= plan_index < len(children):
+                    item = children[plan_index]
+                    self.rename_tree_selection_guard = True
+                    try:
+                        self.rename_tree.selection_set(item)
+                        self.rename_tree.focus(item)
+                        self.rename_tree.see(item)
+                    finally:
+                        self.rename_tree_selection_guard = False
+            except Exception:
+                self.rename_tree_selection_guard = False
+
+        if center_map and self.rename_map_widget and 0 <= plan_index < len(self.rename_plan):
+            gps = self.rename_plan[plan_index].get("gps")
+            if gps:
+                try:
+                    self.rename_map_widget.set_position(gps[0], gps[1])
+                    if zoom_map:
+                        current_zoom = self.get_map_zoom_value(self.rename_map_widget) or 0
+                        if current_zoom < 18:
+                            self.rename_map_widget.set_zoom(18)
+                except Exception as exc:
+                    self.log(f"⚠️ Impossible de centrer la carte de renommage : {exc}")
+
+        if not refresh_map:
+            return
+
+        if defer_map_refresh:
+            self.schedule_rename_map_refresh(fit=False)
+        else:
+            self.refresh_rename_order_map(fit=False)
+
+    def schedule_rename_map_refresh(self, fit=False):
+        """
+        Redessine la carte de renommage après la fin du callback courant.
+
+        Important : ne pas supprimer/recréer les marqueurs pendant que
+        tkintermapview traite encore un clic sur l'un de ces marqueurs.
+        """
+        if self.rename_map_refresh_after_id:
+            try:
+                self.root.after_cancel(self.rename_map_refresh_after_id)
+            except Exception:
+                pass
+            self.rename_map_refresh_after_id = None
+
+        def do_refresh():
+            self.rename_map_refresh_after_id = None
+            try:
+                self.refresh_rename_order_map(fit=fit)
+            except Exception as exc:
+                self.log(f"❌ Erreur rafraîchissement carte renommage : {exc}")
+
+        try:
+            self.rename_map_refresh_after_id = self.root.after(80, do_refresh)
+        except Exception as exc:
+            self.log(f"❌ Impossible de programmer le rafraîchissement carte renommage : {exc}")
+
+
+
+    def schedule_rename_map_zoom_refresh(self):
+        """
+        Redessine uniquement les points/agrégats après un changement de zoom
+        ou de taille de carte.
+
+        C'est indispensable pour que les agrégats se déploient/recomposent au
+        zoom, tout en gardant la carte passive : aucun clic carte, aucun
+        callback de marqueur, aucun recentrage automatique.
+        """
+        if self.rename_map_initializing:
+            return
+
+        if self.rename_map_zoom_refresh_after_id:
+            try:
+                self.root.after_cancel(self.rename_map_zoom_refresh_after_id)
+            except Exception:
+                pass
+            self.rename_map_zoom_refresh_after_id = None
+
+        def do_refresh():
+            self.rename_map_zoom_refresh_after_id = None
+            try:
+                if self.rename_map_widget and self.rename_plan:
+                    self.refresh_rename_order_map(fit=False)
+            except Exception as exc:
+                self.log(f"⚠️ Redessin agrégats carte renommage impossible : {exc}")
+
+        try:
+            self.rename_map_zoom_refresh_after_id = self.root.after(260, do_refresh)
+        except Exception as exc:
+            self.log(f"⚠️ Programmation redessin agrégats impossible : {exc}")
+
+    def schedule_initial_rename_map_draw(self):
+        """
+        Premier dessin contrôlé de la carte de renommage, ou redessin complet
+        après changement de paramètre d'ordre.
+
+        La carte doit d'abord recevoir sa taille définitive dans Tkinter.
+        Sinon les agrégats peuvent être calculés sur un zoom/taille provisoire.
+        """
+        self.rename_map_initializing = True
+
+        if self.rename_map_refresh_after_id:
+            try:
+                self.root.after_cancel(self.rename_map_refresh_after_id)
+            except Exception:
+                pass
+            self.rename_map_refresh_after_id = None
+
+        if self.rename_map_zoom_refresh_after_id:
+            try:
+                self.root.after_cancel(self.rename_map_zoom_refresh_after_id)
+            except Exception:
+                pass
+            self.rename_map_zoom_refresh_after_id = None
+
+        def step_fit():
+            try:
+                if self.rename_map_widget:
+                    self.fit_rename_order_map()
+                    self.rename_map_fit_done = True
+            except Exception as exc:
+                self.log(f"⚠️ Ajustement carte renommage impossible : {exc}")
+            try:
+                self.rename_map_refresh_after_id = self.root.after(180, step_draw)
+            except Exception:
+                self.rename_map_refresh_after_id = None
+                self.rename_map_initializing = False
+
+        def step_draw():
+            self.rename_map_refresh_after_id = None
+            try:
+                self.refresh_rename_order_map(fit=False)
+                self.rename_map_last_signature = self.rename_map_signature()
+            except Exception as exc:
+                self.log(f"⚠️ Dessin carte renommage impossible : {exc}")
+            finally:
+                self.rename_map_initializing = False
+
+        try:
+            self.rename_map_refresh_after_id = self.root.after(260, step_fit)
+        except Exception as exc:
+            self.rename_map_initializing = False
+            self.log(f"⚠️ Programmation carte renommage impossible : {exc}")
+
+    def handle_rename_marker_click(self, plan_index):
+        """
+        v51e : désactivé volontairement.
+
+        Les pastilles et agrégats de la carte de renommage ne sont pas
+        interactifs. Ils servent uniquement à lire l'ordre proposé.
+        """
+        return
+
+    def handle_rename_map_click(self, coords):
+        """
+        v51e : désactivé volontairement.
+
+        La carte du module de renommage est un panneau de contrôle visuel :
+        points numérotés, agrégats lisibles, ligne d'ordre. Aucun clic sur la
+        carte ne doit sélectionner, zoomer, recentrer ou redessiner quoi que ce
+        soit, car les essais v51b-v51d ont montré que cette interaction pouvait
+        fermer brutalement le logiciel.
+        """
+        return
+
+    def refresh_rename_order_map(self, fit=False):
+        if not self.rename_map_widget:
+            return
+
+        self.clear_rename_order_map()
+        self.rename_map_hit_targets = []
+
+        ordered = [p for p in self.rename_plan if not p.get("skip") and p.get("gps")]
+        if not ordered:
+            return
+
+        positions = [p["gps"] for p in ordered]
+        if len(positions) >= 2:
+            try:
+                path = self.rename_map_widget.set_path(
+                    positions,
+                    color="#8e44ad",
+                    width=3
+                )
+                self.rename_map_paths.append(path)
+            except Exception:
+                pass
+
+        zoom = self.get_map_zoom_value(self.rename_map_widget) or 17
+        clusters = self.build_rename_map_clusters(self.rename_plan, zoom)
+        selected_index = self.rename_map_selected_plan_index
+
+        for cluster in clusters:
+            selected = any(item["plan_index"] == selected_index for item in cluster["items"])
+
+            if len(cluster["items"]) == 1:
+                item = cluster["items"][0]
+                icon = self.get_rename_map_marker_icon(item["number"], selected=selected)
+                self.rename_map_hit_targets.append({
+                    "lat": item["lat"],
+                    "lon": item["lon"],
+                    "plan_index": item["plan_index"],
+                    "radius_px": 36
+                })
+                try:
+                    marker = self.rename_map_widget.set_marker(
+                        item["lat"],
+                        item["lon"],
+                        text="",
+                        icon=icon,
+                        icon_anchor="center"
+                    )
+                except TypeError:
+                    marker = self.rename_map_widget.set_marker(
+                        item["lat"],
+                        item["lon"],
+                        text=str(item["number"])
+                    )
+                self.rename_map_markers.append(marker)
+            else:
+                icon = self.get_rename_map_cluster_icon(cluster["numbers"], selected=selected)
+                first_index = sorted(cluster["items"], key=lambda item: item["number"])[0]["plan_index"]
+                self.rename_map_hit_targets.append({
+                    "lat": cluster["lat"],
+                    "lon": cluster["lon"],
+                    "plan_index": first_index,
+                    "radius_px": 70
+                })
+                try:
+                    marker = self.rename_map_widget.set_marker(
+                        cluster["lat"],
+                        cluster["lon"],
+                        text="",
+                        icon=icon,
+                        icon_anchor="center"
+                    )
+                except TypeError:
+                    marker = self.rename_map_widget.set_marker(
+                        cluster["lat"],
+                        cluster["lon"],
+                        text=self.rename_cluster_label_from_numbers(cluster["numbers"])
+                    )
+                self.rename_map_markers.append(marker)
+
+        if fit or not self.rename_map_fit_done:
+            self.fit_rename_order_map()
+            self.rename_map_fit_done = True
+
+    def rename_map_signature(self):
+        widget = self.rename_map_widget
+        if not widget:
+            return None
+        try:
+            return (
+                self.get_map_zoom_value(widget),
+                int(widget.winfo_width()),
+                int(widget.winfo_height()),
+                len(self.rename_plan)
+            )
+        except Exception:
+            return None
+
+    def start_rename_map_watch(self):
+        self.stop_rename_map_watch()
+
+        def tick():
+            if not self.rename_map_widget:
+                self.rename_map_after_id = None
+                return
+
+            signature = self.rename_map_signature()
+            if signature != self.rename_map_last_signature:
+                self.rename_map_last_signature = signature
+                try:
+                    # Garder le même système de fonds auto que les autres cartes.
+                    self.set_tile_server_for_widget(self.rename_map_widget, "rename", "color_auto", force=False)
+                except Exception:
+                    pass
+
+                # v51h : perte corrigée.
+                # La carte reste passive aux clics, mais les agrégats doivent
+                # se déployer/recomposer quand l'utilisateur zoome.
+                if self.rename_map_fit_done and not self.rename_map_initializing:
+                    self.schedule_rename_map_zoom_refresh()
+
+            try:
+                self.rename_map_after_id = self.root.after(450, tick)
+            except Exception:
+                self.rename_map_after_id = None
+
+        tick()
+
+    def stop_rename_map_watch(self):
+        if self.rename_map_after_id:
+            try:
+                self.root.after_cancel(self.rename_map_after_id)
+            except Exception:
+                pass
+        self.rename_map_after_id = None
+
+        if getattr(self, "rename_map_refresh_after_id", None):
+            try:
+                self.root.after_cancel(self.rename_map_refresh_after_id)
+            except Exception:
+                pass
+        self.rename_map_refresh_after_id = None
+
+        if getattr(self, "rename_map_zoom_refresh_after_id", None):
+            try:
+                self.root.after_cancel(self.rename_map_zoom_refresh_after_id)
+            except Exception:
+                pass
+        self.rename_map_zoom_refresh_after_id = None
+        self.rename_map_initializing = False
+
+    def build_rename_order_map_panel(self, parent):
+        wrapper = tk.Frame(parent)
+        wrapper.pack(fill="both", expand=True)
+
+        toolbar = tk.Frame(wrapper)
+        toolbar.pack(fill="x", pady=(0, 3))
+
+        tk.Button(
+            toolbar,
+            text="Recentrer",
+            command=self.schedule_initial_rename_map_draw
+        ).pack(side="right", padx=4)
+
+        self.rename_map_widget = tkintermapview.TkinterMapView(
+            wrapper,
+            width=520,
+            height=520,
+            corner_radius=0
+        )
+        self.rename_map_widget.pack(fill="both", expand=True)
+        try:
+            # Même architecture que les autres cartes du logiciel :
+            # mode auto avec fonds Swisstopo adaptés à l'échelle.
+            self.set_tile_server_for_widget(self.rename_map_widget, "rename", "color_auto", force=True)
+        except Exception:
+            pass
+
+        self.rename_map_fit_done = False
+        self.rename_map_last_signature = None
+        self.start_rename_map_watch()
+
     def select_base_folder(self):
         folder = filedialog.askdirectory(title="Sélectionnez le dossier du Bisse")
         if not folder:
@@ -9873,11 +10802,12 @@ namespace GestionBissesFolderPicker
             )
             return
 
+        self.stop_rename_map_watch()
         self.clear_main_frame()
-        self.status_header.config(text="Module renommage des photos", fg="#8e44ad")
+        self.status_header.config(text="Module Renommer / déterminer l’ordre des photos", fg="#8e44ad")
 
         top = tk.Frame(self.main_frame)
-        top.pack(fill="x", pady=(0, 8))
+        top.pack(fill="x", pady=(0, 6))
 
         tk.Button(
             top,
@@ -9889,43 +10819,46 @@ namespace GestionBissesFolderPicker
         self.rename_prefix_var.set(default_prefix)
         self.rename_year_var.set(str(datetime.now().year))
         self.rename_start_var.set(1)
+        self.rename_order_mode_var.set("datetime")
+        self.rename_reverse_var.set(False)
+        self.rename_map_selected_plan_index = None
 
         controls = tk.LabelFrame(
             self.main_frame,
             text="Paramètres de renommage",
-            padx=10,
-            pady=10
+            padx=8,
+            pady=6
         )
-        controls.pack(fill="x", pady=8)
+        controls.pack(fill="x", pady=(0, 6))
 
-        tk.Label(controls, text="Préfixe").grid(row=0, column=0, sticky="w", padx=5)
+        tk.Label(controls, text="Préfixe").grid(row=0, column=0, sticky="w", padx=(4, 3))
         tk.Entry(
             controls,
             textvariable=self.rename_prefix_var,
             width=28
-        ).grid(row=0, column=1, sticky="w", padx=5)
+        ).grid(row=0, column=1, sticky="w", padx=(0, 10))
 
-        tk.Label(controls, text="Année").grid(row=0, column=2, sticky="w", padx=5)
+        tk.Label(controls, text="Année").grid(row=0, column=2, sticky="w", padx=(0, 3))
         tk.Entry(
             controls,
             textvariable=self.rename_year_var,
-            width=10
-        ).grid(row=0, column=3, sticky="w", padx=5)
+            width=8
+        ).grid(row=0, column=3, sticky="w", padx=(0, 10))
 
-        tk.Label(controls, text="Premier numéro").grid(row=0, column=4, sticky="w", padx=5)
+        tk.Label(controls, text="Premier numéro").grid(row=0, column=4, sticky="w", padx=(0, 3))
         tk.Spinbox(
             controls,
             from_=1,
             to=99999,
             textvariable=self.rename_start_var,
-            width=8
-        ).grid(row=0, column=5, sticky="w", padx=5)
+            width=7
+        ).grid(row=0, column=5, sticky="w", padx=(0, 14))
 
         tk.Button(
             controls,
             text="👁️ Prévisualiser",
             command=self.preview_rename_plan
-        ).grid(row=0, column=6, padx=10)
+        ).grid(row=0, column=6, padx=(0, 10))
 
         tk.Button(
             controls,
@@ -9933,25 +10866,80 @@ namespace GestionBissesFolderPicker
             command=self.apply_rename_plan,
             bg="#8e44ad",
             fg="white"
-        ).grid(row=0, column=7, padx=10)
+        ).grid(row=0, column=7, padx=(0, 4))
 
-        info = (
-            "Les photos sont triées par date de prise de vue EXIF.\n"
-            "Les JPG originaux dans Photos sont renommés directement.\n"
-            "Les JPG issus de HEIC/HEIF sont renommés dans Export_JPG.\n"
-            "Le catalogue est mis à jour automatiquement."
+        order_frame = tk.Frame(controls)
+        order_frame.grid(row=1, column=0, columnspan=8, sticky="ew", pady=(7, 0))
+        order_frame.grid_columnconfigure(8, weight=1)
+
+        def order_changed():
+            self.rename_map_fit_done = False
+            self.preview_rename_plan()
+
+        tk.Label(order_frame, text="Ordre :").grid(row=0, column=0, sticky="w", padx=(4, 8))
+
+        tk.Radiobutton(
+            order_frame,
+            text="Date / heure",
+            variable=self.rename_order_mode_var,
+            value="datetime",
+            command=order_changed
+        ).grid(row=0, column=1, sticky="w", padx=(0, 10))
+
+        tk.Radiobutton(
+            order_frame,
+            text="Position GPS",
+            variable=self.rename_order_mode_var,
+            value="gps",
+            command=order_changed
+        ).grid(row=0, column=2, sticky="w", padx=(0, 10))
+
+        tk.Radiobutton(
+            order_frame,
+            text="Tracé si disponible",
+            variable=self.rename_order_mode_var,
+            value="reference",
+            command=order_changed
+        ).grid(row=0, column=3, sticky="w", padx=(0, 12))
+
+        tk.Checkbutton(
+            order_frame,
+            text="Inverser",
+            variable=self.rename_reverse_var,
+            command=order_changed
+        ).grid(row=0, column=4, sticky="w", padx=(0, 12))
+
+        tk.Label(order_frame, text="Proximité").grid(row=0, column=5, sticky="e", padx=(0, 4))
+        tk.Spinbox(
+            order_frame,
+            from_=0,
+            to=80,
+            increment=1,
+            textvariable=self.rename_gps_group_radius_var,
+            width=5,
+            command=order_changed
+        ).grid(row=0, column=6, sticky="w")
+        tk.Label(order_frame, text="m").grid(row=0, column=7, sticky="w", padx=(3, 0))
+
+        # Agencement principal : tableau à gauche, carte à droite.
+        # Ratio visé : 60% tableau / 40% carte.
+        content = tk.PanedWindow(
+            self.main_frame,
+            orient=tk.HORIZONTAL,
+            sashwidth=7,
+            bg="#d6dce1"
         )
-        tk.Label(
-            controls,
-            text=info,
-            fg="#555555",
-            justify="left"
-        ).grid(row=1, column=0, columnspan=8, sticky="w", pady=(10, 0))
+        content.pack(fill="both", expand=True, pady=(4, 0))
 
-        table_frame = tk.Frame(self.main_frame)
-        table_frame.pack(fill="both", expand=True, pady=8)
+        table_frame = tk.Frame(content)
+        map_frame = tk.Frame(content)
 
-        columns = ("order", "date", "current", "new", "folder", "status")
+        content.add(table_frame, minsize=560, width=960)
+        content.add(map_frame, minsize=360, width=640)
+
+        self.build_rename_order_map_panel(map_frame)
+
+        columns = ("order", "date", "current", "new", "status")
         self.rename_tree = ttk.Treeview(
             table_frame,
             columns=columns,
@@ -9962,23 +10950,58 @@ namespace GestionBissesFolderPicker
         self.rename_tree.heading("date", text="Date de prise de vue")
         self.rename_tree.heading("current", text="Nom actuel")
         self.rename_tree.heading("new", text="Nouveau nom")
-        self.rename_tree.heading("folder", text="Dossier")
         self.rename_tree.heading("status", text="Statut")
 
-        self.rename_tree.column("order", width=50, anchor="center")
-        self.rename_tree.column("date", width=160)
-        self.rename_tree.column("current", width=230)
-        self.rename_tree.column("new", width=230)
-        self.rename_tree.column("folder", width=280)
-        self.rename_tree.column("status", width=150)
+        self.rename_tree.column("order", width=55, anchor="center", stretch=False)
+        self.rename_tree.column("date", width=145, stretch=False)
+        self.rename_tree.column("current", width=215)
+        self.rename_tree.column("new", width=245)
+        self.rename_tree.column("status", width=170, stretch=False)
 
         y_scroll = tk.Scrollbar(table_frame, orient="vertical", command=self.rename_tree.yview)
-        self.rename_tree.configure(yscrollcommand=y_scroll.set)
+        x_scroll = tk.Scrollbar(table_frame, orient="horizontal", command=self.rename_tree.xview)
+        self.rename_tree.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
 
-        self.rename_tree.pack(side="left", fill="both", expand=True)
-        y_scroll.pack(side="right", fill="y")
+        self.rename_tree.grid(row=0, column=0, sticky="nsew")
+        y_scroll.grid(row=0, column=1, sticky="ns")
+        x_scroll.grid(row=1, column=0, sticky="ew")
+        table_frame.grid_rowconfigure(0, weight=1)
+        table_frame.grid_columnconfigure(0, weight=1)
+
+        def on_tree_select(_event=None):
+            if getattr(self, "rename_tree_selection_guard", False):
+                return
+            selection = self.rename_tree.selection()
+            if not selection:
+                return
+            children = list(self.rename_tree.get_children())
+            try:
+                index = children.index(selection[0])
+            except Exception:
+                return
+
+            # v51f : carte passive. Le tableau mémorise la sélection seulement.
+            self.rename_map_selected_plan_index = index
+
+        def on_tree_double_click(_event=None):
+            on_tree_select(_event)
+
+        self.rename_tree.bind("<<TreeviewSelect>>", on_tree_select)
+        self.rename_tree.bind("<Double-1>", on_tree_double_click)
 
         self.preview_rename_plan()
+
+        try:
+            self.root.after(
+                500,
+                lambda: content.sash_place(
+                    0,
+                    max(560, int(content.winfo_width() * 0.60)),
+                    0
+                )
+            )
+        except Exception:
+            pass
 
     def build_rename_plan(self):
         prefix = self.sanitize_filename_part(self.rename_prefix_var.get())
@@ -10000,6 +11023,7 @@ namespace GestionBissesFolderPicker
                     "source_path": image_path,
                     "target_path": image_path,
                     "date": datetime.max,
+                    "gps": self.get_entry_gps_latlon(entry),
                     "status": "Fichier introuvable",
                     "skip": True
                 })
@@ -10012,41 +11036,53 @@ namespace GestionBissesFolderPicker
                     "source_path": image_path,
                     "target_path": image_path,
                     "date": datetime.max,
+                    "gps": self.get_entry_gps_latlon(entry),
                     "status": "Non JPG",
                     "skip": True
                 })
                 continue
 
             dt = self.get_capture_datetime_for_sort(image_path, entry)
+            gps = self.get_entry_gps_latlon(entry)
+
             candidates.append({
                 "catalog_index": catalog_index,
                 "entry": entry,
                 "source_path": image_path,
                 "date": dt,
+                "gps": gps,
                 "skip": False
             })
 
         sortable = [p for p in candidates if not p.get("skip")]
         skipped = [p for p in candidates if p.get("skip")]
 
-        sortable.sort(key=lambda p: (p["date"], os.path.basename(p["source_path"]).lower()))
+        ordered = self.sort_rename_candidates(sortable)
 
         plan = []
         number = start
+        mode_label = self.rename_order_mode_label()
 
-        for p in sortable:
+        for p in ordered:
             folder = os.path.dirname(p["source_path"])
             new_name = f"{prefix}_{year}_{number}.jpg"
             target_path = os.path.join(folder, new_name)
 
-            status = "À renommer"
+            status = f"À renommer · {mode_label}"
             if os.path.abspath(p["source_path"]) == os.path.abspath(target_path):
-                status = "Déjà correct"
+                status = f"Déjà correct · {mode_label}"
+
+            if self.rename_order_mode_var.get() in {"gps", "reference"} and not p.get("gps"):
+                status += " · sans GPS, placé en fin"
+
+            if self.rename_order_mode_var.get() == "reference" and "trace_distance_m" in p:
+                status += f" · écart trace {p['trace_distance_m']:.0f} m"
 
             p["target_path"] = target_path
             p["new_name"] = new_name
             p["status"] = status
             p["order_number"] = number
+            p["order_mode"] = self.rename_order_mode_var.get()
 
             plan.append(p)
             number += 1
@@ -10077,7 +11113,19 @@ namespace GestionBissesFolderPicker
             else:
                 date_text = "—"
 
-            folder_text = self.relative_to_base(os.path.dirname(source_path))
+            raw_status = p.get("status", "")
+            if "Déjà correct" in raw_status:
+                status = "Déjà correct"
+            elif "sans GPS" in raw_status:
+                status = "Sans GPS"
+            elif "Tracé" in raw_status or "tracé" in raw_status:
+                status = "À renommer · Tracé"
+            elif "GPS" in raw_status:
+                status = "À renommer · GPS"
+            elif "Date" in raw_status or "date" in raw_status:
+                status = "À renommer · Date"
+            else:
+                status = raw_status
 
             self.rename_tree.insert(
                 "",
@@ -10087,37 +11135,63 @@ namespace GestionBissesFolderPicker
                     date_text,
                     os.path.basename(source_path),
                     os.path.basename(target_path),
-                    folder_text,
-                    p.get("status", "")
+                    status
                 )
             )
 
-        self.log(f"👁️ Aperçu renommage généré : {len(self.rename_plan)} entrée(s).")
+        # v51g :
+        # Toute modification des paramètres d'ordre doit actualiser la carte.
+        # Le dessin reste différé pour attendre la taille réelle de la carte,
+        # mais il n'est plus conditionné par rename_map_fit_done.
+        if self.rename_map_widget:
+            self.schedule_initial_rename_map_draw()
+
+        self.log(
+            f"👁️ Aperçu renommage généré : {len(self.rename_plan)} entrée(s). "
+            f"{self.rename_plan_sort_text()}."
+        )
 
     def apply_rename_plan(self):
-        if not self.rename_plan:
-            self.preview_rename_plan()
+        # v51g : toujours reconstruire le plan au moment d'appliquer.
+        # Cela évite d'utiliser un aperçu périmé après un changement de préfixe,
+        # d'année, de premier numéro, de mode d'ordre, d'inversion ou de proximité.
+        self.preview_rename_plan()
 
         if not self.rename_plan:
             messagebox.showwarning("Aucun renommage", "Aucun plan de renommage disponible.")
             return
 
-        active_plan = [
+        ordered_plan = [
             p for p in self.rename_plan
-            if not p.get("skip")
-            and os.path.abspath(p.get("source_path", "")) != os.path.abspath(p.get("target_path", ""))
+            if not p.get("skip") and p.get("order_number")
         ]
 
-        if not active_plan:
-            messagebox.showinfo("Rien à faire", "Tous les noms sont déjà corrects.")
+        active_plan = [
+            p for p in ordered_plan
+            if os.path.abspath(p.get("source_path", "")) != os.path.abspath(p.get("target_path", ""))
+        ]
+
+        metadata_changes = []
+        for p in ordered_plan:
+            entry = self.catalog_data[p["catalog_index"]]
+            if (
+                int(entry.get("platform_order") or 0) != int(p["order_number"])
+                or entry.get("photo_order_mode") != p.get("order_mode")
+            ):
+                metadata_changes.append(p)
+
+        if not active_plan and not metadata_changes:
+            messagebox.showinfo("Rien à faire", "Tous les noms et ordres sont déjà corrects.")
             return
 
         if not messagebox.askyesno(
             "Confirmation",
             (
-                f"Renommer {len(active_plan)} photo(s) ?\n\n"
-                "Cette opération modifiera les fichiers JPG et le catalogue.\n"
-                "Elle n'altère pas les fichiers HEIC originaux."
+                f"Renommer {len(active_plan)} photo(s) et mettre à jour "
+                f"l'ordre de {len(ordered_plan)} photo(s) dans le catalogue ?\n\n"
+                f"{self.rename_plan_sort_text()}.\n\n"
+                "Cette opération modifiera les fichiers JPG lorsque nécessaire, "
+                "mettra à jour le catalogue et n'altèrera pas les fichiers HEIC originaux."
             )
         ):
             return
@@ -10149,31 +11223,47 @@ namespace GestionBissesFolderPicker
                 os.rename(source_path, temp_path)
                 temp_moves.append((p, temp_path))
 
+            active_by_catalog_index = {}
+
             for p, temp_path in temp_moves:
                 os.rename(temp_path, p["target_path"])
-
-                entry = self.catalog_data[p["catalog_index"]]
-                self.set_entry_image_path(entry, p["target_path"])
-
-                if "original_filename_before_rename" not in entry:
-                    entry["original_filename_before_rename"] = entry.get(
-                        "original_filename",
-                        os.path.basename(p["source_path"])
-                    )
-
-                entry["renamed"] = True
-                entry["rename_date"] = datetime.now().isoformat(timespec="seconds")
-                entry["previous_filename"] = os.path.basename(p["source_path"])
+                active_by_catalog_index[p["catalog_index"]] = p
 
                 self.log(
                     f"🔤 Renommé : {os.path.basename(p['source_path'])} -> {os.path.basename(p['target_path'])}"
                 )
 
+            for p in ordered_plan:
+                entry = self.catalog_data[p["catalog_index"]]
+                active = active_by_catalog_index.get(p["catalog_index"])
+
+                if active:
+                    self.set_entry_image_path(entry, active["target_path"])
+
+                    if "original_filename_before_rename" not in entry:
+                        entry["original_filename_before_rename"] = entry.get(
+                            "original_filename",
+                            os.path.basename(active["source_path"])
+                        )
+
+                    entry["renamed"] = True
+                    entry["rename_date"] = datetime.now().isoformat(timespec="seconds")
+                    entry["previous_filename"] = os.path.basename(active["source_path"])
+
+                entry["photo_order"] = int(p["order_number"])
+                entry["photo_order_mode"] = p.get("order_mode", self.rename_order_mode_var.get())
+                entry["photo_order_label"] = self.rename_order_mode_label(p.get("order_mode"))
+                entry["photo_order_date"] = datetime.now().isoformat(timespec="seconds")
+                entry["platform_order"] = int(p["order_number"])
+
             self.save_catalog()
 
             messagebox.showinfo(
                 "Renommage terminé",
-                f"{len(active_plan)} photo(s) renommée(s)."
+                (
+                    f"{len(active_plan)} photo(s) renommée(s).\n"
+                    f"Ordre enregistré pour {len(ordered_plan)} photo(s)."
+                )
             )
 
             self.load_folder(self.base_folder)
@@ -10181,11 +11271,6 @@ namespace GestionBissesFolderPicker
         except Exception as e:
             messagebox.showerror("Erreur", str(e))
             self.log(f"❌ Erreur renommage : {e}")
-
-
-    # ============================================================
-    # MODULE TRACÉS DU BISSE : IMPORT DES GPX SUISSEMOBILE / TOPO
-    # ============================================================
 
     def strip_accents(self, text):
         normalized = unicodedata.normalize("NFD", str(text))
@@ -15634,6 +16719,16 @@ namespace GestionBissesFolderPicker
 
             sort_datetime = self.get_capture_datetime_for_sort(image_path, entry)
 
+            try:
+                photo_order = int(entry.get("photo_order") or 0)
+            except Exception:
+                photo_order = 0
+
+            try:
+                platform_order = int(entry.get("platform_order") or 0)
+            except Exception:
+                platform_order = 0
+
             photos.append({
                 "catalog_index": idx,
                 "filename": filename,
@@ -15652,18 +16747,40 @@ namespace GestionBissesFolderPicker
                 "ele": ele,
                 "image_path": image_path,
                 "sort_datetime": sort_datetime,
+                "photo_order": photo_order,
+                "photo_order_mode": entry.get("photo_order_mode", ""),
                 "platform_selected": bool(entry.get("platform_selected", False)),
-                "platform_order": int(entry.get("platform_order") or 0)
+                "platform_order": platform_order
             })
 
-        # Ordre de navigation, de numérotation des marqueurs et de tri dans la carte :
-        # date de prise de vue EXIF, avec fallback défini par get_capture_datetime_for_sort.
-        photos.sort(
-            key=lambda photo: (
-                photo.get("sort_datetime", datetime.max),
-                photo.get("filename", "").lower()
+        # v51b :
+        # Après le renommage intelligent, l'ordre final est enregistré dans
+        # photo_order. L'atelier Photos doit respecter cet ordre, sinon il donne
+        # l'impression de "renommer" ou renuméroter à nouveau les images en les
+        # remettant dans l'ordre chronologique.
+        if any(photo.get("photo_order", 0) > 0 for photo in photos):
+            photos.sort(
+                key=lambda photo: (
+                    photo.get("photo_order", 0) if photo.get("photo_order", 0) > 0 else 10**9,
+                    photo.get("filename", "").lower()
+                )
             )
-        )
+        elif photos and all(photo.get("platform_order", 0) > 0 for photo in photos):
+            # Compatibilité pour un catalogue déjà ordonné avant l'introduction
+            # explicite de photo_order.
+            photos.sort(
+                key=lambda photo: (
+                    photo.get("platform_order", 0),
+                    photo.get("filename", "").lower()
+                )
+            )
+        else:
+            photos.sort(
+                key=lambda photo: (
+                    photo.get("sort_datetime", datetime.max),
+                    photo.get("filename", "").lower()
+                )
+            )
 
         return photos
 
@@ -15759,7 +16876,7 @@ namespace GestionBissesFolderPicker
 
             tk.Button(
                 actions,
-                text="🔤 Renommer les photos après tri",
+                text="🔤 Renommer / déterminer l’ordre des photos",
                 command=self.show_rename_interface,
                 bg="#8e44ad",
                 fg="white"
@@ -15887,7 +17004,7 @@ namespace GestionBissesFolderPicker
 
         tk.Button(
             actions,
-            text="🔤 Renommer les photos après tri",
+            text="🔤 Renommer / déterminer l’ordre des photos",
             command=close_then(self.show_rename_interface),
             bg="#8e44ad",
             fg="white",
