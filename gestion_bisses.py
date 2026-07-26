@@ -129,6 +129,10 @@ class BisseManagerApp:
         self.photo_layer_clusters = {"photo": [], "gpx": []}
         self.photo_spider_state = {"photo": None, "gpx": None}
         self.photo_spider_paths = {"photo": [], "gpx": []}
+        # v52a : invalide les callbacks différés dès que le mode photo change.
+        # Un ancien calcul « visible » ne peut ainsi plus recréer un agrégat
+        # après le passage en « Discrètes » ou « Masquées ».
+        self.photo_layer_generation = {"photo": 0, "gpx": 0}
         self.photo_cluster_threshold_px = 42
         self.photo_zoom_animation_token = 0
         # Les commandes de marqueur et de carte peuvent être déclenchées par
@@ -215,6 +219,32 @@ class BisseManagerApp:
         self.gpx_workshop_undo_stack = []
         self.gpx_workshop_redo_stack = []
 
+        # v52 : micro-correction non destructive d'un seul segment.
+        # La géométrie n'est écrite dans le catalogue qu'après validation
+        # explicite ; jusque-là, toute l'édition reste dans cette copie mémoire.
+        self.gpx_geometry_edit_active = False
+        self.gpx_geometry_edit_segment_id = None
+        self.gpx_geometry_edit_draft_parts = []
+        self.gpx_geometry_edit_session_original_parts = []
+        self.gpx_geometry_edit_history = []
+        self.gpx_geometry_edit_redo_history = []
+        self.gpx_geometry_edit_dirty = False
+        self.gpx_geometry_edit_selected_point = None
+        self.gpx_geometry_edit_linked_endpoint_updates = []
+        self.gpx_geometry_edit_quality_baseline = {}
+        self.gpx_geometry_edit_tool_var = tk.StringVar(value="move")
+        self.gpx_geometry_edit_toolbar = None
+        self.gpx_geometry_save_button = None
+        self.gpx_geometry_edit_entry_frame = None
+        self.gpx_geometry_edit_category_row = None
+        self.gpx_geometry_control_icon_cache = {}
+        self.gpx_geometry_control_markers = []
+        self.gpx_geometry_edit_last_zoom = None
+        self.gpx_geometry_edit_last_view_signature = None
+        self.gpx_geometry_edit_zoom_after_id = None
+        self.gpx_geometry_visible_control_points = []
+        self.gpx_workshop_mutation_buttons = []
+
         # Visionneuse flottante unique de l'atelier GPX.
         self.gpx_photo_viewer_window = None
         self.gpx_photo_viewer_canvas = None
@@ -252,17 +282,19 @@ class BisseManagerApp:
             font=("Arial", 20, "bold")
         ).pack(side="left")
 
-        tk.Button(
+        self.header_open_folder_button = tk.Button(
             header,
             text="📂 Ouvrir un dossier bisse",
             command=self.select_base_folder
-        ).pack(side="right", padx=5)
+        )
+        self.header_open_folder_button.pack(side="right", padx=5)
 
-        tk.Button(
+        self.header_workspace_button = tk.Button(
             header,
             text="🏠 Mes bisses",
             command=self.show_workspace_home
-        ).pack(side="right", padx=5)
+        )
+        self.header_workspace_button.pack(side="right", padx=5)
 
         tk.Button(
             header,
@@ -331,6 +363,9 @@ class BisseManagerApp:
         self.root.bind("<Left>", self.handle_photo_navigation_key, add="+")
         self.root.bind("<Right>", self.handle_photo_navigation_key, add="+")
         self.root.bind("<Escape>", self.handle_global_escape_key, add="+")
+        self.root.bind("<Control-z>", self.handle_global_undo_key, add="+")
+        self.root.bind("<Control-y>", self.handle_global_redo_key, add="+")
+        self.root.bind("<Control-Shift-Z>", self.handle_global_redo_key, add="+")
 
         self.create_welcome_screen()
 
@@ -450,6 +485,11 @@ class BisseManagerApp:
 
         try:
             self.cancel_gpx_cut_mode(silent=True)
+        except Exception:
+            pass
+
+        try:
+            self.reset_gpx_geometry_edit_session(redraw=False)
         except Exception:
             pass
 
@@ -12255,6 +12295,11 @@ namespace GestionBissesFolderPicker
             self.gpx_workshop_undo_stack = self.gpx_workshop_undo_stack[-80:]
 
     def undo_gpx_segment_action(self):
+        if self.gpx_geometry_edit_active:
+            self.gpx_workshop_status_var.set(
+                "Utilisez ↶ dans la barre de correction, ou quittez ce mode."
+            )
+            return
         if not self.gpx_workshop_undo_stack:
             self.gpx_workshop_status_var.set("Aucune action de segment à annuler.")
             return
@@ -12273,6 +12318,11 @@ namespace GestionBissesFolderPicker
         self.gpx_workshop_status_var.set(f"↶ Annulé : {previous.get('reason') or 'dernière action'}")
 
     def redo_gpx_segment_action(self):
+        if self.gpx_geometry_edit_active:
+            self.gpx_workshop_status_var.set(
+                "Terminez ou quittez la correction avant de rétablir une action de segment."
+            )
+            return
         if not self.gpx_workshop_redo_stack:
             self.gpx_workshop_status_var.set("Aucune action de segment à rétablir.")
             return
@@ -12326,6 +12376,7 @@ namespace GestionBissesFolderPicker
 
         self.clear_main_frame()
         self.gpx_workshop_active = True
+        self.reset_gpx_geometry_edit_session(redraw=False)
         self.status_header.config(
             text="Atelier Tracés GPX · orientation · segmentation · classement · export",
             fg="#d35400"
@@ -12340,38 +12391,48 @@ namespace GestionBissesFolderPicker
         tk.Button(
             left_actions,
             text="↩️ Tableau de bord",
-            command=lambda: self.load_folder(self.base_folder)
+            command=self.leave_gpx_workshop
         ).pack(side="left", padx=(0, 4))
 
-        tk.Button(
+        self.gpx_workshop_mutation_buttons = []
+
+        import_sources_button = tk.Button(
             left_actions,
             text="📥 Importer des GPX sources",
             command=self.import_gpx_sources_into_workshop,
             bg="#d35400",
             fg="white"
-        ).pack(side="left", padx=4)
+        )
+        import_sources_button.pack(side="left", padx=4)
+        self.gpx_workshop_mutation_buttons.append(import_sources_button)
 
-        tk.Button(
+        rename_sources_button = tk.Button(
             left_actions,
             text="✏️ Renommer les GPX du dossier",
             command=self.show_gpx_rename_dialog
-        ).pack(side="left", padx=4)
+        )
+        rename_sources_button.pack(side="left", padx=4)
+        self.gpx_workshop_mutation_buttons.append(rename_sources_button)
 
-        tk.Button(
+        save_workshop_button = tk.Button(
             left_actions,
             text="💾 Enregistrer l’atelier",
-            command=self.save_gpx_workshop_state,
+            command=self.save_gpx_workshop_from_ui,
             bg="#27ae60",
             fg="white"
-        ).pack(side="left", padx=4)
+        )
+        save_workshop_button.pack(side="left", padx=4)
+        self.gpx_workshop_mutation_buttons.append(save_workshop_button)
 
-        tk.Button(
+        export_segments_button = tk.Button(
             left_actions,
             text="📤 Exporter les tronçons GPX",
             command=self.export_gpx_workshop_segments,
             bg="#2980b9",
             fg="white"
-        ).pack(side="left", padx=4)
+        )
+        export_segments_button.pack(side="left", padx=4)
+        self.gpx_workshop_mutation_buttons.append(export_segments_button)
 
         photo_mode = tk.LabelFrame(toolbar, text="Photos", padx=5, pady=2)
         photo_mode.pack(side="right", padx=(8, 0))
@@ -12459,6 +12520,70 @@ namespace GestionBissesFolderPicker
             bg="#eeeeee",
             fg="#555555"
         ).pack(fill="x", padx=8, pady=(0, 4))
+
+        # Barre v52 entièrement contextuelle : elle n'occupe aucune place en
+        # usage normal et n'apparaît que pendant la correction d'un segment.
+        self.gpx_geometry_edit_toolbar = tk.Frame(
+            parent,
+            bg="#fff3cd",
+            bd=1,
+            relief="solid",
+            padx=5,
+            pady=4
+        )
+
+        tk.Label(
+            self.gpx_geometry_edit_toolbar,
+            text="✏️ Correction",
+            bg="#fff3cd",
+            fg="#6b4f00",
+            font=("Arial", 10, "bold")
+        ).pack(side="left", padx=(0, 5))
+
+        for label, value in (
+            ("Déplacer", "move"),
+            ("+ Ajouter", "add"),
+            ("− Supprimer", "delete"),
+        ):
+            tk.Radiobutton(
+                self.gpx_geometry_edit_toolbar,
+                text=label,
+                variable=self.gpx_geometry_edit_tool_var,
+                value=value,
+                indicatoron=False,
+                command=self.on_gpx_geometry_edit_tool_changed,
+                padx=7,
+                pady=2
+            ).pack(side="left", padx=2)
+
+        tk.Button(
+            self.gpx_geometry_edit_toolbar,
+            text="↶",
+            width=3,
+            command=self.undo_gpx_geometry_edit
+        ).pack(side="left", padx=(6, 2))
+
+        tk.Button(
+            self.gpx_geometry_edit_toolbar,
+            text="Restaurer",
+            command=self.restore_gpx_geometry_original
+        ).pack(side="left", padx=2)
+
+        tk.Button(
+            self.gpx_geometry_edit_toolbar,
+            text="✕ Quitter",
+            command=self.quit_gpx_geometry_edit
+        ).pack(side="right", padx=(2, 0))
+
+        self.gpx_geometry_save_button = tk.Button(
+            self.gpx_geometry_edit_toolbar,
+            text="✓ Enregistrer",
+            width=15,
+            command=self.save_gpx_geometry_edit,
+            bg="#27ae60",
+            fg="white"
+        )
+        self.gpx_geometry_save_button.pack(side="right", padx=2)
 
         # La carte et la visionneuse intégrée partagent un panneau horizontal.
         # La visionneuse peut être ajoutée/retirée sans recréer l'atelier.
@@ -12821,8 +12946,18 @@ namespace GestionBissesFolderPicker
             wraplength=470
         ).pack(fill="x", pady=(0, 6))
 
+        # Le bouton v52 n'est inséré que pour une sélection simple. Le cadre
+        # reste dépaqueté sinon : aucune hauteur supplémentaire permanente.
+        self.gpx_geometry_edit_entry_frame = tk.Frame(parent)
+        tk.Button(
+            self.gpx_geometry_edit_entry_frame,
+            text="✏️ Corriger le tracé",
+            command=self.start_gpx_geometry_edit
+        ).pack(fill="x")
+
         category_row = tk.Frame(parent)
         category_row.pack(fill="x", pady=4)
+        self.gpx_geometry_edit_category_row = category_row
 
         tk.Label(category_row, text="Catégorie :").pack(side="left", padx=(0, 5))
         self.gpx_category_combo = ttk.Combobox(
@@ -13558,6 +13693,19 @@ namespace GestionBissesFolderPicker
 
     def on_gpx_segment_selected(self, _event=None):
         ids = self.get_selected_gpx_segment_ids()
+        if self.gpx_geometry_edit_active:
+            expected = self.gpx_geometry_edit_segment_id
+            if ids != [expected]:
+                try:
+                    self.gpx_segment_tree.selection_set(expected)
+                    self.gpx_segment_tree.focus(expected)
+                except Exception:
+                    pass
+                self.gpx_workshop_status_var.set(
+                    "Terminez ou quittez la correction avant de changer de segment."
+                )
+                return
+
         if not ids:
             self.gpx_workshop_selected_segment_var.set("Aucun segment sélectionné")
         elif len(ids) == 1:
@@ -13577,6 +13725,7 @@ namespace GestionBissesFolderPicker
             self.set_bicolor_combos_from_segment(segment)
         else:
             self.gpx_workshop_selected_segment_var.set(f"{len(ids)} segments sélectionnés")
+        self.update_gpx_geometry_edit_entry_visibility()
         self.draw_gpx_workshop_map()
 
     def find_gpx_source(self, source_id):
@@ -13606,6 +13755,11 @@ namespace GestionBissesFolderPicker
           on propose de retirer aussi les parties de segments concernées,
           afin d'éviter des segments orphelins ou incohérents.
         """
+        if self.gpx_geometry_edit_active:
+            self.gpx_workshop_status_var.set(
+                "Terminez ou quittez la correction avant de retirer une branche."
+            )
+            return
         if not self.gpx_source_tree:
             return
 
@@ -13733,7 +13887,22 @@ namespace GestionBissesFolderPicker
         column = self.gpx_segment_tree.identify_column(event.x)
         item_id = self.gpx_segment_tree.identify_row(event.y)
 
+        if (
+            self.gpx_geometry_edit_active
+            and item_id
+            and item_id != self.gpx_geometry_edit_segment_id
+        ):
+            self.gpx_workshop_status_var.set(
+                "Terminez ou quittez la correction avant de changer de segment."
+            )
+            return "break"
+
         if region == "cell" and column == "#1" and item_id:
+            if self.gpx_geometry_edit_active:
+                self.gpx_workshop_status_var.set(
+                    "La visibilité du segment reste fixe pendant sa correction."
+                )
+                return "break"
             current_selection = list(self.gpx_segment_tree.selection())
             segment = self.find_gpx_segment(item_id)
             if segment:
@@ -13958,6 +14127,11 @@ namespace GestionBissesFolderPicker
         )
 
     def prepare_workshop_segments_from_sources(self):
+        if self.gpx_geometry_edit_active:
+            self.gpx_workshop_status_var.set(
+                "Terminez ou quittez la correction avant de recréer les segments."
+            )
+            return
         workshop = self.get_gpx_workshop_state()
         sources = sorted(
             workshop.get("sources", []),
@@ -14059,7 +14233,17 @@ namespace GestionBissesFolderPicker
         mode = "visible" if self.gpx_workshop_show_photos_var.get() else "hidden"
         self.set_gpx_photo_display_mode(mode)
 
+    def clear_gpx_geometry_control_markers(self):
+        markers = list(self.gpx_geometry_control_markers)
+        self.gpx_geometry_control_markers = []
+        self.gpx_geometry_visible_control_points = []
+        self.delete_map_objects_with_retry(markers)
+
     def clear_gpx_editor_drawings(self):
+        # v52a : les points d'édition ont leur propre couche. Ils sont effacés
+        # explicitement avant tout redessin et surtout à la sortie du mode.
+        self.clear_gpx_geometry_control_markers()
+
         for path in self.gpx_editor_paths:
             try:
                 path.delete()
@@ -14378,8 +14562,17 @@ namespace GestionBissesFolderPicker
             # des autres sans changer leur couleur de catégorie.
             for segment in normal_segments + selected_segments:
                 selected = segment.get("id") in selected_segment_ids
-                for part in segment.get("parts", []):
-                    self.draw_gpx_segment_part_on_editor_map(segment, part, selected=selected)
+                displayed_segment = segment
+                if self.gpx_geometry_edit_active:
+                    displayed_segment = self.preview_gpx_geometry_segment(
+                        segment
+                    )
+                for part in displayed_segment.get("parts", []):
+                    self.draw_gpx_segment_part_on_editor_map(
+                        displayed_segment,
+                        part,
+                        selected=selected
+                    )
         else:
             selected_source_id = self.gpx_workshop_selected_source_id
             for source in workshop.get("sources", []):
@@ -14418,6 +14611,9 @@ namespace GestionBissesFolderPicker
                 if endpoint_b:
                     self.add_gpx_endpoint_marker(endpoint_b[0], endpoint_b[1], "B")
 
+        if self.gpx_geometry_edit_active:
+            self.draw_gpx_geometry_control_points()
+
         self.update_gpx_endpoint_toggle_button()
 
         # Synchronisation stricte de la case « Afficher les photos » après
@@ -14425,6 +14621,8 @@ namespace GestionBissesFolderPicker
         self.sync_gpx_workshop_photo_markers()
 
     def select_gpx_segment_by_id(self, segment_id):
+        if self.gpx_geometry_edit_active:
+            return
         if self.gpx_segment_tree:
             self.gpx_segment_tree.selection_set(segment_id)
             self.gpx_segment_tree.focus(segment_id)
@@ -14711,7 +14909,52 @@ namespace GestionBissesFolderPicker
 
         return None
 
+    def handle_global_undo_key(self, _event=None):
+        """
+        Raccourci contextuel et non intrusif :
+        - les champs texte conservent leur propre Ctrl+Z ;
+        - la correction géométrique utilise son historique local ;
+        - l'atelier GPX normal utilise l'historique des segments.
+        """
+        if self.focus_is_text_editor():
+            return None
+
+        if self.gpx_geometry_edit_active:
+            self.undo_gpx_geometry_edit()
+            return "break"
+
+        if self.gpx_workshop_active:
+            if self.gpx_workshop_click_mode == "cut":
+                self.cancel_gpx_cut_mode(silent=True)
+            self.undo_gpx_segment_action()
+            return "break"
+
+        return None
+
+    def handle_global_redo_key(self, _event=None):
+        """
+        Ctrl+Y (et Ctrl+Maj+Z) suit le même routage que Ctrl+Z.
+        """
+        if self.focus_is_text_editor():
+            return None
+
+        if self.gpx_geometry_edit_active:
+            self.redo_gpx_geometry_edit()
+            return "break"
+
+        if self.gpx_workshop_active:
+            if self.gpx_workshop_click_mode == "cut":
+                self.cancel_gpx_cut_mode(silent=True)
+            self.redo_gpx_segment_action()
+            return "break"
+
+        return None
+
     def handle_global_escape_key(self, _event=None):
+        if self.gpx_geometry_edit_active:
+            self.quit_gpx_geometry_edit()
+            return "break"
+
         if self.gpx_workshop_click_mode == "cut":
             self.cancel_gpx_cut_mode(silent=False)
             return "break"
@@ -14799,6 +15042,1263 @@ namespace GestionBissesFolderPicker
             (min(lats), max(lons))
         )
 
+    # ============================================================
+    # v52 — MICRO-CORRECTION NON DESTRUCTIVE DES TRACÉS
+    # ============================================================
+
+    def set_gpx_geometry_navigation_locked(self, locked):
+        state = "disabled" if locked else "normal"
+        for button in (
+            getattr(self, "header_open_folder_button", None),
+            getattr(self, "header_workspace_button", None),
+        ):
+            if button:
+                try:
+                    button.config(state=state)
+                except Exception:
+                    pass
+        for button in getattr(self, "gpx_workshop_mutation_buttons", []):
+            try:
+                button.config(state=state)
+            except Exception:
+                pass
+
+    def update_gpx_geometry_edit_entry_visibility(self):
+        frame = self.gpx_geometry_edit_entry_frame
+        if not frame:
+            return
+
+        try:
+            if self.gpx_geometry_edit_active:
+                frame.pack_forget()
+                return
+
+            if len(self.get_selected_gpx_segment_ids()) == 1:
+                options = {"fill": "x", "pady": (0, 5)}
+                if self.gpx_geometry_edit_category_row:
+                    options["before"] = self.gpx_geometry_edit_category_row
+                frame.pack(**options)
+            else:
+                frame.pack_forget()
+        except Exception:
+            pass
+
+    def leave_gpx_workshop(self):
+        if self.gpx_geometry_edit_active and not self.quit_gpx_geometry_edit():
+            return
+        self.load_folder(self.base_folder)
+
+    def save_gpx_workshop_from_ui(self):
+        if self.gpx_geometry_edit_active:
+            self.gpx_workshop_status_var.set(
+                "Utilisez « ✓ Enregistrer » dans la barre de correction pour valider le tracé."
+            )
+            return
+        try:
+            self.save_gpx_workshop_state()
+            self.gpx_workshop_status_var.set("Atelier GPX enregistré.")
+        except Exception as exc:
+            messagebox.showerror(
+                "Enregistrement impossible",
+                f"L’atelier GPX n’a pas pu être enregistré.\n\n{exc}"
+            )
+
+    def stop_gpx_geometry_edit_view_watch(self):
+        if self.gpx_geometry_edit_zoom_after_id:
+            try:
+                self.root.after_cancel(self.gpx_geometry_edit_zoom_after_id)
+            except Exception:
+                pass
+        self.gpx_geometry_edit_zoom_after_id = None
+        self.gpx_geometry_edit_last_view_signature = None
+
+    def start_gpx_geometry_edit_view_watch(self):
+        self.stop_gpx_geometry_edit_view_watch()
+
+        def tick():
+            if not self.gpx_geometry_edit_active or not self.gpx_editor_map:
+                self.gpx_geometry_edit_zoom_after_id = None
+                return
+
+            center = self.get_gpx_map_center()
+            signature = (
+                self.get_map_zoom_value(self.gpx_editor_map),
+                round(center[0], 5) if center else None,
+                round(center[1], 5) if center else None,
+                int(self.gpx_editor_map.winfo_width()),
+                int(self.gpx_editor_map.winfo_height()),
+            )
+            if signature != self.gpx_geometry_edit_last_view_signature:
+                self.gpx_geometry_edit_last_view_signature = signature
+                self.gpx_geometry_edit_last_zoom = signature[0]
+                self.draw_gpx_workshop_map()
+
+            try:
+                self.gpx_geometry_edit_zoom_after_id = self.root.after(350, tick)
+            except Exception:
+                self.gpx_geometry_edit_zoom_after_id = None
+
+        try:
+            self.gpx_geometry_edit_zoom_after_id = self.root.after(200, tick)
+        except Exception:
+            self.gpx_geometry_edit_zoom_after_id = None
+
+    def update_gpx_geometry_dirty_indicator(self):
+        """
+        Convention visuelle commune pour les éditeurs à validation explicite :
+        une étoile dans le bouton existant, sans ajouter de zone à l'écran.
+        Les autres actions de l'atelier GPX sont sauvegardées immédiatement et
+        ne doivent donc pas afficher un faux état « non enregistré ».
+        """
+        button = self.gpx_geometry_save_button
+        if not button:
+            return
+        try:
+            button.config(
+                text="✓ Enregistrer *"
+                if self.gpx_geometry_edit_dirty
+                else "✓ Enregistrer"
+            )
+        except Exception:
+            pass
+
+    def current_gpx_geometry_edit_state(self):
+        return {
+            "parts": copy.deepcopy(self.gpx_geometry_edit_draft_parts),
+            "linked_endpoint_updates": copy.deepcopy(
+                self.gpx_geometry_edit_linked_endpoint_updates
+            ),
+        }
+
+    def restore_gpx_geometry_edit_state(self, state):
+        if isinstance(state, dict):
+            parts = state.get("parts", [])
+            linked = state.get("linked_endpoint_updates", [])
+        else:
+            # Compatibilité défensive avec l'ancien format interne d'historique.
+            parts = state if isinstance(state, list) else []
+            linked = []
+
+        self.gpx_geometry_edit_draft_parts = copy.deepcopy(parts)
+        self.gpx_geometry_edit_linked_endpoint_updates = copy.deepcopy(linked)
+        self.prune_noop_gpx_geometry_linked_endpoint_updates()
+        self.gpx_geometry_edit_selected_point = None
+        self.gpx_geometry_edit_dirty = (
+            self.gpx_geometry_edit_draft_parts
+            != self.gpx_geometry_edit_session_original_parts
+            or bool(self.gpx_geometry_edit_linked_endpoint_updates)
+        )
+        self.update_gpx_geometry_dirty_indicator()
+
+    def reset_gpx_geometry_edit_session(self, redraw=True):
+        was_active = bool(getattr(self, "gpx_geometry_edit_active", False))
+        self.stop_gpx_geometry_edit_view_watch()
+        # Suppression immédiate, indépendante du redessin général : aucun
+        # point de contrôle ne peut survivre à « Quitter ».
+        self.clear_gpx_geometry_control_markers()
+        self.gpx_geometry_edit_active = False
+        self.gpx_geometry_edit_segment_id = None
+        self.gpx_geometry_edit_draft_parts = []
+        self.gpx_geometry_edit_session_original_parts = []
+        self.gpx_geometry_edit_history = []
+        self.gpx_geometry_edit_redo_history = []
+        self.gpx_geometry_edit_dirty = False
+        self.gpx_geometry_edit_selected_point = None
+        self.gpx_geometry_edit_linked_endpoint_updates = []
+        self.gpx_geometry_edit_quality_baseline = {}
+        self.gpx_geometry_edit_last_zoom = None
+        self.gpx_geometry_edit_last_view_signature = None
+        self.gpx_geometry_visible_control_points = []
+        self.gpx_geometry_edit_tool_var.set("move")
+        self.update_gpx_geometry_dirty_indicator()
+
+        if self.gpx_geometry_edit_toolbar:
+            try:
+                self.gpx_geometry_edit_toolbar.pack_forget()
+            except Exception:
+                pass
+
+        self.set_gpx_geometry_navigation_locked(False)
+        if was_active:
+            self.exit_gpx_segment_edit_photo_mode()
+        self.update_gpx_geometry_edit_entry_visibility()
+
+        if redraw and self.gpx_editor_map:
+            self.draw_gpx_workshop_map()
+
+    def start_gpx_geometry_edit(self):
+        if self.gpx_geometry_edit_active:
+            return
+
+        ids = self.get_selected_gpx_segment_ids()
+        if len(ids) != 1:
+            messagebox.showwarning(
+                "Sélection requise",
+                "Sélectionnez exactement un segment à corriger."
+            )
+            return
+
+        segment = self.find_gpx_segment(ids[0])
+        if not segment:
+            return
+
+        parts = copy.deepcopy(segment.get("parts", []))
+        if not parts or any(len(part.get("points", [])) < 2 for part in parts):
+            messagebox.showwarning(
+                "Tracé inexploitable",
+                "Ce segment ne contient pas une géométrie valide à corriger."
+            )
+            return
+
+        self.cancel_gpx_cut_mode(silent=True)
+        self.gpx_geometry_edit_active = True
+        self.gpx_geometry_edit_segment_id = ids[0]
+        self.gpx_geometry_edit_draft_parts = parts
+        self.gpx_geometry_edit_session_original_parts = copy.deepcopy(parts)
+        self.gpx_geometry_edit_history = []
+        self.gpx_geometry_edit_redo_history = []
+        self.gpx_geometry_edit_dirty = False
+        self.gpx_geometry_edit_selected_point = None
+        self.gpx_geometry_edit_linked_endpoint_updates = []
+        self.gpx_geometry_edit_quality_baseline = (
+            self.gpx_geometry_quality_counts(parts)
+        )
+        self.gpx_geometry_edit_tool_var.set("move")
+        self.gpx_geometry_edit_last_zoom = self.get_map_zoom_value(self.gpx_editor_map)
+        self.gpx_geometry_edit_last_view_signature = None
+        self.set_gpx_geometry_navigation_locked(True)
+        self.enter_gpx_segment_edit_photo_mode()
+
+        if self.gpx_geometry_edit_toolbar and self.gpx_map_viewer_paned:
+            self.gpx_geometry_edit_toolbar.pack(
+                fill="x",
+                padx=8,
+                pady=(0, 4),
+                before=self.gpx_map_viewer_paned
+            )
+
+        self.update_gpx_geometry_edit_entry_visibility()
+        self.update_gpx_geometry_dirty_indicator()
+        self.start_gpx_geometry_edit_view_watch()
+        self.draw_gpx_workshop_map()
+        self.gpx_workshop_status_var.set(
+            "Correction active · Déplacer : cliquez un point, puis sa nouvelle position · Ctrl+Z / Ctrl+Y."
+        )
+
+    def quit_gpx_geometry_edit(self):
+        if not self.gpx_geometry_edit_active:
+            return True
+
+        if self.gpx_geometry_edit_dirty:
+            if not messagebox.askyesno(
+                "Quitter la correction ?",
+                "Les corrections non enregistrées seront perdues.\n\nQuitter quand même ?"
+            ):
+                return False
+
+        self.reset_gpx_geometry_edit_session(redraw=True)
+        self.gpx_workshop_status_var.set("Correction du tracé quittée.")
+        return True
+
+    def on_gpx_geometry_edit_tool_changed(self):
+        if not self.gpx_geometry_edit_active:
+            return
+
+        self.gpx_geometry_edit_selected_point = None
+        tool = self.gpx_geometry_edit_tool_var.get()
+        messages = {
+            "move": "Déplacer : cliquez un point, puis sa nouvelle position.",
+            "add": "Ajouter : cliquez près du tracé à l’endroit du nouveau point.",
+            "delete": "Supprimer : cliquez sur le point à retirer.",
+        }
+        self.draw_gpx_workshop_map()
+        self.gpx_workshop_status_var.set(f"Correction active · {messages.get(tool, '')}")
+
+    def snapshot_gpx_geometry_draft(self):
+        self.gpx_geometry_edit_history.append(
+            self.current_gpx_geometry_edit_state()
+        )
+        self.gpx_geometry_edit_redo_history.clear()
+        if len(self.gpx_geometry_edit_history) > 80:
+            self.gpx_geometry_edit_history = self.gpx_geometry_edit_history[-80:]
+
+    def undo_gpx_geometry_edit(self):
+        if not self.gpx_geometry_edit_active:
+            return
+        if not self.gpx_geometry_edit_history:
+            self.gpx_workshop_status_var.set(
+                "Aucune correction non enregistrée à annuler."
+            )
+            return
+
+        self.gpx_geometry_edit_redo_history.append(
+            self.current_gpx_geometry_edit_state()
+        )
+        self.restore_gpx_geometry_edit_state(
+            self.gpx_geometry_edit_history.pop()
+        )
+        self.draw_gpx_workshop_map()
+        self.gpx_workshop_status_var.set("↶ Dernière correction annulée.")
+
+    def redo_gpx_geometry_edit(self):
+        if not self.gpx_geometry_edit_active:
+            return
+        if not self.gpx_geometry_edit_redo_history:
+            self.gpx_workshop_status_var.set(
+                "Aucune correction non enregistrée à rétablir."
+            )
+            return
+
+        self.gpx_geometry_edit_history.append(
+            self.current_gpx_geometry_edit_state()
+        )
+        self.restore_gpx_geometry_edit_state(
+            self.gpx_geometry_edit_redo_history.pop()
+        )
+        self.draw_gpx_workshop_map()
+        self.gpx_workshop_status_var.set("↷ Dernière correction rétablie.")
+
+    def restore_gpx_geometry_original(self):
+        if not self.gpx_geometry_edit_active:
+            return
+
+        segment = self.find_gpx_segment(self.gpx_geometry_edit_segment_id)
+        if not segment:
+            return
+
+        original = segment.get("geometry_original_parts")
+        if not original:
+            original = self.gpx_geometry_edit_session_original_parts
+
+        if not original:
+            self.gpx_workshop_status_var.set("Aucune géométrie originale disponible.")
+            return
+
+        if not messagebox.askyesno(
+            "Restaurer le tracé original ?",
+            "La géométrie originale sera chargée dans l’aperçu.\n"
+            "Elle ne remplacera le tracé enregistré qu’après « Enregistrer »."
+        ):
+            return
+
+        self.snapshot_gpx_geometry_draft()
+        self.gpx_geometry_edit_draft_parts = copy.deepcopy(original)
+        self.gpx_geometry_edit_linked_endpoint_updates = []
+        self.gpx_geometry_edit_selected_point = None
+        self.gpx_geometry_edit_dirty = (
+            self.gpx_geometry_edit_draft_parts
+            != self.gpx_geometry_edit_session_original_parts
+        )
+        self.update_gpx_geometry_dirty_indicator()
+        self.draw_gpx_workshop_map()
+        self.gpx_workshop_status_var.set(
+            "Tracé original chargé dans l’aperçu · cliquez « Enregistrer » pour valider."
+        )
+
+    def gpx_geometry_edit_min_zoom(self):
+        return 17
+
+    def gpx_geometry_edit_tolerance_m(self, latitude, pixels=18):
+        zoom = self.get_map_zoom_value(self.gpx_editor_map)
+        if zoom is None:
+            zoom = self.gpx_geometry_edit_min_zoom()
+        meters_per_pixel = (
+            156543.03392
+            * max(0.15, math.cos(math.radians(float(latitude))))
+            / (2 ** zoom)
+        )
+        return max(1.5, min(60.0, meters_per_pixel * float(pixels)))
+
+    def get_gpx_geometry_control_icon(self, selected=False):
+        key = "selected" if selected else "normal"
+        if key in self.gpx_geometry_control_icon_cache:
+            return self.gpx_geometry_control_icon_cache[key]
+
+        size = 17 if selected else 11
+        image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        fill = "#e74c3c" if selected else "#fff7d1"
+        outline = "#922b21" if selected else "#6b4f00"
+        draw.ellipse(
+            (1, 1, size - 2, size - 2),
+            fill=fill,
+            outline=outline,
+            width=2
+        )
+        icon = ImageTk.PhotoImage(image)
+        self.gpx_geometry_control_icon_cache[key] = icon
+        return icon
+
+    def get_gpx_map_center(self):
+        if not self.gpx_editor_map:
+            return None
+        try:
+            getter = getattr(self.gpx_editor_map, "get_position", None)
+            if callable(getter):
+                position = getter()
+                return float(position[0]), float(position[1])
+        except Exception:
+            pass
+        try:
+            position = getattr(self.gpx_editor_map, "position", None)
+            if position and len(position) >= 2:
+                return float(position[0]), float(position[1])
+        except Exception:
+            pass
+        return None
+
+    def visible_gpx_geometry_control_points(self):
+        points = []
+        for part_index, part in enumerate(self.gpx_geometry_edit_draft_parts):
+            for point_index, point in enumerate(part.get("points", [])):
+                if point and len(point) >= 2:
+                    try:
+                        points.append((
+                            part_index,
+                            point_index,
+                            float(point[0]),
+                            float(point[1])
+                        ))
+                    except (TypeError, ValueError):
+                        continue
+
+        center = self.get_gpx_map_center()
+        zoom = self.get_map_zoom_value(self.gpx_editor_map)
+        if not center or zoom is None or not self.gpx_editor_map:
+            return points[:800]
+
+        try:
+            center_x, center_y = self.latlon_to_world_pixel(center[0], center[1], zoom)
+            half_w = max(200, self.gpx_editor_map.winfo_width()) / 2 + 60
+            half_h = max(200, self.gpx_editor_map.winfo_height()) / 2 + 60
+            visible = []
+            for item in points:
+                point_x, point_y = self.latlon_to_world_pixel(item[2], item[3], zoom)
+                if abs(point_x - center_x) <= half_w and abs(point_y - center_y) <= half_h:
+                    visible.append(item)
+            # Garde-fou de performance : un nombre anormalement élevé de
+            # marqueurs ne doit jamais figer toute l'application.
+            if len(visible) > 800:
+                stride = int(math.ceil(len(visible) / 800))
+                visible = visible[::stride]
+            return visible
+        except Exception:
+            return points[:800]
+
+    def draw_gpx_geometry_control_points(self):
+        self.gpx_geometry_visible_control_points = []
+        if not self.gpx_geometry_edit_active or not self.gpx_editor_map:
+            return
+
+        zoom = self.get_map_zoom_value(self.gpx_editor_map)
+        if zoom is not None and zoom < self.gpx_geometry_edit_min_zoom():
+            self.gpx_workshop_status_var.set(
+                "Correction active · zoomez davantage pour afficher et modifier les points."
+            )
+            return
+
+        visible = self.visible_gpx_geometry_control_points()
+        self.gpx_geometry_visible_control_points = visible
+        selected_key = self.gpx_geometry_edit_selected_point
+
+        for part_index, point_index, lat, lon in visible:
+            selected = selected_key == (part_index, point_index)
+            try:
+                marker = self.gpx_editor_map.set_marker(
+                    lat,
+                    lon,
+                    icon=self.get_gpx_geometry_control_icon(selected=selected),
+                    icon_anchor="center"
+                )
+            except TypeError:
+                marker = self.gpx_editor_map.set_marker(lat, lon, text="•")
+            self.gpx_geometry_control_markers.append(marker)
+
+    def nearest_visible_gpx_geometry_point(self, coords):
+        click_lat, click_lon = float(coords[0]), float(coords[1])
+        candidates = self.gpx_geometry_visible_control_points
+        if not candidates:
+            return None, None
+
+        nearest = min(
+            candidates,
+            key=lambda item: self.haversine_distance_m(
+                click_lat, click_lon, item[2], item[3]
+            )
+        )
+        distance = self.haversine_distance_m(
+            click_lat, click_lon, nearest[2], nearest[3]
+        )
+        tolerance = self.gpx_geometry_edit_tolerance_m(click_lat, pixels=20)
+        if distance > tolerance:
+            return None, distance
+        return (nearest[0], nearest[1]), distance
+
+    def point_to_gpx_edge_distance(self, coords, point_a, point_b):
+        lat, lon = float(coords[0]), float(coords[1])
+        lat_a, lon_a = float(point_a[0]), float(point_a[1])
+        lat_b, lon_b = float(point_b[0]), float(point_b[1])
+        meters_lat = 111320.0
+        meters_lon = max(1.0, 111320.0 * math.cos(math.radians(lat)))
+
+        ax = (lon_a - lon) * meters_lon
+        ay = (lat_a - lat) * meters_lat
+        bx = (lon_b - lon) * meters_lon
+        by = (lat_b - lat) * meters_lat
+        dx = bx - ax
+        dy = by - ay
+        length_sq = dx * dx + dy * dy
+        if length_sq <= 0:
+            return math.hypot(ax, ay), 0.0
+
+        ratio = max(0.0, min(1.0, -(ax * dx + ay * dy) / length_sq))
+        nearest_x = ax + ratio * dx
+        nearest_y = ay + ratio * dy
+        return math.hypot(nearest_x, nearest_y), ratio
+
+    def nearest_gpx_geometry_edge(self, coords):
+        best = None
+        for part_index, part in enumerate(self.gpx_geometry_edit_draft_parts):
+            points = part.get("points", [])
+            for point_index in range(len(points) - 1):
+                distance, ratio = self.point_to_gpx_edge_distance(
+                    coords,
+                    points[point_index],
+                    points[point_index + 1]
+                )
+                if best is None or distance < best[0]:
+                    best = (distance, part_index, point_index, ratio)
+        return best
+
+    def gpx_geometry_endpoint_side(self, part_index, point_index):
+        try:
+            points = self.gpx_geometry_edit_draft_parts[part_index].get(
+                "points", []
+            )
+        except (IndexError, TypeError):
+            return None
+
+        if not points:
+            return None
+        if point_index == 0:
+            return "start"
+        if point_index == len(points) - 1:
+            return "end"
+        return None
+
+    def find_gpx_geometry_linked_endpoint_group(self, part_index, side):
+        for group in self.gpx_geometry_edit_linked_endpoint_updates:
+            if (
+                group.get("source_part_index") == part_index
+                and group.get("source_side") == side
+            ):
+                return group
+        return None
+
+    def remove_gpx_geometry_linked_endpoint_group(self, part_index, side):
+        self.gpx_geometry_edit_linked_endpoint_updates = [
+            group
+            for group in self.gpx_geometry_edit_linked_endpoint_updates
+            if not (
+                group.get("source_part_index") == part_index
+                and group.get("source_side") == side
+            )
+        ]
+
+    def prune_noop_gpx_geometry_linked_endpoint_updates(self):
+        """
+        Retire les propagations revenues exactement à la géométrie enregistrée,
+        afin que l'étoile ne signale jamais une fausse modification.
+        """
+        remaining = []
+        for group in self.gpx_geometry_edit_linked_endpoint_updates:
+            new_point = group.get("new_point")
+            changed = False
+            unresolved = False
+
+            for target in group.get("targets", []):
+                segment = self.find_gpx_segment(target.get("segment_id"))
+                try:
+                    points = segment["parts"][int(target.get("part_index"))]["points"]
+                    point = (
+                        points[0]
+                        if target.get("side") == "start"
+                        else points[-1]
+                    )
+                    if self.point_distance_m(point, new_point) > 0.05:
+                        changed = True
+                except (IndexError, KeyError, TypeError, ValueError):
+                    unresolved = True
+
+            if changed or unresolved:
+                remaining.append(group)
+
+        self.gpx_geometry_edit_linked_endpoint_updates = remaining
+
+    def find_shared_gpx_segment_endpoints(
+        self,
+        point,
+        excluded_segment_id=None,
+        tolerance_m=2.0
+    ):
+        """
+        Repère uniquement les extrémités d'autres segments. Aucun objet du
+        catalogue n'est modifié ici : le résultat sert à préparer un brouillon
+        de continuité qui ne sera appliqué qu'à l'enregistrement.
+        """
+        matches = []
+        for segment in self.get_gpx_workshop_state().get("segments", []):
+            segment_id = segment.get("id")
+            if not segment_id or segment_id == excluded_segment_id:
+                continue
+
+            for part_index, part in enumerate(segment.get("parts", [])):
+                points = part.get("points", [])
+                if len(points) < 2:
+                    continue
+
+                for side, target in (
+                    ("start", points[0]),
+                    ("end", points[-1]),
+                ):
+                    try:
+                        distance = self.point_distance_m(point, target)
+                    except Exception:
+                        continue
+                    if distance <= tolerance_m:
+                        matches.append({
+                            "segment_id": segment_id,
+                            "part_index": part_index,
+                            "side": side,
+                            "distance_m": distance,
+                            "original_point": copy.deepcopy(target),
+                        })
+        return matches
+
+    def gpx_geometry_large_move_threshold_m(self, part_index, point_index):
+        """
+        Seuil adaptatif pour détecter un clic de destination manifestement
+        éloigné. Il ne bloque jamais silencieusement : il demande confirmation.
+        """
+        try:
+            points = self.gpx_geometry_edit_draft_parts[part_index]["points"]
+            point = points[point_index]
+        except (IndexError, KeyError, TypeError):
+            return 75.0
+
+        local_distances = []
+        for neighbour_index in (point_index - 1, point_index + 1):
+            if 0 <= neighbour_index < len(points):
+                try:
+                    distance = self.point_distance_m(
+                        point,
+                        points[neighbour_index]
+                    )
+                except Exception:
+                    continue
+                if math.isfinite(distance) and distance > 0:
+                    local_distances.append(distance)
+
+        if not local_distances:
+            return 75.0
+
+        local_spacing = min(local_distances)
+        return max(40.0, min(150.0, local_spacing * 8.0))
+
+    def confirm_gpx_geometry_large_move(
+        self,
+        old_point,
+        new_coords,
+        part_index,
+        point_index
+    ):
+        distance = self.point_distance_m(old_point, new_coords)
+        threshold = self.gpx_geometry_large_move_threshold_m(
+            part_index,
+            point_index
+        )
+        if distance <= threshold:
+            return True
+
+        return messagebox.askyesno(
+            "Déplacement inhabituel",
+            (
+                f"Ce point serait déplacé d’environ {distance:.0f} m.\n\n"
+                "Pour une micro-correction, cette distance paraît importante. "
+                "Confirmer tout de même le déplacement ?"
+            )
+        )
+
+    def gpx_geometry_quality_counts(self, parts):
+        """
+        Contrôle léger, destiné à repérer les nouveaux défauts évidents sans
+        bloquer un ancien GPX qui en contiendrait déjà.
+        """
+        counts = {"duplicates": 0, "jumps": 0}
+
+        for part in parts or []:
+            points = part.get("points", [])
+            distances = []
+            for index in range(len(points) - 1):
+                try:
+                    distance = self.point_distance_m(
+                        points[index],
+                        points[index + 1]
+                    )
+                except Exception:
+                    continue
+                if not math.isfinite(distance):
+                    continue
+                distances.append(distance)
+                if distance <= 0.10:
+                    counts["duplicates"] += 1
+
+            positive = sorted(
+                distance for distance in distances
+                if distance > 0.10
+            )
+            if not positive:
+                continue
+
+            middle = len(positive) // 2
+            if len(positive) % 2:
+                median = positive[middle]
+            else:
+                median = (positive[middle - 1] + positive[middle]) / 2.0
+
+            relative_threshold = max(300.0, median * 20.0)
+            for distance in positive:
+                if (
+                    distance > relative_threshold
+                    or distance > 2500.0
+                ):
+                    counts["jumps"] += 1
+
+        return counts
+
+    def gpx_geometry_new_quality_warning(self, parts, baseline=None):
+        baseline = baseline or {}
+        counts = self.gpx_geometry_quality_counts(parts)
+        new_duplicates = max(
+            0,
+            counts.get("duplicates", 0)
+            - int(baseline.get("duplicates", 0))
+        )
+        new_jumps = max(
+            0,
+            counts.get("jumps", 0)
+            - int(baseline.get("jumps", 0))
+        )
+
+        details = []
+        if new_duplicates:
+            details.append(
+                f"{new_duplicates} doublon(s) de points consécutifs"
+            )
+        if new_jumps:
+            details.append(
+                f"{new_jumps} saut(s) de distance inhabituel(s)"
+            )
+        return details
+
+    def apply_gpx_geometry_linked_updates_to_parts(self, segment_id, parts):
+        preview_parts = copy.deepcopy(parts)
+        for group in self.gpx_geometry_edit_linked_endpoint_updates:
+            new_point = group.get("new_point")
+            if not new_point or len(new_point) < 2:
+                continue
+
+            for target in group.get("targets", []):
+                if target.get("segment_id") != segment_id:
+                    continue
+                try:
+                    points = preview_parts[target.get("part_index")]["points"]
+                    point_index = 0 if target.get("side") == "start" else len(points) - 1
+                    previous = points[point_index]
+                    updated = list(previous)
+                    updated[0] = float(new_point[0])
+                    updated[1] = float(new_point[1])
+                    points[point_index] = updated
+                except (IndexError, KeyError, TypeError, ValueError):
+                    continue
+        return preview_parts
+
+    def preview_gpx_geometry_segment(self, segment):
+        displayed = copy.deepcopy(segment)
+        if segment.get("id") == self.gpx_geometry_edit_segment_id:
+            displayed["parts"] = copy.deepcopy(
+                self.gpx_geometry_edit_draft_parts
+            )
+        else:
+            displayed["parts"] = self.apply_gpx_geometry_linked_updates_to_parts(
+                segment.get("id"),
+                segment.get("parts", [])
+            )
+        return displayed
+
+    def handle_gpx_geometry_edit_click(self, coords):
+        if not self.gpx_geometry_edit_active:
+            return
+
+        zoom = self.get_map_zoom_value(self.gpx_editor_map)
+        if zoom is not None and zoom < self.gpx_geometry_edit_min_zoom():
+            self.gpx_workshop_status_var.set(
+                "Zoomez davantage avant de modifier les points du tracé."
+            )
+            return
+
+        tool = self.gpx_geometry_edit_tool_var.get()
+        if tool == "move":
+            if self.gpx_geometry_edit_selected_point is None:
+                key, _distance = self.nearest_visible_gpx_geometry_point(coords)
+                if key is None:
+                    self.gpx_workshop_status_var.set(
+                        "Aucun point assez proche · cliquez directement sur une pastille de contrôle."
+                    )
+                    return
+                self.gpx_geometry_edit_selected_point = key
+                self.draw_gpx_workshop_map()
+                self.gpx_workshop_status_var.set(
+                    "Point sélectionné · cliquez maintenant à sa nouvelle position."
+                )
+                return
+
+            part_index, point_index = self.gpx_geometry_edit_selected_point
+            try:
+                old_point = self.gpx_geometry_edit_draft_parts[part_index]["points"][point_index]
+            except (IndexError, KeyError):
+                self.gpx_geometry_edit_selected_point = None
+                return
+
+            moved_point = list(old_point)
+            moved_point[0] = float(coords[0])
+            moved_point[1] = float(coords[1])
+
+            if not self.confirm_gpx_geometry_large_move(
+                old_point,
+                moved_point,
+                part_index,
+                point_index
+            ):
+                self.gpx_geometry_edit_selected_point = None
+                self.draw_gpx_workshop_map()
+                self.gpx_workshop_status_var.set("Déplacement annulé.")
+                return
+
+            endpoint_side = self.gpx_geometry_endpoint_side(
+                part_index,
+                point_index
+            )
+            existing_group = None
+            linked_targets = []
+            continuity_declined = False
+
+            if endpoint_side:
+                existing_group = self.find_gpx_geometry_linked_endpoint_group(
+                    part_index,
+                    endpoint_side
+                )
+                if existing_group is None:
+                    linked_targets = self.find_shared_gpx_segment_endpoints(
+                        old_point,
+                        excluded_segment_id=self.gpx_geometry_edit_segment_id,
+                        tolerance_m=2.0
+                    )
+                    if linked_targets:
+                        decision = messagebox.askyesnocancel(
+                            "Extrémité partagée",
+                            (
+                                f"Cette extrémité rejoint "
+                                f"{len(linked_targets)} extrémité(s) de segment voisin.\n\n"
+                                "Oui : déplacer aussi les extrémités correspondantes "
+                                "et conserver la continuité.\n"
+                                "Non : déplacer seulement le segment corrigé.\n"
+                                "Annuler : ne rien modifier."
+                            )
+                        )
+                        if decision is None:
+                            self.gpx_geometry_edit_selected_point = None
+                            self.draw_gpx_workshop_map()
+                            self.gpx_workshop_status_var.set(
+                                "Déplacement annulé."
+                            )
+                            return
+                        continuity_declined = decision is False
+                        if decision is False:
+                            linked_targets = []
+
+            self.snapshot_gpx_geometry_draft()
+            self.gpx_geometry_edit_draft_parts[part_index]["points"][point_index] = moved_point
+            if existing_group is not None:
+                existing_group["new_point"] = copy.deepcopy(moved_point)
+            elif linked_targets:
+                self.gpx_geometry_edit_linked_endpoint_updates.append({
+                    "source_part_index": part_index,
+                    "source_side": endpoint_side,
+                    "targets": copy.deepcopy(linked_targets),
+                    "new_point": copy.deepcopy(moved_point),
+                })
+
+            self.prune_noop_gpx_geometry_linked_endpoint_updates()
+            self.gpx_geometry_edit_selected_point = None
+            self.gpx_geometry_edit_dirty = (
+                self.gpx_geometry_edit_draft_parts
+                != self.gpx_geometry_edit_session_original_parts
+                or bool(self.gpx_geometry_edit_linked_endpoint_updates)
+            )
+            self.update_gpx_geometry_dirty_indicator()
+            self.draw_gpx_workshop_map()
+            if existing_group is not None:
+                linked_count = len(existing_group.get("targets", []))
+            else:
+                linked_count = len(linked_targets)
+
+            if linked_count:
+                status = (
+                    f"Point déplacé · continuité préparée avec "
+                    f"{linked_count} extrémité(s) voisine(s) · non enregistré."
+                )
+            elif continuity_declined:
+                status = (
+                    "Point déplacé sans propager l’extrémité voisine "
+                    "· correction non enregistrée."
+                )
+            else:
+                status = "Point déplacé · correction non enregistrée."
+            self.gpx_workshop_status_var.set(status)
+            return
+
+        if tool == "add":
+            edge = self.nearest_gpx_geometry_edge(coords)
+            tolerance = self.gpx_geometry_edit_tolerance_m(coords[0], pixels=26)
+            if not edge or edge[0] > tolerance:
+                self.gpx_workshop_status_var.set(
+                    "Cliquez plus près du tracé pour ajouter un point."
+                )
+                return
+
+            _distance, part_index, point_index, ratio = edge
+            points = self.gpx_geometry_edit_draft_parts[part_index]["points"]
+            new_point = [float(coords[0]), float(coords[1])]
+            try:
+                elevation_a = float(points[point_index][2])
+                elevation_b = float(points[point_index + 1][2])
+                new_point.append(elevation_a + (elevation_b - elevation_a) * ratio)
+            except (IndexError, TypeError, ValueError):
+                pass
+
+            self.snapshot_gpx_geometry_draft()
+            points.insert(point_index + 1, new_point)
+            self.gpx_geometry_edit_dirty = (
+                self.gpx_geometry_edit_draft_parts
+                != self.gpx_geometry_edit_session_original_parts
+                or bool(self.gpx_geometry_edit_linked_endpoint_updates)
+            )
+            self.update_gpx_geometry_dirty_indicator()
+            self.draw_gpx_workshop_map()
+            self.gpx_workshop_status_var.set("Point ajouté · correction non enregistrée.")
+            return
+
+        if tool == "delete":
+            key, _distance = self.nearest_visible_gpx_geometry_point(coords)
+            if key is None:
+                self.gpx_workshop_status_var.set(
+                    "Aucun point assez proche · cliquez directement sur une pastille de contrôle."
+                )
+                return
+
+            part_index, point_index = key
+            points = self.gpx_geometry_edit_draft_parts[part_index].get("points", [])
+            if len(points) <= 2:
+                self.gpx_workshop_status_var.set(
+                    "Suppression impossible : une partie doit conserver au moins deux points."
+                )
+                return
+
+            endpoint_side = self.gpx_geometry_endpoint_side(
+                part_index,
+                point_index
+            )
+            if endpoint_side:
+                shared = self.find_shared_gpx_segment_endpoints(
+                    points[point_index],
+                    excluded_segment_id=self.gpx_geometry_edit_segment_id,
+                    tolerance_m=2.0
+                )
+                shared_note = (
+                    f"\n\nCette extrémité est actuellement reliée à "
+                    f"{len(shared)} extrémité(s) de segment voisin."
+                    if shared else ""
+                )
+                if not messagebox.askyesno(
+                    "Supprimer une extrémité ?",
+                    (
+                        "Vous allez supprimer une extrémité de partie. "
+                        "Cela peut rompre la continuité du tracé."
+                        f"{shared_note}\n\nContinuer ?"
+                    )
+                ):
+                    return
+
+            self.snapshot_gpx_geometry_draft()
+            del points[point_index]
+            if endpoint_side:
+                self.remove_gpx_geometry_linked_endpoint_group(
+                    part_index,
+                    endpoint_side
+                )
+            self.gpx_geometry_edit_selected_point = None
+            self.gpx_geometry_edit_dirty = (
+                self.gpx_geometry_edit_draft_parts
+                != self.gpx_geometry_edit_session_original_parts
+                or bool(self.gpx_geometry_edit_linked_endpoint_updates)
+            )
+            self.update_gpx_geometry_dirty_indicator()
+            self.draw_gpx_workshop_map()
+            self.gpx_workshop_status_var.set("Point supprimé · correction non enregistrée.")
+
+    def validate_gpx_geometry_parts(self, parts):
+        if not parts:
+            return False, "Le segment ne contient plus aucune partie."
+        for part_index, part in enumerate(parts, start=1):
+            points = part.get("points", [])
+            if len(points) < 2:
+                return False, f"La partie {part_index} contient moins de deux points."
+            for point_index, point in enumerate(points, start=1):
+                if not point or len(point) < 2:
+                    return False, f"Point incomplet dans la partie {part_index}."
+                try:
+                    lat = float(point[0])
+                    lon = float(point[1])
+                except (TypeError, ValueError):
+                    return False, f"Coordonnées invalides dans la partie {part_index}."
+                if not math.isfinite(lat) or not math.isfinite(lon):
+                    return False, f"Coordonnées non finies dans la partie {part_index}."
+                if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+                    return False, (
+                        f"Coordonnées hors limites dans la partie {part_index}, "
+                        f"point {point_index}."
+                    )
+        return True, ""
+
+    def mark_gpx_segment_geometry_state(self, segment, timestamp):
+        original = segment.get("geometry_original_parts", [])
+        restored = segment.get("parts", []) == original
+        segment["geometry_edited"] = not restored
+        segment["geometry_edit_date"] = timestamp
+        if restored:
+            segment["geometry_restored_at"] = timestamp
+        else:
+            segment.pop("geometry_restored_at", None)
+        return restored
+
+    def build_gpx_geometry_save_plan(self):
+        """
+        Construit une transaction complète sans modifier le catalogue vivant.
+        Le segment actif et ses extrémités voisines restent ainsi de simples
+        brouillons jusqu'à la validation explicite.
+        """
+        main_id = self.gpx_geometry_edit_segment_id
+        main_segment = self.find_gpx_segment(main_id)
+        if not main_segment:
+            return None, (
+                "Le segment édité n’existe plus. "
+                "La correction n’a pas été enregistrée."
+            ), [], 0
+
+        plan = {main_id: copy.deepcopy(main_segment)}
+        plan[main_id]["parts"] = copy.deepcopy(
+            self.gpx_geometry_edit_draft_parts
+        )
+        linked_keys = set()
+
+        for group in self.gpx_geometry_edit_linked_endpoint_updates:
+            new_point = group.get("new_point")
+            if not new_point or len(new_point) < 2:
+                return None, (
+                    "Une extrémité liée contient une destination invalide."
+                ), [], 0
+
+            for target in group.get("targets", []):
+                segment_id = target.get("segment_id")
+                neighbour = self.find_gpx_segment(segment_id)
+                if not neighbour:
+                    return None, (
+                        "Un segment voisin lié n’existe plus. "
+                        "Aucune correction n’a été appliquée."
+                    ), [], 0
+
+                if segment_id not in plan:
+                    plan[segment_id] = copy.deepcopy(neighbour)
+
+                try:
+                    part_index = int(target.get("part_index"))
+                    points = plan[segment_id]["parts"][part_index]["points"]
+                    point_index = (
+                        0
+                        if target.get("side") == "start"
+                        else len(points) - 1
+                    )
+                    previous = points[point_index]
+                    updated = list(previous)
+                    updated[0] = float(new_point[0])
+                    updated[1] = float(new_point[1])
+                    points[point_index] = updated
+                except (IndexError, KeyError, TypeError, ValueError):
+                    return None, (
+                        "Une extrémité de segment voisin a changé pendant "
+                        "la correction. Aucune correction n’a été appliquée."
+                    ), [], 0
+
+                linked_keys.add((
+                    segment_id,
+                    part_index,
+                    target.get("side")
+                ))
+
+        quality_warnings = []
+        for segment_id, proposed in plan.items():
+            valid, error = self.validate_gpx_geometry_parts(
+                proposed.get("parts", [])
+            )
+            if not valid:
+                return None, error, [], 0
+
+            if segment_id == main_id:
+                baseline = self.gpx_geometry_edit_quality_baseline
+            else:
+                current = self.find_gpx_segment(segment_id)
+                baseline = self.gpx_geometry_quality_counts(
+                    current.get("parts", []) if current else []
+                )
+
+            for warning in self.gpx_geometry_new_quality_warning(
+                proposed.get("parts", []),
+                baseline
+            ):
+                quality_warnings.append(
+                    f"Segment {str(segment_id)[:8]} : {warning}"
+                )
+
+        return plan, "", quality_warnings, len(linked_keys)
+
+    def save_gpx_geometry_edit(self):
+        if not self.gpx_geometry_edit_active:
+            return
+        if not self.gpx_geometry_edit_dirty:
+            self.gpx_workshop_status_var.set("Aucune correction à enregistrer.")
+            return
+
+        plan, error, quality_warnings, linked_count = (
+            self.build_gpx_geometry_save_plan()
+        )
+        if plan is None:
+            messagebox.showerror(
+                "Tracé invalide",
+                error
+            )
+            return
+
+        if quality_warnings:
+            if not messagebox.askyesno(
+                "Contrôle du tracé",
+                (
+                    "La correction semble introduire :\n\n"
+                    + "\n".join(f"• {item}" for item in quality_warnings[:8])
+                    + "\n\nEnregistrer tout de même ?"
+                )
+            ):
+                self.gpx_workshop_status_var.set(
+                    "Enregistrement annulé après le contrôle du tracé."
+                )
+                return
+
+        workshop = self.get_gpx_workshop_state()
+        previous_segments = copy.deepcopy(workshop.get("segments", []))
+        previous_undo_stack = copy.deepcopy(self.gpx_workshop_undo_stack)
+        previous_redo_stack = copy.deepcopy(self.gpx_workshop_redo_stack)
+        self.snapshot_gpx_segments("Correction manuelle du tracé")
+
+        timestamp = datetime.now().isoformat(timespec="seconds")
+        restored_by_id = {}
+        for segment_id, proposed in plan.items():
+            current = self.find_gpx_segment(segment_id)
+            if current and not proposed.get("geometry_original_parts"):
+                proposed["geometry_original_parts"] = copy.deepcopy(
+                    current.get("parts", [])
+                )
+            restored_by_id[segment_id] = (
+                self.mark_gpx_segment_geometry_state(proposed, timestamp)
+            )
+            if current:
+                current.clear()
+                current.update(copy.deepcopy(proposed))
+
+        try:
+            self.save_gpx_workshop_state()
+        except Exception as exc:
+            # Restauration transactionnelle de tous les segments, y compris
+            # les voisins dont la continuité avait été préparée.
+            workshop["segments"] = previous_segments
+            self.gpx_workshop_undo_stack = previous_undo_stack
+            self.gpx_workshop_redo_stack = previous_redo_stack
+            messagebox.showerror(
+                "Enregistrement impossible",
+                "La correction n’a pas été appliquée.\n\n"
+                f"{exc}"
+            )
+            self.gpx_workshop_status_var.set(
+                "Échec d’enregistrement · le brouillon est conservé."
+            )
+            self.log(f"❌ Enregistrement de la correction impossible : {exc}")
+            return
+
+        segment = self.find_gpx_segment(self.gpx_geometry_edit_segment_id)
+        if not segment:
+            # Cas théoriquement impossible après une écriture réussie.
+            self.gpx_workshop_status_var.set(
+                "Correction enregistrée, mais le segment actif doit être resélectionné."
+            )
+            self.reset_gpx_geometry_edit_session(redraw=True)
+            return
+
+        restored = restored_by_id.get(segment.get("id"), False)
+        self.gpx_geometry_edit_session_original_parts = copy.deepcopy(
+            segment["parts"]
+        )
+        self.gpx_geometry_edit_history = []
+        self.gpx_geometry_edit_redo_history = []
+        self.gpx_geometry_edit_linked_endpoint_updates = []
+        self.gpx_geometry_edit_quality_baseline = (
+            self.gpx_geometry_quality_counts(segment["parts"])
+        )
+        self.gpx_geometry_edit_dirty = False
+        self.gpx_geometry_edit_selected_point = None
+        self.update_gpx_geometry_dirty_indicator()
+        self.refresh_gpx_segment_tree()
+        if self.gpx_segment_tree:
+            self.gpx_segment_tree.selection_set(segment.get("id"))
+            self.gpx_segment_tree.focus(segment.get("id"))
+        self.draw_gpx_workshop_map()
+        if restored:
+            status = "✓ Tracé restauré et enregistré."
+        else:
+            status = "✓ Correction du tracé enregistrée."
+        if linked_count:
+            status += (
+                f" Continuité conservée avec "
+                f"{linked_count} extrémité(s) voisine(s)."
+            )
+        self.gpx_workshop_status_var.set(status)
+        self.log(
+            f"✏️ Géométrie {'restaurée' if restored else 'corrigée'} : "
+            f"segment {str(segment.get('id', ''))[:8]}"
+            + (
+                f" · {linked_count} extrémité(s) liée(s)"
+                if linked_count else ""
+            )
+        )
+
     def handle_gpx_workshop_map_click(self, coords):
         if self.consume_photo_map_click_guard("gpx"):
             return
@@ -14806,10 +16306,40 @@ namespace GestionBissesFolderPicker
         if self.photo_spider_state.get("gpx") is not None:
             self.close_photo_spider("gpx", redraw=True)
 
+        if self.gpx_geometry_edit_active:
+            self.handle_gpx_geometry_edit_click(coords)
+            return
+
         if self.gpx_workshop_click_mode == "cut":
             self.cut_selected_gpx_segment_at_coords(coords)
 
+    def confirm_gpx_edited_topology_change(self, segments, action_label):
+        edited = [
+            segment
+            for segment in segments
+            if segment and segment.get("geometry_edited")
+        ]
+        if not edited:
+            return True
+
+        return messagebox.askyesno(
+            "Tracé corrigé",
+            (
+                f"{len(edited)} segment(s) concerné(s) contiennent une "
+                "correction manuelle enregistrée.\n\n"
+                f"L’action « {action_label} » modifiera leur structure. "
+                "Le retour direct à leur géométrie originale ne pourra plus "
+                "être garanti sur les nouveaux segments créés.\n\n"
+                "Continuer ?"
+            )
+        )
+
     def activate_gpx_cut_mode(self):
+        if self.gpx_geometry_edit_active:
+            self.gpx_workshop_status_var.set(
+                "Terminez ou quittez la correction avant de découper un segment."
+            )
+            return
         selected = self.get_selected_gpx_segment_ids()
         if len(selected) != 1:
             messagebox.showwarning(
@@ -14833,6 +16363,12 @@ namespace GestionBissesFolderPicker
             )
             return
 
+        if not self.confirm_gpx_edited_topology_change(
+            [segment],
+            "Découper le segment"
+        ):
+            return
+
         self.gpx_workshop_click_mode = "cut"
         self.gpx_workshop_pending_segment_id = selected[0]
         self.enter_gpx_segment_edit_photo_mode()
@@ -14844,11 +16380,17 @@ namespace GestionBissesFolderPicker
         if mode not in {"visible", "discrete", "hidden"}:
             return
 
-        if not automatic and self.gpx_workshop_click_mode == "cut":
-            # Un choix manuel pendant la découpe devient le nouvel état voulu :
-            # il ne sera pas écrasé à la fin du mode.
+        if not automatic and (
+            self.gpx_workshop_click_mode == "cut"
+            or self.gpx_geometry_edit_active
+        ):
+            # Un choix manuel pendant une découpe ou une correction devient le
+            # nouvel état voulu : il ne sera pas écrasé à la fin du mode.
             self.gpx_photo_mode_before_edit = None
 
+        self.invalidate_photo_layer_callbacks("gpx")
+        self.photo_spider_state["gpx"] = None
+        self.photo_layer_last_signature["gpx"] = None
         self.gpx_photo_display_mode_var.set(mode)
         self.gpx_workshop_show_photos_var.set(mode != "hidden")
         self.refresh_photo_layer("gpx", force=True)
@@ -15080,6 +16622,11 @@ namespace GestionBissesFolderPicker
         return remaining
 
     def merge_selected_gpx_segments(self):
+        if self.gpx_geometry_edit_active:
+            self.gpx_workshop_status_var.set(
+                "Terminez ou quittez la correction avant de fusionner des segments."
+            )
+            return
         ids = self.get_selected_gpx_segment_ids()
         if len(ids) < 2:
             messagebox.showwarning("Fusion", "Sélectionnez au moins deux segments pour les fusionner.")
@@ -15091,6 +16638,12 @@ namespace GestionBissesFolderPicker
             if segment.get("id") in ids
         ]
         if len(selected_segments) < 2:
+            return
+
+        if not self.confirm_gpx_edited_topology_change(
+            selected_segments,
+            "Fusionner la sélection"
+        ):
             return
 
         categories = {seg.get("category_id", "non_classe") for seg in selected_segments}
@@ -15152,6 +16705,11 @@ namespace GestionBissesFolderPicker
         self.gpx_workshop_status_var.set(status)
 
     def split_selected_discontinuous_segment(self):
+        if self.gpx_geometry_edit_active:
+            self.gpx_workshop_status_var.set(
+                "Terminez ou quittez la correction avant de dissocier le segment."
+            )
+            return
         ids = self.get_selected_gpx_segment_ids()
         if len(ids) != 1:
             messagebox.showwarning(
@@ -15167,6 +16725,12 @@ namespace GestionBissesFolderPicker
         parts = segment.get("parts", [])
         if len(parts) <= 1:
             self.gpx_workshop_status_var.set("Ce segment ne contient qu’une seule partie.")
+            return
+
+        if not self.confirm_gpx_edited_topology_change(
+            [segment],
+            "Dissocier le segment discontinu"
+        ):
             return
 
         new_segments = [
@@ -15201,6 +16765,11 @@ namespace GestionBissesFolderPicker
         )
 
     def delete_selected_gpx_segments(self):
+        if self.gpx_geometry_edit_active:
+            self.gpx_workshop_status_var.set(
+                "Terminez ou quittez la correction avant de retirer le segment."
+            )
+            return
         ids = self.get_selected_gpx_segment_ids()
         if not ids:
             return
@@ -15256,6 +16825,11 @@ namespace GestionBissesFolderPicker
         self.open_global_segment_category_editor()
 
     def export_gpx_workshop_segments(self):
+        if self.gpx_geometry_edit_active:
+            self.gpx_workshop_status_var.set(
+                "Enregistrez ou quittez la correction avant d’exporter les segments."
+            )
+            return
         workshop = self.get_gpx_workshop_state()
         segments = workshop.get("segments", [])
 
@@ -17692,25 +19266,62 @@ namespace GestionBissesFolderPicker
 
         return sorted(clusters, key=lambda c: c["min_number"])
 
+    def delete_map_objects_with_retry(self, objects, attempt=0):
+        """
+        Supprime des objets TkinterMapView sans perdre leur référence si le
+        canevas est momentanément occupé. Les rares échecs sont retentés après
+        le callback courant, au maximum quatre fois.
+        """
+        failed = []
+        for obj in list(objects or []):
+            try:
+                obj.delete()
+            except Exception:
+                failed.append(obj)
+
+        if failed and attempt < 3:
+            try:
+                self.root.after(
+                    60,
+                    lambda pending=failed, n=attempt + 1: self.delete_map_objects_with_retry(
+                        pending,
+                        n
+                    )
+                )
+            except Exception:
+                pass
+
+    def invalidate_photo_layer_callbacks(self, context):
+        self.photo_layer_generation[context] = (
+            int(self.photo_layer_generation.get(context, 0)) + 1
+        )
+        # Les animations de zoom utilisaient un jeton global déjà existant.
+        self.photo_zoom_animation_token += 1
+        self.photo_map_click_guard_until[context] = 0.0
+
     def clear_photo_layer_objects(self, context):
         marker_list = self.map_markers if context == "photo" else self.gpx_editor_photo_markers
-        for marker in marker_list:
-            try:
-                marker.delete()
-            except Exception:
-                pass
+        markers_to_delete = list(marker_list)
         marker_list.clear()
 
-        for path in self.photo_spider_paths.get(context, []):
-            try:
-                path.delete()
-            except Exception:
-                pass
+        paths_to_delete = list(self.photo_spider_paths.get(context, []))
         self.photo_spider_paths[context] = []
+        self.delete_map_objects_with_retry(markers_to_delete)
+        self.delete_map_objects_with_retry(paths_to_delete)
 
-    def set_context_photo_marker(self, context, lat, lon, icon, command=None):
+    def set_context_photo_marker(
+        self,
+        context,
+        lat,
+        lon,
+        icon,
+        command=None,
+        required_mode=None
+    ):
         widget = self.get_photo_map_widget(context)
         if not widget:
+            return None
+        if required_mode and self.get_photo_layer_mode(context) != required_mode:
             return None
 
         kwargs = {
@@ -17724,6 +19335,13 @@ namespace GestionBissesFolderPicker
             marker = widget.set_marker(lat, lon, text="", **kwargs)
         except TypeError:
             marker = widget.set_marker(lat, lon, text="", command=command)
+
+        # Le mode peut avoir été modifié par un autre callback Tk juste avant
+        # la fin de la création. Dans ce cas, l'objet tardif est supprimé au
+        # lieu d'être ajouté à la couche courante.
+        if required_mode and self.get_photo_layer_mode(context) != required_mode:
+            self.delete_map_objects_with_retry([marker])
+            return None
 
         if context == "photo":
             self.map_markers.append(marker)
@@ -17783,7 +19401,8 @@ namespace GestionBissesFolderPicker
                     item["photo"]["lat"],
                     item["photo"]["lon"],
                     icon,
-                    command=lambda _marker, p=item["photo"], ctx=context: self.open_photo_from_context(ctx, p)
+                    command=lambda _marker, p=item["photo"], ctx=context: self.open_photo_from_context(ctx, p),
+                    required_mode="visible"
                 )
             else:
                 icon = self.get_photo_cluster_icon(len(items), selected=selected)
@@ -17792,7 +19411,8 @@ namespace GestionBissesFolderPicker
                     cluster["lat"],
                     cluster["lon"],
                     icon,
-                    command=lambda _marker, c=cluster, ctx=context: self.on_photo_cluster_click(ctx, c)
+                    command=lambda _marker, c=cluster, ctx=context: self.on_photo_cluster_click(ctx, c),
+                    required_mode="visible"
                 )
 
     def render_discrete_photos(self, context, photos):
@@ -17807,7 +19427,8 @@ namespace GestionBissesFolderPicker
                 photo["lat"],
                 photo["lon"],
                 icon,
-                command=None
+                command=None,
+                required_mode="discrete"
             )
 
     def refresh_photo_layer(self, context, force=False):
@@ -17904,11 +19525,12 @@ namespace GestionBissesFolderPicker
 
     def animate_photo_cluster_zoom(self, context, cluster, target_zoom, open_spider_if_still_grouped=False):
         widget = self.get_photo_map_widget(context)
-        if not widget:
+        if not widget or self.get_photo_layer_mode(context) != "visible":
             return
 
         self.photo_zoom_animation_token += 1
         token = self.photo_zoom_animation_token
+        generation = self.photo_layer_generation.get(context, 0)
         current_zoom = self.get_map_zoom_value(widget) or target_zoom
         center = (cluster["lat"], cluster["lon"])
         wanted_ids = tuple(cluster["photo_ids"])
@@ -17921,7 +19543,11 @@ namespace GestionBissesFolderPicker
         steps = list(range(current_zoom + 1, int(target_zoom) + 1))
 
         def advance(index=0):
-            if token != self.photo_zoom_animation_token:
+            if (
+                token != self.photo_zoom_animation_token
+                or generation != self.photo_layer_generation.get(context, 0)
+                or self.get_photo_layer_mode(context) != "visible"
+            ):
                 return
 
             if index < len(steps):
@@ -17936,7 +19562,11 @@ namespace GestionBissesFolderPicker
             self.photo_layer_last_signature[context] = None
             self.refresh_photo_layer(context, force=True)
 
-            if open_spider_if_still_grouped:
+            if (
+                open_spider_if_still_grouped
+                and generation == self.photo_layer_generation.get(context, 0)
+                and self.get_photo_layer_mode(context) == "visible"
+            ):
                 clusters = self.photo_layer_clusters.get(context, [])
                 remaining = self.find_cluster_for_photo_ids(clusters, wanted_ids)
                 if remaining and len(remaining.get("items", [])) > 1:
@@ -17966,6 +19596,9 @@ namespace GestionBissesFolderPicker
         return offsets
 
     def open_photo_spider(self, context, cluster):
+        if self.get_photo_layer_mode(context) != "visible":
+            self.photo_spider_state[context] = None
+            return
         self.photo_spider_state[context] = {
             "photo_ids": tuple(cluster.get("photo_ids", ())),
             "zoom": self.get_map_zoom_value(self.get_photo_map_widget(context)) or 17
@@ -17975,7 +19608,11 @@ namespace GestionBissesFolderPicker
     def render_photo_spider(self, context, clusters):
         state = self.photo_spider_state.get(context)
         widget = self.get_photo_map_widget(context)
-        if not state or not widget:
+        if (
+            not state
+            or not widget
+            or self.get_photo_layer_mode(context) != "visible"
+        ):
             return False
 
         cluster = self.find_cluster_for_photo_ids(clusters, state.get("photo_ids", ()))
@@ -18014,7 +19651,8 @@ namespace GestionBissesFolderPicker
             cluster["lat"],
             cluster["lon"],
             self.get_photo_anchor_icon(),
-            command=lambda _marker, ctx=context: self.close_photo_spider_from_anchor(ctx)
+            command=lambda _marker, ctx=context: self.close_photo_spider_from_anchor(ctx),
+            required_mode="visible"
         )
 
         for item, lat, lon in deployed:
@@ -18025,7 +19663,8 @@ namespace GestionBissesFolderPicker
                 lat,
                 lon,
                 icon,
-                command=lambda _marker, p=item["photo"], ctx=context: self.open_photo_from_context(ctx, p)
+                command=lambda _marker, p=item["photo"], ctx=context: self.open_photo_from_context(ctx, p),
+                required_mode="visible"
             )
 
         return True
