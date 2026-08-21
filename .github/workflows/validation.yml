@@ -1,24 +1,50 @@
-name: Validation Python
+name: Validation Abisses
 
 on:
   push:
   pull_request:
 
 jobs:
-  syntax:
-    runs-on: windows-latest
+  validation:
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
+        os: [windows-latest, ubuntu-latest]
+        python-version: ["3.12", "3.13"]
 
     steps:
-      - name: Checkout
+      - name: Récupérer le code
         uses: actions/checkout@v4
 
-      - name: Python
+      - name: Installer Python
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
 
       - name: Vérifier la syntaxe
-        run: python -m py_compile gestion_bisses.py lancer_gestion_bisses.py publier_mise_a_jour.py
+        run: >-
+          python -m py_compile
+          gestion_bisses.py
+          lancer_gestion_bisses.py
+          publier_mise_a_jour.py
+          abisses_paths.py
+          abisses_update.py
+          abisses_update_ui.py
+          packaging/build_icons.py
+
+      - name: Exécuter les tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Vérifier les espaces et marqueurs Git
+        run: git diff --check
+
+      - name: Vérifier les scripts Linux
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          bash -n packaging/linux/build_deb.sh
+          bash -n packaging/linux/check_bundle.sh
+          sh -n packaging/linux/abisses
+          sh -n packaging/linux/postinst
+          sh -n packaging/linux/postrm

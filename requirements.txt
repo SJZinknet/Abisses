@@ -3,3 +3,5 @@ pillow-heif
 gpxpy
 tkintermapview
 piexif
+certifi
+tzdata

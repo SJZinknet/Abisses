@@ -3,7 +3,7 @@ setlocal
 cd /d "%~dp0"
 
 echo ============================================================
-echo Lancement de Gestion Bisses
+echo Lancement d'Abisses
 echo ============================================================
 
 if exist ".venv\Scripts\python.exe" goto USE_VENV
@@ -55,8 +55,8 @@ goto END
 :END
 if not "%APP_ERROR%"=="0" (
     echo.
-    echo Gestion Bisses ne s'est pas lance correctement.
-    echo Consultez lancement_gestion_bisses.log dans ce dossier.
+    echo Abisses ne s'est pas lance correctement.
+    echo Le chemin exact du journal est affiche dans la boite d'erreur.
     pause
 )
 

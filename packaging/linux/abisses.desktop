@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Abisses
+Comment=Préparation des données des bisses
+Exec=/usr/bin/abisses
+Icon=abisses
+Terminal=false
+Categories=Utility;Education;Geography;
+StartupNotify=true
+StartupWMClass=Abisses

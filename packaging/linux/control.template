@@ -1,0 +1,11 @@
+Package: abisses
+Version: @VERSION@
+Section: utils
+Priority: optional
+Architecture: amd64
+Maintainer: Projet Abisses
+Depends: libc6, libtcl8.6, libtk8.6, libx11-6, libxext6, libxrender1, libxft2, libfontconfig1, libfreetype6, libglib2.0-0, libgl1, xdg-utils
+Homepage: https://github.com/SJZinknet/Abisses
+Description: Préparation des données des bisses
+ Abisses organise les photos, métadonnées, traces GPX, segments et exports
+ destinés à l'inventaire et à la plateforme des bisses valaisans.

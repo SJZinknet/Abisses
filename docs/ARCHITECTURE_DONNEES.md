@@ -11,9 +11,31 @@ Il permet :
 - de valider automatiquement la syntaxe Python;
 - de publier des Releases.
 
+Les ordinateurs qui utilisent l'application installée ne font pas de
+`git pull`. Ils récupèrent les installateurs contrôlés par leur empreinte
+SHA256 depuis les Releases. Le dépôt Git reste réservé au développement.
+
+## Installation locale
+
+Le dossier d'installation contient uniquement le programme et ses
+dépendances. Il peut donc être remplacé ou désinstallé sans toucher aux données
+des bisses.
+
+Les fichiers propres à chaque ordinateur sont placés dans le profil
+utilisateur :
+
+- réglages : `%LOCALAPPDATA%\Abisses` sous Windows ou `~/.config/Abisses`
+  sous Linux;
+- journaux : dossier local de journaux Abisses;
+- cache : dossier local utilisé temporairement pour les installateurs.
+
+Une ancienne configuration placée près de `gestion_bisses.py` est copiée au
+premier lancement, sans suppression de l'original.
+
 ## Gestion_Bisses_Data
 
-`Gestion_Bisses_Data` reste local à chaque ordinateur et est ignoré par Git.
+`Gestion_Bisses_Data` reste local à chaque ordinateur ou relié au NAS et est
+ignoré par Git.
 Il contient notamment :
 - les projets connus;
 - les liens vers les dossiers des bisses;

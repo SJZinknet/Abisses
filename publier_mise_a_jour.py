@@ -56,10 +56,18 @@ def main() -> int:
     if not APP.exists():
         return fail("gestion_bisses.py est introuvable.")
 
+    python_files = [
+        APP,
+        ROOT / "abisses_paths.py",
+        ROOT / "abisses_update.py",
+        ROOT / "abisses_update_ui.py",
+        ROOT / "lancer_gestion_bisses.py",
+    ]
     try:
-        source = APP.read_text(encoding="utf-8")
-        ast.parse(source)
-        compile(source, str(APP), "exec")
+        for path in python_files:
+            source = path.read_text(encoding="utf-8")
+            ast.parse(source)
+            compile(source, str(path), "exec")
     except Exception as exc:
         return fail(f"Syntaxe Python invalide : {exc}")
 
@@ -76,18 +84,37 @@ def main() -> int:
 
     message = input("Message de mise à jour : ").strip()
     if not message:
-        message = "Mise à jour Gestion Bisses"
+        message = "Mise à jour Abisses"
+
+    # Cet ancien journal a été suivi par erreur dans les premières versions.
+    # Il reste sur l'ordinateur comme diagnostic local, mais n'est plus envoyé
+    # sur GitHub (le lanceur v55 écrit désormais dans le profil utilisateur).
+    legacy_log = "lancement_gestion_bisses.log"
+    tracked_log = run(git, "ls-files", "--error-unmatch", legacy_log)
+    if tracked_log.returncode == 0:
+        untrack_log = run(git, "rm", "--cached", "--ignore-unmatch", legacy_log)
+        if untrack_log.returncode != 0:
+            return fail(f"Impossible de retirer {legacy_log} du suivi Git.")
+        print(f"✅ {legacy_log} retiré du dépôt (conservé sur l'ordinateur).")
 
     files = [
         "gestion_bisses.py",
+        "abisses_paths.py",
+        "abisses_update.py",
+        "abisses_update_ui.py",
         "lancer_gestion_bisses.py",
         "publier_mise_a_jour.py",
         "requirements.txt",
+        "requirements-build.txt",
+        "requirements-build-lock.txt",
         "README.md",
         "CHANGELOG.md",
         "VERSION",
         ".gitignore",
+        ".gitattributes",
         ".github",
+        "packaging",
+        "tests",
         "docs",
         "installer_dependances.bat",
         "lancer_gestion_bisses.bat",
@@ -99,21 +126,20 @@ def main() -> int:
 
     diff = run(git, "diff", "--cached", "--quiet")
     if diff.returncode == 0:
-        print("Aucun changement à publier.")
-        return 0
-
-    commit = run(git, "commit", "-m", message)
-    if commit.returncode != 0:
-        return fail("git commit a échoué.")
+        print("Aucun nouveau changement à commiter ; poursuite vers la Release.")
+    else:
+        commit = run(git, "commit", "-m", message)
+        if commit.returncode != 0:
+            return fail("git commit a échoué.")
 
     push = run(git, "push")
     if push.returncode != 0:
         return fail("git push a échoué.")
 
-    print("✅ Mise à jour envoyée sur GitHub.")
+    print("✅ Branche envoyée sur GitHub.")
 
     version = input(
-        "Créer aussi une Release ? Entrez une version (ex. 0.50.0), "
+        "Créer aussi une Release ? Entrez une version (ex. 0.55.0-beta.1), "
         "ou laissez vide : "
     ).strip()
 
@@ -121,11 +147,23 @@ def main() -> int:
         return 0
 
     tag = version if version.startswith("v") else f"v{version}"
-    VERSION_FILE.write_text(version.lstrip("v") + "\n", encoding="utf-8")
-    run(git, "add", "VERSION")
-    run(git, "commit", "-m", f"Version {tag}")
+    normalized_version = version.lstrip("v")
+    current_version = VERSION_FILE.read_text(encoding="utf-8").strip()
+    if current_version != normalized_version:
+        VERSION_FILE.write_text(normalized_version + "\n", encoding="utf-8")
+        run(git, "add", "VERSION")
+        version_commit = run(git, "commit", "-m", f"Version {tag}")
+        if version_commit.returncode != 0:
+            return fail("Impossible de commiter le nouveau fichier VERSION.")
+        version_push = run(git, "push")
+        if version_push.returncode != 0:
+            return fail("Impossible d'envoyer le nouveau fichier VERSION.")
 
-    tag_result = run(git, "tag", "-a", tag, "-m", f"Gestion Bisses {tag}")
+    existing_tag = run(git, "rev-parse", "--verify", f"refs/tags/{tag}", capture=True)
+    if existing_tag.returncode == 0:
+        return fail(f"Le tag {tag} existe déjà.")
+
+    tag_result = run(git, "tag", "-a", tag, "-m", f"Abisses {tag}")
     if tag_result.returncode != 0:
         return fail(f"Impossible de créer le tag {tag}.")
 

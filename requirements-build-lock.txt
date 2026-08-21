@@ -1,0 +1,30 @@
+# Versions validées pour fabriquer les installateurs 0.55.0-beta.1.
+# Les dépendances propres à Windows (pefile, pywin32-ctypes) sont résolues
+# automatiquement par PyInstaller sur le runner Windows.
+altgraph==0.17.5
+certifi==2026.7.22
+charset-normalizer==3.5.1
+click==8.4.2
+customtkinter==6.0.0
+darkdetect==0.8.0
+decorator==5.3.1
+future==1.0.0
+geocoder==1.38.1
+geographiclib==2.1
+geopy==2.5.0
+gpxpy==1.6.2
+idna==3.19
+packaging==26.3
+piexif==1.1.3
+pillow==12.3.0
+pillow_heif==1.5.0
+pyinstaller-hooks-contrib==2026.6
+pyinstaller==6.22.2
+pyperclip==1.11.0
+ratelim==0.1.6
+requests==2.34.2
+setuptools==84.0.0
+six==1.17.0
+tkintermapview==1.30
+tzdata==2026.3
+urllib3==2.7.0

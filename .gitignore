@@ -27,6 +27,9 @@ Photos/
 *.png
 *.gpx
 
+# Ressource graphique livrée avec l'application
+!packaging/icons/abisses.png
+
 # Dossiers de tests locaux éventuels
 test_data/
 Mes_Bisses/
@@ -36,6 +39,14 @@ Mes_Bisses/
 .venv_backup*/
 __pycache__/
 *.pyc
+
+# Construction des applications installables
+build/
+dist/
+release/
+.ruff_cache/
+*.deb
+*.exe
 
 # Données locales Abisses
 Gestion_Bisses_Data/

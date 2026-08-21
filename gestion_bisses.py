@@ -25,24 +25,36 @@ import gpxpy
 import tkintermapview
 import piexif
 
+from abisses_paths import (
+    get_application_dir,
+    path_looks_foreign,
+    prepare_user_environment,
+    resource_path,
+)
+from abisses_update import display_version, get_current_version
+from abisses_update_ui import AbissesUpdateController
+
 pillow_heif.register_heif_opener()
 
-APP_VERSION = "v54"
+APP_VERSION = get_current_version()
 
 
 class BisseManagerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title(f"Gestionnaire de Bisses - Édition Pro {APP_VERSION}")
+        self.root.title(f"Abisses — Édition Pro {display_version(APP_VERSION)}")
+        self.configure_application_icon()
         self.configure_main_window_geometry()
 
         # Données globales du logiciel
         # GitHub contient le code. Le dossier Gestion_Bisses_Data peut être
         # choisi librement par poste et son chemin est enregistré dans
         # settings.local.json, ignoré par Git.
-        self.app_folder = self.get_application_folder()
-        self.default_app_data_folder = os.path.join(self.app_folder, "Gestion_Bisses_Data")
-        self.local_settings_path = os.path.join(self.app_folder, "settings.local.json")
+        self.app_folder = str(get_application_dir())
+        self.local_environment = prepare_user_environment(self.app_folder)
+        self.default_app_data_folder = str(self.local_environment.default_data_dir)
+        self.local_settings_path = str(self.local_environment.settings_file)
+        self.local_log_path = str(self.local_environment.log_file)
         self.app_data_folder = self.resolve_app_data_folder_at_startup()
         os.makedirs(self.app_data_folder, exist_ok=True)
 
@@ -57,6 +69,8 @@ class BisseManagerApp:
         )
         self.global_segment_categories = []
         self.settings_window = None
+        self.settings_notebook = None
+        self.settings_update_tab = None
         self.segment_category_manager_tree = None
         self.segment_category_manager_usage = {}
 
@@ -299,7 +313,7 @@ class BisseManagerApp:
 
         tk.Label(
             header,
-            text="🏔️ Gestionnaire de Bisses",
+            text="🏔️ Abisses",
             font=("Arial", 20, "bold")
         ).pack(side="left")
 
@@ -322,6 +336,13 @@ class BisseManagerApp:
             text="⚙️ Paramètres",
             command=self.show_settings_dialog
         ).pack(side="right", padx=5)
+
+        self.header_update_button = tk.Button(
+            header,
+            text="⬆ Mise à jour disponible",
+            command=self.open_update_settings,
+            bg="#dceeff"
+        )
 
         self.status_header = tk.Label(
             root,
@@ -388,7 +409,29 @@ class BisseManagerApp:
         self.root.bind("<Control-y>", self.handle_global_redo_key, add="+")
         self.root.bind("<Control-Shift-Z>", self.handle_global_redo_key, add="+")
 
+        self.update_controller = AbissesUpdateController(
+            self.root,
+            read_settings=self.read_local_settings,
+            write_settings=self.write_local_settings,
+            on_update_available=self.handle_update_available,
+            log=self.log,
+        )
+
         self.create_welcome_screen()
+
+        if self.local_environment.migrated_settings_from:
+            self.log(
+                "✅ Réglages locaux migrés vers le profil utilisateur : "
+                f"{self.local_settings_path}"
+            )
+        elif self.local_environment.migration_error:
+            self.log(
+                "⚠️ Migration des anciens réglages impossible : "
+                f"{self.local_environment.migration_error}"
+            )
+
+        # La vérification reste asynchrone et ne retarde jamais l'ouverture.
+        self.root.after(1800, self.update_controller.maybe_check_automatically)
 
     def configure_main_window_geometry(self):
         """
@@ -490,6 +533,17 @@ class BisseManagerApp:
                 continue
 
         self._apply_main_window_fallback_geometry()
+
+    def configure_application_icon(self):
+        """Applique l'icône Abisses à la fenêtre quand elle est disponible."""
+        icon_path = resource_path("packaging/icons/abisses.png")
+        if not icon_path.is_file():
+            return
+        try:
+            self._application_icon = tk.PhotoImage(file=str(icon_path))
+            self.root.iconphoto(True, self._application_icon)
+        except Exception:
+            self._application_icon = None
 
     # ============================================================
     # OUTILS GÉNÉRAUX
@@ -721,21 +775,10 @@ class BisseManagerApp:
 
     def get_application_folder(self):
         """
-        Dossier où se trouve le script principal.
-
-        Tous les fichiers globaux du logiciel sont regroupés dans
-        Gestion_Bisses_Data/ à côté de gestion_bisses.py, au lieu d'être
-        dispersés dans les dossiers source des bisses.
+        Dossier du programme. Les fichiers modifiables ne sont plus écrits ici
+        afin que l'application puisse être installée dans un dossier protégé.
         """
-        try:
-            if "__file__" in globals():
-                return os.path.dirname(os.path.abspath(__file__))
-        except Exception:
-            pass
-        try:
-            return os.getcwd()
-        except Exception:
-            return "."
+        return str(get_application_dir())
 
 
     # ============================================================
@@ -761,8 +804,11 @@ class BisseManagerApp:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             payload = data if isinstance(data, dict) else {}
             payload["updated_at"] = datetime.now().isoformat(timespec="seconds")
-            with open(path, "w", encoding="utf-8") as f:
+            temp_path = path + ".tmp"
+            with open(temp_path, "w", encoding="utf-8") as f:
                 json.dump(payload, f, indent=2, ensure_ascii=False)
+                f.write("\n")
+            os.replace(temp_path, path)
         except Exception as exc:
             try:
                 messagebox.showwarning(
@@ -861,17 +907,17 @@ class BisseManagerApp:
         )
 
         message = (
-            "Gestion Bisses doit choisir le dossier des données locales du logiciel.\n\n"
+            "Abisses doit choisir le dossier des données locales du logiciel.\n\n"
             "Ces données ne sont pas le code GitHub : elles contiennent Mes bisses, "
             "les projets, les catégories globales, la bibliothèque et les sauvegardes.\n\n"
             "Voulez-vous utiliser un ancien dossier Gestion_Bisses_Data existant ?\n\n"
             "Oui = choisir un dossier existant\n"
             "Non = créer un nouveau Gestion_Bisses_Data\n"
-            "Annuler = utiliser le dossier par défaut près du logiciel"
+            "Annuler = utiliser le dossier par défaut de votre profil utilisateur"
         )
 
         answer = messagebox.askyesnocancel(
-            "Dossier des données Gestion Bisses",
+            "Dossier des données Abisses",
             message
         )
 
@@ -895,9 +941,35 @@ class BisseManagerApp:
         configured = settings.get("app_data_folder", "")
 
         if configured:
-            folder = os.path.abspath(os.path.expanduser(configured))
-            os.makedirs(folder, exist_ok=True)
-            return folder
+            if path_looks_foreign(configured):
+                settings["previous_app_data_folder"] = configured
+                settings.pop("app_data_folder", None)
+                self.write_local_settings(settings)
+                messagebox.showwarning(
+                    "Dossier de données d'un autre système",
+                    "Le chemin enregistré appartient à un autre système "
+                    "d'exploitation :\n\n"
+                    f"{configured}\n\n"
+                    "Abisses va vous demander de choisir le dossier de données "
+                    "de cet ordinateur. L'ancien chemin est conservé dans les "
+                    "réglages pour information."
+                )
+            else:
+                folder = os.path.abspath(os.path.expanduser(configured))
+                if os.path.isdir(folder):
+                    return folder
+
+                settings["previous_app_data_folder"] = configured
+                settings.pop("app_data_folder", None)
+                self.write_local_settings(settings)
+                messagebox.showwarning(
+                    "Dossier de données introuvable",
+                    "Le dossier de données enregistré n'est actuellement pas "
+                    "accessible :\n\n"
+                    f"{configured}\n\n"
+                    "Il n'a pas été recréé automatiquement. Vous pouvez choisir "
+                    "le dossier existant, notamment sur le NAS, ou en créer un nouveau."
+                )
 
         folder = self.prompt_app_data_folder_at_startup()
         folder = os.path.abspath(os.path.expanduser(folder))
@@ -956,7 +1028,7 @@ class BisseManagerApp:
         if not self.is_app_data_folder_nonempty(chosen):
             warning = (
                 "\n\nAttention : ce dossier ne semble pas contenir de projets "
-                "Gestion Bisses existants."
+                "Abisses existants."
             )
 
         if messagebox.askyesno(
@@ -2987,11 +3059,34 @@ class BisseManagerApp:
 
         return usage
 
-    def show_settings_dialog(self):
+    def handle_update_available(self, update_info):
+        """Affiche un accès discret à la mise à jour dans l'en-tête."""
+        try:
+            self.header_update_button.config(
+                text=f"⬆ Abisses {display_version(update_info.new_version)}"
+            )
+            if not self.header_update_button.winfo_manager():
+                self.header_update_button.pack(side="right", padx=5)
+        except Exception:
+            pass
+
+    def open_update_settings(self):
+        self.show_settings_dialog(initial_tab="updates")
+
+    def show_settings_dialog(self, initial_tab=None):
         if self.settings_window and self.settings_window.winfo_exists():
             self.settings_window.deiconify()
             self.settings_window.lift()
             self.settings_window.focus_force()
+            if (
+                initial_tab == "updates"
+                and self.settings_notebook is not None
+                and self.settings_update_tab is not None
+            ):
+                try:
+                    self.settings_notebook.select(self.settings_update_tab)
+                except Exception:
+                    pass
             return
 
         window = tk.Toplevel(self.root)
@@ -3003,6 +3098,7 @@ class BisseManagerApp:
 
         notebook = ttk.Notebook(window)
         notebook.pack(fill="both", expand=True, padx=12, pady=12)
+        self.settings_notebook = notebook
 
         categories_tab = tk.Frame(notebook, padx=12, pady=12)
         notebook.add(categories_tab, text="Catégories de segments")
@@ -3073,9 +3169,19 @@ class BisseManagerApp:
             fg="#666666"
         ).pack(fill="x", pady=(24, 0))
 
+        updates_tab = tk.Frame(notebook, padx=18, pady=18)
+        notebook.add(updates_tab, text="Mises à jour")
+        self.settings_update_tab = updates_tab
+        self.update_controller.attach(updates_tab)
+
+        if initial_tab == "updates":
+            notebook.select(updates_tab)
+
         def close():
             self.segment_category_manager_tree = None
             self.settings_window = None
+            self.settings_notebook = None
+            self.settings_update_tab = None
             window.destroy()
 
         window.protocol("WM_DELETE_WINDOW", close)
@@ -22451,7 +22557,31 @@ namespace GestionBissesFolderPicker
         self.select_photo_on_map(self.geolocated_photos[new_index])
 
 
+def run_packaged_self_test():
+    """Contrôle sans interface utilisé par la fabrication des installateurs."""
+    ZoneInfo("Europe/Zurich")
+    test_image = Image.new("RGB", (2, 2), "white")
+    if test_image.size != (2, 2):
+        raise RuntimeError("Pillow ne fonctionne pas correctement.")
+    if not APP_VERSION:
+        raise RuntimeError("La version d'Abisses est introuvable.")
+    print(
+        json.dumps(
+            {
+                "application": "Abisses",
+                "version": APP_VERSION,
+                "python": sys.version.split()[0],
+                "self_test": "OK",
+            },
+            ensure_ascii=False,
+        )
+    )
+
+
 if __name__ == "__main__":
-    root = tk.Tk()
+    if "--self-test" in sys.argv:
+        run_packaged_self_test()
+        raise SystemExit(0)
+    root = tk.Tk(className="Abisses")
     app = BisseManagerApp(root)
     root.mainloop()

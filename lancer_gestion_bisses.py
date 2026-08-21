@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Lance Gestion Bisses, tente une mise à jour Git sûre et conserve un journal
+Lance Abisses en mode développement, tente une mise à jour Git sûre et conserve un journal
 lisible si l'application ne démarre pas.
 
-Compatible avec Python 3.8 et versions suivantes.
+Compatible avec Python 3.10 et versions suivantes.
 """
 
 from __future__ import annotations
@@ -19,10 +19,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from abisses_paths import get_application_dir, launcher_log_file_path
 
-APP_DIR = Path(__file__).resolve().parent
+
+APP_DIR = get_application_dir()
 APP_SCRIPT = APP_DIR / "gestion_bisses.py"
-LOG_FILE = APP_DIR / "lancement_gestion_bisses.log"
+LOG_FILE = launcher_log_file_path()
 
 
 def log(message: str) -> None:
@@ -32,6 +34,7 @@ def log(message: str) -> None:
     )
     print(line)
     try:
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
         with LOG_FILE.open("a", encoding="utf-8") as handle:
             handle.write(line + "\n")
     except Exception:
@@ -142,7 +145,7 @@ def update_from_github() -> None:
 def launch_application() -> int:
     if not APP_SCRIPT.exists():
         show_error(
-            "Gestion Bisses",
+            "Abisses",
             "Fichier introuvable :\n{}\n\n"
             "Le lanceur doit se trouver dans le même dossier que gestion_bisses.py."
             .format(APP_SCRIPT),
@@ -160,7 +163,7 @@ def launch_application() -> int:
 
     if result.returncode != 0:
         show_error(
-            "Gestion Bisses ne s'est pas lancé",
+            "Abisses ne s'est pas lancé",
             "L'application s'est arrêtée avec le code {}.\n\n"
             "Consultez le fichier :\n{}\n\n"
             "Vous pouvez aussi lancer lancer_gestion_bisses.bat afin que "
@@ -180,7 +183,7 @@ def main() -> int:
         details = traceback.format_exc()
         log(details)
         show_error(
-            "Erreur du lanceur Gestion Bisses",
+            "Erreur du lanceur Abisses",
             "Une erreur inattendue s'est produite.\n\n"
             "Le détail a été enregistré dans :\n{}".format(LOG_FILE),
         )
