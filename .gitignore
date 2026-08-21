@@ -1,31 +1,55 @@
-# Données locales et données métier
-Gestion_Bisses_Data/
-Export_Platform/
-Export_JPG/
-_A_VERIFIER_AVANT_SUPPRESSION/
-_RAPPORTS_NETTOYAGE_GESTION_BISSES/
-category_migrations/
-*.local.json
-settings.local.json
-
 # Python
 __pycache__/
-*.py[cod]
+*.pyc
+*.pyo
+*.pyd
+
+# Environnements virtuels
 .venv/
 venv/
 env/
-.pytest_cache/
-.mypy_cache/
 
-# IDE / OS
-.vscode/
-.idea/
+# Fichiers système
 .DS_Store
 Thumbs.db
-desktop.ini
 
-# Sauvegardes ponctuelles
-*.bak
-*.tmp
-*_BACKUP_*/
-*_backup_*/
+# Données générées par le programme
+Export_JPG/
+catalogue.json
+carte_photos.html
+
+# Photos et traces lourdes
+Photos/
+*.heic
+*.heif
+*.jpg
+*.jpeg
+*.png
+*.gpx
+
+# Dossiers de tests locaux éventuels
+test_data/
+Mes_Bisses/
+
+# Environnements Python locaux
+.venv/
+.venv_backup*/
+__pycache__/
+*.pyc
+
+# Données locales Abisses
+Gestion_Bisses_Data/
+settings.local.json
+
+# Journaux
+*.log
+
+# Données métier et exports
+Photos/
+Fichiers GPX/
+Export_JPG/
+Export_Platform/
+
+# Fichiers système
+.DS_Store
+Thumbs.db
