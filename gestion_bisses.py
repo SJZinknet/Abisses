@@ -14,6 +14,7 @@ import queue
 import threading
 import time
 import csv
+import heapq
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk, colorchooser, simpledialog
 from PIL import Image, ImageTk, ImageOps, ImageDraw, ImageFont
@@ -187,6 +188,11 @@ class BisseManagerApp:
         self.rename_map_selected_plan_index = None
         self.rename_tree_selection_guard = False
         self.rename_map_hit_targets = []
+        # v52e : le mode GPS peut utiliser automatiquement la géométrie du
+        # GPX qui a fourni les coordonnées des photos. Ce guide est purement
+        # spatial : les horodatages du GPX ne participent jamais au tri.
+        self.rename_gpx_source_choice = None
+        self.rename_gpx_guidance_info = None
 
         # Atelier GPX restructuré
         self.gpx_editor_map = None
@@ -219,11 +225,17 @@ class BisseManagerApp:
         self.gpx_workshop_undo_stack = []
         self.gpx_workshop_redo_stack = []
 
-        # v52 : micro-correction non destructive d'un seul segment.
+        # v52b : micro-correction non destructive et création prudente d'un
+        # segment par clics. Le même moteur de brouillon est partagé par les
+        # deux modes afin de ne pas multiplier les couches cartographiques.
         # La géométrie n'est écrite dans le catalogue qu'après validation
         # explicite ; jusque-là, toute l'édition reste dans cette copie mémoire.
         self.gpx_geometry_edit_active = False
+        self.gpx_geometry_edit_kind = None
         self.gpx_geometry_edit_segment_id = None
+        self.gpx_geometry_create_anchor_segment_id = None
+        self.gpx_geometry_creation_phase = None
+        self.gpx_geometry_creation_snap_count = 0
         self.gpx_geometry_edit_draft_parts = []
         self.gpx_geometry_edit_session_original_parts = []
         self.gpx_geometry_edit_history = []
@@ -234,8 +246,15 @@ class BisseManagerApp:
         self.gpx_geometry_edit_quality_baseline = {}
         self.gpx_geometry_edit_tool_var = tk.StringVar(value="move")
         self.gpx_geometry_edit_toolbar = None
+        self.gpx_geometry_toolbar_title_var = tk.StringVar(value="✏️ Correction")
+        self.gpx_geometry_tools_frame = None
+        self.gpx_geometry_orientation_frame = None
         self.gpx_geometry_save_button = None
+        self.gpx_geometry_quit_button = None
+        self.gpx_geometry_restore_button = None
         self.gpx_geometry_edit_entry_frame = None
+        self.gpx_geometry_create_button = None
+        self.gpx_geometry_correct_button = None
         self.gpx_geometry_edit_category_row = None
         self.gpx_geometry_control_icon_cache = {}
         self.gpx_geometry_control_markers = []
@@ -7696,8 +7715,7 @@ namespace GestionBissesFolderPicker
         mode = mode or self.rename_order_mode_var.get()
         return {
             "datetime": "Date / heure",
-            "gps": "Position GPS des photos",
-            "reference": "Tracé de référence"
+            "gps": "Position GPS des photos"
         }.get(mode, mode)
 
     def rename_plan_sort_text(self):
@@ -7707,9 +7725,13 @@ namespace GestionBissesFolderPicker
         if mode == "datetime":
             return f"Tri : date / heure{reverse}"
         if mode == "gps":
+            guidance = getattr(self, "rename_gpx_guidance_info", None) or {}
+            if guidance.get("used"):
+                return (
+                    f"Tri : position GPS guidée par "
+                    f"{guidance.get('source_filename', 'le GPX topo')}{reverse}"
+                )
             return f"Tri : position GPS autonome{reverse}"
-        if mode == "reference":
-            return f"Tri : tracé de référence si disponible{reverse}"
         return f"Tri : {mode}{reverse}"
 
     def rename_photo_date_key(self, item):
@@ -7783,51 +7805,123 @@ namespace GestionBissesFolderPicker
 
         return best
 
-    def sort_by_gps_autonomous(self, items):
+    def optimize_rename_cluster_path(self, ordered_clusters):
         """
-        Ordre géographique autonome.
+        Améliore globalement le chemin produit par le plus-proche-voisin.
 
-        Principe :
-        1. regrouper les photos très proches ;
-        2. partir de la zone de la première photo chronologique, si possible ;
-        3. avancer de proche en proche entre les groupes ;
-        4. garder les photos d'un même groupe ensemble.
+        Le parcours glouton est rapide et donne généralement une bonne base,
+        mais il peut s'enfermer dans un coude ou entre deux passages proches,
+        puis revenir chercher très tard des groupes laissés derrière lui. Une
+        optimisation 2-opt bornée supprime ces détours sans changer le premier
+        groupe, ni l'ordre chronologique interne des groupes de proximité.
 
-        Le résultat ne dépend pas d'un GPX préparé, mais reste contrôlable et
-        inversable sur la carte de renommage.
+        Le calcul travaille dans un repère local en mètres. Il est volontairement
+        borné pour que la prévisualisation reste fluide avec de gros dossiers.
         """
-        gps_items = [item for item in items if item.get("gps")]
-        no_gps = [item for item in items if not item.get("gps")]
+        count = len(ordered_clusters)
+        if count < 4:
+            return list(ordered_clusters)
 
-        if len(gps_items) <= 1:
-            ordered = sorted(gps_items, key=lambda p: (self.rename_photo_date_key(p), os.path.basename(p["source_path"]).lower()))
-            ordered.extend(sorted(no_gps, key=lambda p: (self.rename_photo_date_key(p), os.path.basename(p["source_path"]).lower())))
-            return ordered
+        mean_lat = sum(float(cluster["lat"]) for cluster in ordered_clusters) / count
+        meters_per_degree_lat = 111_320.0
+        meters_per_degree_lon = meters_per_degree_lat * max(
+            0.01,
+            math.cos(math.radians(mean_lat))
+        )
 
-        clusters = self.cluster_rename_photos_by_gps(gps_items)
-        if not clusters:
-            return sorted(items, key=lambda p: (self.rename_photo_date_key(p), os.path.basename(p["source_path"]).lower()))
+        coordinates = [
+            (
+                float(cluster["lon"]) * meters_per_degree_lon,
+                float(cluster["lat"]) * meters_per_degree_lat
+            )
+            for cluster in ordered_clusters
+        ]
 
-        earliest = min(gps_items, key=lambda p: (self.rename_photo_date_key(p), os.path.basename(p["source_path"]).lower()))
-        start_index = None
-        for i, cluster in enumerate(clusters):
-            if earliest in cluster["items"]:
-                start_index = i
+        # Les dossiers courants comptent quelques centaines de groupes au
+        # maximum. Dans cette plage, une matrice locale évite de recalculer les
+        # mêmes distances pendant chaque passe. Au-delà, le calcul direct évite
+        # une allocation quadratique trop importante.
+        distance_matrix = None
+        if count <= 600:
+            distance_matrix = [[0.0] * count for _ in range(count)]
+            for index_a in range(count):
+                ax, ay = coordinates[index_a]
+                for index_b in range(index_a + 1, count):
+                    bx, by = coordinates[index_b]
+                    value = math.hypot(ax - bx, ay - by)
+                    distance_matrix[index_a][index_b] = value
+                    distance_matrix[index_b][index_a] = value
+
+        def distance(index_a, index_b):
+            if distance_matrix is not None:
+                return distance_matrix[index_a][index_b]
+            ax, ay = coordinates[index_a]
+            bx, by = coordinates[index_b]
+            return math.hypot(ax - bx, ay - by)
+
+        route = list(range(count))
+
+        # Un nombre de passes limité corrige les principaux croisements et
+        # grands retours sans transformer l'aperçu en résolution TSP coûteuse.
+        max_passes = min(60, max(12, int(math.sqrt(count)) * 4))
+        improvement_epsilon_m = 0.05
+
+        for _pass_index in range(max_passes):
+            best_delta = -improvement_epsilon_m
+            best_move = None
+
+            # i commence à 1 : le groupe de départ choisi par la photo la plus
+            # ancienne reste ancré. « Inverser » retourne ensuite le résultat
+            # complet comme dans les versions validées.
+            for i in range(1, count - 1):
+                previous_index = route[i - 1]
+                first_reversed_index = route[i]
+
+                for k in range(i + 1, count):
+                    last_reversed_index = route[k]
+
+                    old_length = distance(previous_index, first_reversed_index)
+                    new_length = distance(previous_index, last_reversed_index)
+
+                    if k + 1 < count:
+                        next_index = route[k + 1]
+                        old_length += distance(last_reversed_index, next_index)
+                        new_length += distance(first_reversed_index, next_index)
+
+                    delta = new_length - old_length
+                    if delta < best_delta:
+                        best_delta = delta
+                        best_move = (i, k)
+
+            if best_move is None:
                 break
 
-        if start_index is None:
-            a, b = self.farthest_rename_cluster_pair(clusters)
-            # Choix déterministe ; le bouton « Inverser » donne le contrôle réel.
-            start_index = min(a, b, key=lambda idx: (clusters[idx]["lat"], clusters[idx]["lon"]))
+            i, k = best_move
+            route[i:k + 1] = reversed(route[i:k + 1])
+
+        return [ordered_clusters[index] for index in route]
+
+    def build_nearest_neighbor_rename_cluster_path(self, clusters, start_index):
+        """Construit un parcours déterministe de proche en proche."""
+        if not clusters:
+            return []
+
+        try:
+            current = int(start_index)
+        except Exception:
+            current = 0
+
+        if current < 0 or current >= len(clusters):
+            current = 0
 
         remaining = set(range(len(clusters)))
-        current = start_index
-        ordered_clusters = []
+        ordered_indices = []
 
         while remaining:
             if current not in remaining:
                 current = min(remaining)
-            ordered_clusters.append(clusters[current])
+
+            ordered_indices.append(current)
             remaining.remove(current)
 
             if not remaining:
@@ -7848,153 +7942,737 @@ namespace GestionBissesFolderPicker
                 )
             )
 
+        return ordered_indices
+
+    def sort_by_gps_autonomous(self, items):
+        """
+        Ordre géographique autonome.
+
+        Principe :
+        1. regrouper les photos très proches ;
+        2. repérer les deux extrémités géographiques du corpus ;
+        3. conserver le sens que prenait l'ancien calcul depuis la première
+           photo chronologique, mais démarrer sur l'extrémité correspondante ;
+        4. avancer de proche en proche entre les groupes ;
+        5. corriger globalement les croisements et grands retours du parcours ;
+        6. garder les photos d'un même groupe ensemble.
+
+        Le résultat ne dépend pas d'un GPX préparé, mais reste contrôlable et
+        inversable sur la carte de renommage.
+        """
+        gps_items = [item for item in items if item.get("gps")]
+        no_gps = [item for item in items if not item.get("gps")]
+
+        if len(gps_items) <= 1:
+            ordered = sorted(gps_items, key=lambda p: (self.rename_photo_date_key(p), os.path.basename(p["source_path"]).lower()))
+            ordered.extend(sorted(no_gps, key=lambda p: (self.rename_photo_date_key(p), os.path.basename(p["source_path"]).lower())))
+            return ordered
+
+        clusters = self.cluster_rename_photos_by_gps(gps_items)
+        if not clusters:
+            return sorted(items, key=lambda p: (self.rename_photo_date_key(p), os.path.basename(p["source_path"]).lower()))
+
+        earliest = min(gps_items, key=lambda p: (self.rename_photo_date_key(p), os.path.basename(p["source_path"]).lower()))
+        chronological_start_index = None
+        for i, cluster in enumerate(clusters):
+            if earliest in cluster["items"]:
+                chronological_start_index = i
+                break
+
+        if chronological_start_index is None:
+            chronological_start_index = min(
+                range(len(clusters)),
+                key=lambda idx: (clusters[idx]["lat"], clusters[idx]["lon"])
+            )
+
+        # v52d : une première photo située au milieu du bisse ne doit jamais
+        # devenir une extrémité artificielle de l'ordre. On rejoue d'abord le
+        # parcours historique pour savoir quel sens il avait choisi, puis on
+        # repart de la véritable extrémité rencontrée la première dans ce sens.
+        orientation_path = self.build_nearest_neighbor_rename_cluster_path(
+            clusters,
+            chronological_start_index
+        )
+        endpoint_a, endpoint_b = self.farthest_rename_cluster_pair(clusters)
+        orientation_positions = {
+            cluster_index: position
+            for position, cluster_index in enumerate(orientation_path)
+        }
+        start_index = min(
+            (endpoint_a, endpoint_b),
+            key=lambda idx: orientation_positions.get(idx, len(clusters))
+        )
+
+        ordered_indices = self.build_nearest_neighbor_rename_cluster_path(
+            clusters,
+            start_index
+        )
+        ordered_clusters = [clusters[index] for index in ordered_indices]
+
+        # v52c : le plus-proche-voisin peut produire un bon ordre local mais
+        # un mauvais parcours global. La passe 2-opt retire les retours tardifs
+        # visibles sur la ligne violette, sans toucher aux choix d'interface.
+        ordered_clusters = self.optimize_rename_cluster_path(ordered_clusters)
+
+        # « Inverser » change le sens géographique des groupes. L'ordre
+        # chronologique interne des photos prises à moins du rayon choisi reste
+        # stable ; retourner toutes les photos mélangeait précisément 179/180.
+        if self.rename_reverse_var.get():
+            ordered_clusters.reverse()
+
         ordered = []
         for cluster in ordered_clusters:
             ordered.extend(cluster["items"])
 
-        if self.rename_reverse_var.get():
-            ordered.reverse()
-
         ordered.extend(sorted(no_gps, key=lambda p: (self.rename_photo_date_key(p), os.path.basename(p["source_path"]).lower())))
         return ordered
 
-    def get_reference_trace_points_for_rename(self):
-        """
-        Récupère un tracé de référence si l'atelier GPX contient déjà des
-        segments ordonnés. Ce mode reste optionnel : sans tracé, on retombe sur
-        le tri GPS autonome.
-        """
-        container = self.catalog_container or {}
-        points = []
+    # ============================================================
+    # V52E — TRI GPS GUIDÉ PAR LA TOPOLOGIE DU GPX SOURCE
+    # ============================================================
 
-        workshop = container.get("gpx_workshop", {}) or {}
-        segments = workshop.get("segments", []) or []
+    def normalize_rename_gpx_source_name(self, value):
+        """Normalise un nom de GPX sans dépendre de son dossier."""
+        if not value:
+            return ""
+        return os.path.basename(str(value).strip()).casefold()
 
-        if segments:
-            for segment in sorted(segments, key=self.gpx_segment_sort_key):
-                for part in segment.get("parts", []) or []:
-                    part_points = [
-                        (float(p[0]), float(p[1]))
-                        for p in part.get("points", []) or []
-                        if p and len(p) >= 2
-                    ]
-                    if len(part_points) >= 2:
-                        if points and points[-1] == part_points[0]:
-                            points.extend(part_points[1:])
-                        else:
-                            points.extend(part_points)
+    def normalize_rename_gpx_parts(self, raw_parts):
+        """Convertit les différents formats de géométrie du catalogue."""
+        parts = []
 
-        if len(points) >= 2:
-            return points
+        for raw_part in raw_parts or []:
+            if isinstance(raw_part, dict):
+                raw_points = raw_part.get("points", []) or []
+            else:
+                raw_points = raw_part or []
 
-        manual = (container.get("gpx_traces", {}) or {}).get("manual_segments", []) or []
-        for record in manual:
-            for part in record.get("segments", []) or []:
-                part_points = [
-                    (float(p[0]), float(p[1]))
-                    for p in part
-                    if p and len(p) >= 2
-                ]
-                if len(part_points) >= 2:
-                    if points and points[-1] == part_points[0]:
-                        points.extend(part_points[1:])
+            points = []
+            for raw_point in raw_points:
+                try:
+                    if isinstance(raw_point, dict):
+                        lat = float(raw_point.get("lat"))
+                        lon = float(raw_point.get("lon"))
                     else:
-                        points.extend(part_points)
+                        lat = float(raw_point[0])
+                        lon = float(raw_point[1])
+                    if -90 <= lat <= 90 and -180 <= lon <= 180:
+                        points.append((lat, lon))
+                except Exception:
+                    continue
 
-        return points if len(points) >= 2 else []
+            if len(points) >= 2:
+                parts.append(points)
 
-    def latlon_to_local_xy_m(self, lat, lon, lat0=None):
-        lat0 = float(lat0 if lat0 is not None else lat)
-        x = float(lon) * 111320.0 * math.cos(math.radians(lat0))
-        y = float(lat) * 110540.0
-        return x, y
+        return parts
 
-    def project_photo_on_reference_trace(self, lat, lon, trace_points):
-        if not trace_points or len(trace_points) < 2:
+    def load_rename_gpx_parts_from_file(self, path):
+        """Charge uniquement la géométrie d'un GPX, jamais ses heures."""
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                gpx = gpxpy.parse(handle)
+        except Exception:
+            return []
+
+        raw_parts = []
+        for track in getattr(gpx, "tracks", []) or []:
+            for segment in getattr(track, "segments", []) or []:
+                raw_parts.append([
+                    (point.latitude, point.longitude)
+                    for point in getattr(segment, "points", []) or []
+                ])
+
+        for route in getattr(gpx, "routes", []) or []:
+            raw_parts.append([
+                (point.latitude, point.longitude)
+                for point in getattr(route, "points", []) or []
+            ])
+
+        return self.normalize_rename_gpx_parts(raw_parts)
+
+    def rename_gpx_source_file_candidates(self, source_name, relative_path=""):
+        """Retourne les emplacements plausibles d'une source GPX."""
+        candidates = []
+
+        if relative_path:
+            if os.path.isabs(relative_path):
+                candidates.append(relative_path)
+            elif self.base_folder:
+                candidates.append(os.path.join(self.base_folder, relative_path))
+
+        if source_name and self.base_folder:
+            candidates.extend([
+                os.path.join(self.base_folder, "Fichiers GPX", source_name),
+                os.path.join(self.base_folder, source_name)
+            ])
+
+        if source_name and self.gpx_folder:
+            candidates.append(os.path.join(self.gpx_folder, source_name))
+
+        for path in getattr(self, "gpx_files", []) or []:
+            if self.normalize_rename_gpx_source_name(path) == self.normalize_rename_gpx_source_name(source_name):
+                candidates.append(path)
+
+        unique = []
+        seen = set()
+        for path in candidates:
+            normalized = os.path.abspath(path)
+            if normalized not in seen:
+                seen.add(normalized)
+                unique.append(path)
+        return unique
+
+    def collect_rename_gpx_source_candidates(self, items):
+        """Recense les GPX utilisables, en privilégiant la source des photos."""
+        declared_counts = {}
+        for item in items:
+            entry = item.get("entry", {}) or {}
+            source_name = entry.get("gps_source_file")
+            normalized = self.normalize_rename_gpx_source_name(source_name)
+            if normalized:
+                declared_counts[normalized] = declared_counts.get(normalized, 0) + 1
+
+        candidates = []
+        workshop = (self.catalog_container or {}).get("gpx_workshop", {}) or {}
+
+        for record in workshop.get("sources", []) or []:
+            source_name = record.get("source_filename") or f"{record.get('label', 'Trace')}.gpx"
+            parts = self.normalize_rename_gpx_parts(record.get("parts", []))
+
+            if not parts:
+                for path in self.rename_gpx_source_file_candidates(
+                    source_name,
+                    record.get("source_relative_path", "")
+                ):
+                    if os.path.exists(path):
+                        parts = self.load_rename_gpx_parts_from_file(path)
+                        if parts:
+                            break
+
+            if parts:
+                normalized = self.normalize_rename_gpx_source_name(source_name)
+                candidates.append({
+                    "key": str(record.get("id") or normalized),
+                    "label": record.get("label") or os.path.splitext(source_name)[0],
+                    "source_filename": source_name,
+                    "normalized_name": normalized,
+                    "parts": parts,
+                    "declared_count": declared_counts.get(normalized, 0),
+                    "point_count": sum(len(part) for part in parts)
+                })
+
+        traces = (self.catalog_container or {}).get("gpx_traces", {}) or {}
+        for record in traces.get("live_topo", []) or []:
+            source_name = record.get("source_filename") or record.get("filename") or f"{record.get('label', 'Topo')}.gpx"
+            parts = self.normalize_rename_gpx_parts(
+                record.get("parts") or record.get("segments") or []
+            )
+            if parts:
+                normalized = self.normalize_rename_gpx_source_name(source_name)
+                candidates.append({
+                    "key": str(record.get("id") or f"live:{normalized}"),
+                    "label": record.get("label") or os.path.splitext(source_name)[0],
+                    "source_filename": source_name,
+                    "normalized_name": normalized,
+                    "parts": parts,
+                    "declared_count": declared_counts.get(normalized, 0),
+                    "point_count": sum(len(part) for part in parts)
+                })
+
+        # Un ancien catalogue peut déclarer la provenance sans encore avoir
+        # importé la source dans l'atelier. Le fichier local reste exploitable.
+        existing_names = {candidate["normalized_name"] for candidate in candidates}
+        for normalized, count in declared_counts.items():
+            if normalized in existing_names:
+                continue
+            original_name = next(
+                (
+                    (item.get("entry", {}) or {}).get("gps_source_file")
+                    for item in items
+                    if self.normalize_rename_gpx_source_name(
+                        (item.get("entry", {}) or {}).get("gps_source_file")
+                    ) == normalized
+                ),
+                normalized
+            )
+            for path in self.rename_gpx_source_file_candidates(original_name):
+                if not os.path.exists(path):
+                    continue
+                parts = self.load_rename_gpx_parts_from_file(path)
+                if parts:
+                    candidates.append({
+                        "key": f"file:{normalized}",
+                        "label": os.path.splitext(os.path.basename(original_name))[0],
+                        "source_filename": os.path.basename(original_name),
+                        "normalized_name": normalized,
+                        "parts": parts,
+                        "declared_count": count,
+                        "point_count": sum(len(part) for part in parts)
+                    })
+                    break
+
+        # Une même source peut exister dans plusieurs sections historiques du
+        # catalogue. On garde la géométrie la plus complète pour chaque nom.
+        deduplicated = {}
+        for candidate in candidates:
+            name = candidate["normalized_name"] or candidate["key"]
+            previous = deduplicated.get(name)
+            if previous is None or candidate["point_count"] > previous["point_count"]:
+                deduplicated[name] = candidate
+
+        return sorted(
+            deduplicated.values(),
+            key=lambda candidate: (
+                -candidate.get("declared_count", 0),
+                -candidate.get("point_count", 0),
+                candidate.get("label", "").casefold()
+            )
+        )
+
+    def choose_rename_gpx_source(self, items):
+        """Choisit silencieusement la source déclarée, ou demande si nécessaire."""
+        candidates = self.collect_rename_gpx_source_candidates(items)
+        if not candidates:
             return None
 
-        photo_x, photo_y = self.latlon_to_local_xy_m(lat, lon, lat)
-        cumulative = 0.0
+        declared = [candidate for candidate in candidates if candidate.get("declared_count", 0) > 0]
+        if len(declared) == 1:
+            self.rename_gpx_source_choice = declared[0]["key"]
+            return declared[0]
+
+        pool = declared or candidates
+        if len(pool) == 1:
+            self.rename_gpx_source_choice = pool[0]["key"]
+            return pool[0]
+
+        for candidate in pool:
+            if candidate["key"] == self.rename_gpx_source_choice:
+                return candidate
+
+        if self.rename_gpx_source_choice == "__gps_autonomous__":
+            return None
+
+        lines = [
+            "Plusieurs GPX peuvent guider l'ordre des photos.",
+            "Choisissez le dessin topographique à utiliser :",
+            ""
+        ]
+        for index, candidate in enumerate(pool, start=1):
+            suffix = " · source des photos" if candidate.get("declared_count", 0) else ""
+            lines.append(f"{index}. {candidate['label']}{suffix}")
+
+        choice = simpledialog.askinteger(
+            "GPX topo pour le tri GPS",
+            "\n".join(lines),
+            parent=self.root,
+            minvalue=1,
+            maxvalue=len(pool)
+        )
+        if choice is None:
+            self.rename_gpx_source_choice = "__gps_autonomous__"
+            return None
+
+        selected = pool[choice - 1]
+        self.rename_gpx_source_choice = selected["key"]
+        return selected
+
+    def build_rename_topology_graph(self, parts, snap_m=1.5):
+        """
+        Construit un graphe non orienté à partir de la géométrie du GPX.
+
+        Les heures, le sens d'enregistrement et la vitesse sont absents de ce
+        modèle. Le léger raccord des points presque identiques permet de
+        reconnaître un passage répété sans fusionner les branches d'un lacet.
+        """
+        valid_parts = [part for part in parts or [] if len(part) >= 2]
+        if not valid_parts:
+            return None
+
+        all_points = [point for part in valid_parts for point in part]
+        mean_lat = sum(point[0] for point in all_points) / len(all_points)
+        meters_per_lon = 111320.0 * max(0.01, math.cos(math.radians(mean_lat)))
+        meters_per_lat = 110540.0
+        snap_m = max(0.25, float(snap_m))
+
+        nodes = []
+        adjacency = []
+        buckets = {}
+
+        def local_xy(lat, lon):
+            return lon * meters_per_lon, lat * meters_per_lat
+
+        def get_node(lat, lon):
+            x, y = local_xy(lat, lon)
+            cell = (math.floor(x / snap_m), math.floor(y / snap_m))
+            best_index = None
+            best_distance = None
+
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    for node_index in buckets.get((cell[0] + dx, cell[1] + dy), []):
+                        node = nodes[node_index]
+                        distance = math.hypot(x - node["x"], y - node["y"])
+                        if distance <= snap_m and (best_distance is None or distance < best_distance):
+                            best_index = node_index
+                            best_distance = distance
+
+            if best_index is not None:
+                return best_index
+
+            node_index = len(nodes)
+            nodes.append({"lat": lat, "lon": lon, "x": x, "y": y})
+            adjacency.append({})
+            buckets.setdefault(cell, []).append(node_index)
+            return node_index
+
+        for part in valid_parts:
+            previous = None
+            for lat, lon in part:
+                current = get_node(float(lat), float(lon))
+                if previous is not None and previous != current:
+                    a = nodes[previous]
+                    b = nodes[current]
+                    length = math.hypot(a["x"] - b["x"], a["y"] - b["y"])
+                    if length > 0:
+                        old = adjacency[previous].get(current)
+                        if old is None or length < old:
+                            adjacency[previous][current] = length
+                            adjacency[current][previous] = length
+                previous = current
+
+        edges = []
+        for node_index, neighbours in enumerate(adjacency):
+            for other_index, length in neighbours.items():
+                if node_index < other_index:
+                    edges.append((node_index, other_index, length))
+
+        if len(nodes) < 2 or not edges:
+            return None
+
+        return {
+            "nodes": nodes,
+            "adjacency": adjacency,
+            "edges": edges
+        }
+
+    def project_rename_point_on_topology(self, lat, lon, graph):
+        """Projette un point sur l'arête la plus proche du graphe topo."""
+        nodes = graph["nodes"]
+        if not nodes:
+            return None
+
+        mean_lat = sum(node["lat"] for node in nodes) / len(nodes)
+        px = float(lon) * 111320.0 * max(0.01, math.cos(math.radians(mean_lat)))
+        py = float(lat) * 110540.0
         best = None
 
-        for a, b in zip(trace_points[:-1], trace_points[1:]):
-            a_lat, a_lon = float(a[0]), float(a[1])
-            b_lat, b_lon = float(b[0]), float(b[1])
-            ref_lat = (a_lat + b_lat + lat) / 3.0
-
-            ax, ay = self.latlon_to_local_xy_m(a_lat, a_lon, ref_lat)
-            bx, by = self.latlon_to_local_xy_m(b_lat, b_lon, ref_lat)
-            px, py = self.latlon_to_local_xy_m(lat, lon, ref_lat)
-
-            dx = bx - ax
-            dy = by - ay
-            seg_len = math.hypot(dx, dy)
-
-            if seg_len <= 0:
+        for node_a, node_b, length in graph["edges"]:
+            a = nodes[node_a]
+            b = nodes[node_b]
+            dx = b["x"] - a["x"]
+            dy = b["y"] - a["y"]
+            denominator = dx * dx + dy * dy
+            if denominator <= 0:
                 continue
 
-            t = ((px - ax) * dx + (py - ay) * dy) / (seg_len * seg_len)
+            t = ((px - a["x"]) * dx + (py - a["y"]) * dy) / denominator
             t = max(0.0, min(1.0, t))
-            proj_x = ax + t * dx
-            proj_y = ay + t * dy
-            dist = math.hypot(px - proj_x, py - proj_y)
-            along = cumulative + t * seg_len
+            proj_x = a["x"] + t * dx
+            proj_y = a["y"] + t * dy
+            offset = math.hypot(px - proj_x, py - proj_y)
 
-            if best is None or dist < best[1]:
-                best = (along, dist)
-
-            cumulative += seg_len
+            if best is None or offset < best["offset_m"]:
+                best = {
+                    "u": node_a,
+                    "v": node_b,
+                    "t": t,
+                    "edge_length": length,
+                    "offset_m": offset,
+                    "point": (
+                        a["lat"] + t * (b["lat"] - a["lat"]),
+                        a["lon"] + t * (b["lon"] - a["lon"])
+                    )
+                }
 
         return best
 
-    def sort_by_reference_trace(self, items):
-        trace_points = self.get_reference_trace_points_for_rename()
-        if len(trace_points) < 2:
-            self.log("ℹ️ Aucun tracé de référence disponible : repli sur l'ordre GPS autonome.")
+    def dijkstra_from_rename_projection(self, graph, projection, with_previous=False):
+        """Distances réseau depuis une projection située au milieu d'une arête."""
+        count = len(graph["nodes"])
+        distances = [float("inf")] * count
+        previous = [None] * count if with_previous else None
+        heap = []
+
+        seeds = (
+            (projection["u"], projection["t"] * projection["edge_length"]),
+            (projection["v"], (1.0 - projection["t"]) * projection["edge_length"])
+        )
+        for node_index, distance in seeds:
+            if distance < distances[node_index]:
+                distances[node_index] = distance
+                heapq.heappush(heap, (distance, node_index))
+
+        while heap:
+            distance, node_index = heapq.heappop(heap)
+            if distance != distances[node_index]:
+                continue
+
+            for other_index, edge_length in graph["adjacency"][node_index].items():
+                proposed = distance + edge_length
+                if proposed < distances[other_index]:
+                    distances[other_index] = proposed
+                    if previous is not None:
+                        previous[other_index] = node_index
+                    heapq.heappush(heap, (proposed, other_index))
+
+        return distances, previous
+
+    def rename_projection_network_distance(self, distances, start_projection, target_projection):
+        """Distance le long du GPX entre deux projections."""
+        candidates = [
+            distances[target_projection["u"]] + target_projection["t"] * target_projection["edge_length"],
+            distances[target_projection["v"]] + (1.0 - target_projection["t"]) * target_projection["edge_length"]
+        ]
+
+        if {
+            start_projection["u"], start_projection["v"]
+        } == {
+            target_projection["u"], target_projection["v"]
+        }:
+            candidates.append(
+                abs(start_projection["t"] - target_projection["t"])
+                * start_projection["edge_length"]
+            )
+
+        return min(candidates)
+
+    def build_rename_topology_display_path(self, graph, start_projection, end_projection, distances, previous):
+        """Reconstruit la portion du GPX comprise entre les deux extrémités."""
+        direct_distance = float("inf")
+        if {
+            start_projection["u"], start_projection["v"]
+        } == {
+            end_projection["u"], end_projection["v"]
+        }:
+            direct_distance = (
+                abs(start_projection["t"] - end_projection["t"])
+                * start_projection["edge_length"]
+            )
+
+        target_options = [
+            (
+                distances[end_projection["u"]] + end_projection["t"] * end_projection["edge_length"],
+                end_projection["u"]
+            ),
+            (
+                distances[end_projection["v"]] + (1.0 - end_projection["t"]) * end_projection["edge_length"],
+                end_projection["v"]
+            )
+        ]
+        target_distance, target_node = min(target_options)
+
+        if direct_distance <= target_distance:
+            return [start_projection["point"], end_projection["point"]]
+
+        node_path = []
+        current = target_node
+        visited = set()
+        while current is not None and current not in visited:
+            visited.add(current)
+            node_path.append(current)
+            current = previous[current]
+        node_path.reverse()
+
+        positions = [start_projection["point"]]
+        positions.extend(
+            (graph["nodes"][node_index]["lat"], graph["nodes"][node_index]["lon"])
+            for node_index in node_path
+        )
+        positions.append(end_projection["point"])
+
+        compact = []
+        for point in positions:
+            if not compact or point != compact[-1]:
+                compact.append(point)
+        return compact
+
+    def sort_by_gps_guided_by_topo(self, items):
+        """
+        Trie les photos le long du dessin du GPX source.
+
+        Le GPX est un réseau géométrique non orienté. Aucun horodatage du GPX
+        ou des photos n'est utilisé pour choisir la progression globale. La
+        date ne reste qu'un départage stable à l'intérieur d'un agrégat.
+        """
+        self.rename_gpx_guidance_info = None
+        gps_items = [item for item in items if item.get("gps")]
+        no_gps = [item for item in items if not item.get("gps")]
+
+        if len(gps_items) <= 1:
             return self.sort_by_gps_autonomous(items)
 
-        projected = []
-        no_projection = []
+        source = self.choose_rename_gpx_source(gps_items)
+        if not source:
+            return self.sort_by_gps_autonomous(items)
 
-        for item in items:
-            gps = item.get("gps")
-            if not gps:
-                no_projection.append(item)
-                continue
+        graph = self.build_rename_topology_graph(source.get("parts", []))
+        if not graph:
+            self.log(f"⚠️ GPX topo inexploitable ({source['label']}) : repli sur le tri GPS autonome.")
+            return self.sort_by_gps_autonomous(items)
 
-            projection = self.project_photo_on_reference_trace(gps[0], gps[1], trace_points)
-            if projection is None:
-                no_projection.append(item)
-                continue
+        clusters = self.cluster_rename_photos_by_gps(gps_items)
+        projections = [
+            self.project_rename_point_on_topology(cluster["lat"], cluster["lon"], graph)
+            for cluster in clusters
+        ]
+        if not projections or any(projection is None for projection in projections):
+            self.log(f"⚠️ Projection sur le GPX topo impossible ({source['label']}) : repli GPS autonome.")
+            return self.sort_by_gps_autonomous(items)
 
-            item["trace_along_m"] = projection[0]
-            item["trace_distance_m"] = projection[1]
-            projected.append(item)
+        offsets = sorted(projection["offset_m"] for projection in projections)
+        within_75m = sum(offset <= 75.0 for offset in offsets) / len(offsets)
+        p90 = offsets[min(len(offsets) - 1, int((len(offsets) - 1) * 0.90))]
+        if within_75m < 0.90 or p90 > 60.0:
+            self.log(
+                f"⚠️ Couverture GPX topo insuffisante ({source['label']}, "
+                f"{within_75m:.0%} à moins de 75 m) : repli GPS autonome."
+            )
+            return self.sort_by_gps_autonomous(items)
 
-        projected.sort(
-            key=lambda p: (
-                p.get("trace_along_m", float("inf")),
-                p.get("trace_distance_m", float("inf")),
-                self.rename_photo_date_key(p),
-                os.path.basename(p["source_path"]).lower()
+        # Les deux extrémités sont celles qui sont les plus éloignées sur le
+        # réseau topo, et non celles qui sont les plus éloignées à vol d'oiseau.
+        endpoint_pair = None
+        endpoint_distance = -1.0
+
+        for index, projection in enumerate(projections):
+            distances, _previous = self.dijkstra_from_rename_projection(graph, projection)
+            for other_index in range(index + 1, len(projections)):
+                distance = self.rename_projection_network_distance(
+                    distances,
+                    projection,
+                    projections[other_index]
+                )
+                if not math.isfinite(distance):
+                    self.log(
+                        f"⚠️ GPX topo discontinu entre les photos ({source['label']}) : "
+                        "repli GPS autonome."
+                    )
+                    return self.sort_by_gps_autonomous(items)
+                if distance > endpoint_distance:
+                    endpoint_distance = distance
+                    endpoint_pair = (index, other_index)
+
+        if endpoint_pair is None or endpoint_distance <= 0:
+            return self.sort_by_gps_autonomous(items)
+
+        earliest = min(
+            gps_items,
+            key=lambda item: (
+                self.rename_photo_date_key(item),
+                os.path.basename(item["source_path"]).lower()
+            )
+        )
+        chronological_cluster_index = next(
+            (
+                index
+                for index, cluster in enumerate(clusters)
+                if earliest in cluster["items"]
             ),
-            reverse=bool(self.rename_reverse_var.get())
+            0
         )
 
-        no_projection.sort(
-            key=lambda p: (self.rename_photo_date_key(p), os.path.basename(p["source_path"]).lower())
+        # La v52d reste la référence pour le sens initial proposé. Le topo ne
+        # sert qu'à corriger la notion de distance et de continuité.
+        orientation_path = self.build_nearest_neighbor_rename_cluster_path(
+            clusters,
+            chronological_cluster_index
+        )
+        orientation_positions = {
+            cluster_index: position
+            for position, cluster_index in enumerate(orientation_path)
+        }
+        start_index = min(
+            endpoint_pair,
+            key=lambda index: orientation_positions.get(index, len(clusters))
+        )
+        end_index = endpoint_pair[1] if start_index == endpoint_pair[0] else endpoint_pair[0]
+
+        distances, previous = self.dijkstra_from_rename_projection(
+            graph,
+            projections[start_index],
+            with_previous=True
+        )
+        network_positions = [
+            self.rename_projection_network_distance(
+                distances,
+                projections[start_index],
+                projection
+            )
+            for projection in projections
+        ]
+
+        ordered_indices = sorted(
+            range(len(clusters)),
+            key=lambda index: (
+                network_positions[index],
+                orientation_positions.get(index, len(clusters)),
+                clusters[index]["lat"],
+                clusters[index]["lon"]
+            )
+        )
+        ordered_clusters = [clusters[index] for index in ordered_indices]
+
+        display_path = self.build_rename_topology_display_path(
+            graph,
+            projections[start_index],
+            projections[end_index],
+            distances,
+            previous
         )
 
-        return projected + no_projection
+        if self.rename_reverse_var.get():
+            ordered_clusters.reverse()
+            display_path.reverse()
+
+        ordered = []
+        for cluster in ordered_clusters:
+            for item in cluster["items"]:
+                item["gps_guided_by_topo"] = True
+                item["gps_topo_source"] = source["source_filename"]
+                ordered.append(item)
+
+        ordered.extend(sorted(
+            no_gps,
+            key=lambda item: (
+                self.rename_photo_date_key(item),
+                os.path.basename(item["source_path"]).lower()
+            )
+        ))
+
+        self.rename_gpx_guidance_info = {
+            "used": True,
+            "source_label": source["label"],
+            "source_filename": source["source_filename"],
+            "display_path": display_path,
+            "clusters_count": len(clusters),
+            "p90_offset_m": p90,
+            "max_offset_m": max(offsets),
+            "network_span_m": endpoint_distance
+        }
+        self.log(
+            f"🧭 Ordre GPS guidé par le GPX topo : {source['source_filename']} · "
+            f"{len(clusters)} groupe(s) · écart médian "
+            f"{offsets[len(offsets) // 2]:.1f} m."
+        )
+        return ordered
 
     def sort_rename_candidates(self, sortable):
         mode = self.rename_order_mode_var.get()
 
         if mode == "gps":
-            return self.sort_by_gps_autonomous(sortable)
+            return self.sort_by_gps_guided_by_topo(sortable)
 
-        if mode == "reference":
-            return self.sort_by_reference_trace(sortable)
+        self.rename_gpx_guidance_info = None
 
         ordered = sorted(
             sortable,
@@ -8415,7 +9093,17 @@ namespace GestionBissesFolderPicker
         if not ordered:
             return
 
-        positions = [p["gps"] for p in ordered]
+        guidance = getattr(self, "rename_gpx_guidance_info", None) or {}
+        if (
+            self.rename_order_mode_var.get() == "gps"
+            and guidance.get("used")
+            and len(guidance.get("display_path", [])) >= 2
+        ):
+            # v52e : la ligne de contrôle épouse le dessin du GPX topo. Les
+            # pastilles conservent naturellement leurs coordonnées réelles.
+            positions = guidance["display_path"]
+        else:
+            positions = [p["gps"] for p in ordered]
         if len(positions) >= 2:
             try:
                 path = self.rename_map_widget.set_path(
@@ -10862,6 +11550,8 @@ namespace GestionBissesFolderPicker
         self.rename_order_mode_var.set("datetime")
         self.rename_reverse_var.set(False)
         self.rename_map_selected_plan_index = None
+        self.rename_gpx_source_choice = None
+        self.rename_gpx_guidance_info = None
 
         controls = tk.LabelFrame(
             self.main_frame,
@@ -10910,7 +11600,7 @@ namespace GestionBissesFolderPicker
 
         order_frame = tk.Frame(controls)
         order_frame.grid(row=1, column=0, columnspan=8, sticky="ew", pady=(7, 0))
-        order_frame.grid_columnconfigure(8, weight=1)
+        order_frame.grid_columnconfigure(7, weight=1)
 
         def order_changed():
             self.rename_map_fit_done = False
@@ -10934,22 +11624,14 @@ namespace GestionBissesFolderPicker
             command=order_changed
         ).grid(row=0, column=2, sticky="w", padx=(0, 10))
 
-        tk.Radiobutton(
-            order_frame,
-            text="Tracé si disponible",
-            variable=self.rename_order_mode_var,
-            value="reference",
-            command=order_changed
-        ).grid(row=0, column=3, sticky="w", padx=(0, 12))
-
         tk.Checkbutton(
             order_frame,
             text="Inverser",
             variable=self.rename_reverse_var,
             command=order_changed
-        ).grid(row=0, column=4, sticky="w", padx=(0, 12))
+        ).grid(row=0, column=3, sticky="w", padx=(0, 12))
 
-        tk.Label(order_frame, text="Proximité").grid(row=0, column=5, sticky="e", padx=(0, 4))
+        tk.Label(order_frame, text="Proximité").grid(row=0, column=4, sticky="e", padx=(0, 4))
         tk.Spinbox(
             order_frame,
             from_=0,
@@ -10958,8 +11640,8 @@ namespace GestionBissesFolderPicker
             textvariable=self.rename_gps_group_radius_var,
             width=5,
             command=order_changed
-        ).grid(row=0, column=6, sticky="w")
-        tk.Label(order_frame, text="m").grid(row=0, column=7, sticky="w", padx=(3, 0))
+        ).grid(row=0, column=5, sticky="w")
+        tk.Label(order_frame, text="m").grid(row=0, column=6, sticky="w", padx=(3, 0))
 
         # Agencement principal : tableau à gauche, carte à droite.
         # Ratio visé : 60% tableau / 40% carte.
@@ -11102,27 +11784,36 @@ namespace GestionBissesFolderPicker
         plan = []
         number = start
         mode_label = self.rename_order_mode_label()
+        guidance = getattr(self, "rename_gpx_guidance_info", None) or {}
+        gps_topo_used = bool(
+            self.rename_order_mode_var.get() == "gps"
+            and guidance.get("used")
+        )
 
         for p in ordered:
             folder = os.path.dirname(p["source_path"])
             new_name = f"{prefix}_{year}_{number}.jpg"
             target_path = os.path.join(folder, new_name)
 
-            status = f"À renommer · {mode_label}"
+            status_label = "GPS + topo" if gps_topo_used else mode_label
+            status = f"À renommer · {status_label}"
             if os.path.abspath(p["source_path"]) == os.path.abspath(target_path):
-                status = f"Déjà correct · {mode_label}"
+                status = f"Déjà correct · {status_label}"
 
-            if self.rename_order_mode_var.get() in {"gps", "reference"} and not p.get("gps"):
+            if self.rename_order_mode_var.get() == "gps" and not p.get("gps"):
                 status += " · sans GPS, placé en fin"
-
-            if self.rename_order_mode_var.get() == "reference" and "trace_distance_m" in p:
-                status += f" · écart trace {p['trace_distance_m']:.0f} m"
 
             p["target_path"] = target_path
             p["new_name"] = new_name
             p["status"] = status
             p["order_number"] = number
             p["order_mode"] = self.rename_order_mode_var.get()
+            p["gps_guided_by_topo"] = bool(p.get("gps") and gps_topo_used)
+            p["gps_topo_source"] = (
+                guidance.get("source_filename", "")
+                if p["gps_guided_by_topo"]
+                else ""
+            )
 
             plan.append(p)
             number += 1
@@ -11158,8 +11849,8 @@ namespace GestionBissesFolderPicker
                 status = "Déjà correct"
             elif "sans GPS" in raw_status:
                 status = "Sans GPS"
-            elif "Tracé" in raw_status or "tracé" in raw_status:
-                status = "À renommer · Tracé"
+            elif "GPS + topo" in raw_status:
+                status = "À renommer · GPS + topo"
             elif "GPS" in raw_status:
                 status = "À renommer · GPS"
             elif "Date" in raw_status or "date" in raw_status:
@@ -11214,9 +11905,15 @@ namespace GestionBissesFolderPicker
         metadata_changes = []
         for p in ordered_plan:
             entry = self.catalog_data[p["catalog_index"]]
+            expected_guidance = "gpx_topology" if p.get("gps_guided_by_topo") else "gps_autonomous"
+            if p.get("order_mode") != "gps":
+                expected_guidance = ""
+            expected_source = p.get("gps_topo_source", "") if p.get("gps_guided_by_topo") else ""
             if (
                 int(entry.get("platform_order") or 0) != int(p["order_number"])
                 or entry.get("photo_order_mode") != p.get("order_mode")
+                or str(entry.get("photo_order_guidance") or "") != expected_guidance
+                or str(entry.get("photo_order_gpx_source") or "") != expected_source
             ):
                 metadata_changes.append(p)
 
@@ -11295,6 +11992,20 @@ namespace GestionBissesFolderPicker
                 entry["photo_order_label"] = self.rename_order_mode_label(p.get("order_mode"))
                 entry["photo_order_date"] = datetime.now().isoformat(timespec="seconds")
                 entry["platform_order"] = int(p["order_number"])
+
+                if p.get("order_mode") == "gps":
+                    entry["photo_order_guidance"] = (
+                        "gpx_topology"
+                        if p.get("gps_guided_by_topo")
+                        else "gps_autonomous"
+                    )
+                else:
+                    entry.pop("photo_order_guidance", None)
+
+                if p.get("gps_guided_by_topo") and p.get("gps_topo_source"):
+                    entry["photo_order_gpx_source"] = p["gps_topo_source"]
+                else:
+                    entry.pop("photo_order_gpx_source", None)
 
             self.save_catalog()
 
@@ -12284,12 +12995,19 @@ namespace GestionBissesFolderPicker
                 labels.append(label)
         return labels
 
-    def snapshot_gpx_segments(self, reason=""):
+    def snapshot_gpx_segments(self, reason="", include_sources=False):
         workshop = self.get_gpx_workshop_state()
-        self.gpx_workshop_undo_stack.append({
+        snapshot = {
             "reason": reason,
             "segments": copy.deepcopy(workshop.get("segments", []))
-        })
+        }
+        # Les sources GPX peuvent être très volumineuses. Elles ne sont copiées
+        # que pour les rares transactions qui les modifient réellement.
+        if include_sources:
+            snapshot["sources"] = copy.deepcopy(
+                workshop.get("sources", [])
+            )
+        self.gpx_workshop_undo_stack.append(snapshot)
         self.gpx_workshop_redo_stack.clear()
         if len(self.gpx_workshop_undo_stack) > 80:
             self.gpx_workshop_undo_stack = self.gpx_workshop_undo_stack[-80:]
@@ -12305,14 +13023,22 @@ namespace GestionBissesFolderPicker
             return
 
         workshop = self.get_gpx_workshop_state()
-        current = copy.deepcopy(workshop.get("segments", []))
+        current_segments = copy.deepcopy(workshop.get("segments", []))
         previous = self.gpx_workshop_undo_stack.pop()
-        self.gpx_workshop_redo_stack.append({
+        future = {
             "reason": previous.get("reason", ""),
-            "segments": current
-        })
+            "segments": current_segments
+        }
+        if "sources" in previous:
+            future["sources"] = copy.deepcopy(
+                workshop.get("sources", [])
+            )
+        self.gpx_workshop_redo_stack.append(future)
+        if "sources" in previous:
+            workshop["sources"] = copy.deepcopy(previous.get("sources", []))
         workshop["segments"] = previous.get("segments", [])
         self.save_gpx_workshop_state()
+        self.refresh_gpx_source_tree()
         self.refresh_gpx_segment_tree()
         self.draw_gpx_workshop_map()
         self.gpx_workshop_status_var.set(f"↶ Annulé : {previous.get('reason') or 'dernière action'}")
@@ -12328,14 +13054,22 @@ namespace GestionBissesFolderPicker
             return
 
         workshop = self.get_gpx_workshop_state()
-        current = copy.deepcopy(workshop.get("segments", []))
+        current_segments = copy.deepcopy(workshop.get("segments", []))
         future = self.gpx_workshop_redo_stack.pop()
-        self.gpx_workshop_undo_stack.append({
+        previous = {
             "reason": future.get("reason", ""),
-            "segments": current
-        })
+            "segments": current_segments
+        }
+        if "sources" in future:
+            previous["sources"] = copy.deepcopy(
+                workshop.get("sources", [])
+            )
+        self.gpx_workshop_undo_stack.append(previous)
+        if "sources" in future:
+            workshop["sources"] = copy.deepcopy(future.get("sources", []))
         workshop["segments"] = future.get("segments", [])
         self.save_gpx_workshop_state()
+        self.refresh_gpx_source_tree()
         self.refresh_gpx_segment_tree()
         self.draw_gpx_workshop_map()
         self.gpx_workshop_status_var.set(f"↷ Rétabli : {future.get('reason') or 'dernière action'}")
@@ -12475,6 +13209,7 @@ namespace GestionBissesFolderPicker
         self.refresh_gpx_segment_tree()
         self.refresh_gpx_category_tree()
         self.refresh_gpx_category_combo()
+        self.update_gpx_geometry_edit_entry_visibility()
         self.draw_gpx_workshop_map()
         self.fit_gpx_workshop_map_to_content()
         self.start_photo_layer_watch("gpx")
@@ -12521,8 +13256,8 @@ namespace GestionBissesFolderPicker
             fg="#555555"
         ).pack(fill="x", padx=8, pady=(0, 4))
 
-        # Barre v52 entièrement contextuelle : elle n'occupe aucune place en
-        # usage normal et n'apparaît que pendant la correction d'un segment.
+        # Barre v52b entièrement contextuelle : le même emplacement sert à la
+        # correction, à la création et au choix final du sens A/B.
         self.gpx_geometry_edit_toolbar = tk.Frame(
             parent,
             bg="#fff3cd",
@@ -12534,11 +13269,17 @@ namespace GestionBissesFolderPicker
 
         tk.Label(
             self.gpx_geometry_edit_toolbar,
-            text="✏️ Correction",
+            textvariable=self.gpx_geometry_toolbar_title_var,
             bg="#fff3cd",
             fg="#6b4f00",
             font=("Arial", 10, "bold")
         ).pack(side="left", padx=(0, 5))
+
+        self.gpx_geometry_tools_frame = tk.Frame(
+            self.gpx_geometry_edit_toolbar,
+            bg="#fff3cd"
+        )
+        self.gpx_geometry_tools_frame.pack(side="left")
 
         for label, value in (
             ("Déplacer", "move"),
@@ -12546,7 +13287,7 @@ namespace GestionBissesFolderPicker
             ("− Supprimer", "delete"),
         ):
             tk.Radiobutton(
-                self.gpx_geometry_edit_toolbar,
+                self.gpx_geometry_tools_frame,
                 text=label,
                 variable=self.gpx_geometry_edit_tool_var,
                 value=value,
@@ -12557,29 +13298,66 @@ namespace GestionBissesFolderPicker
             ).pack(side="left", padx=2)
 
         tk.Button(
-            self.gpx_geometry_edit_toolbar,
+            self.gpx_geometry_tools_frame,
             text="↶",
             width=3,
             command=self.undo_gpx_geometry_edit
         ).pack(side="left", padx=(6, 2))
 
         tk.Button(
-            self.gpx_geometry_edit_toolbar,
-            text="Restaurer",
-            command=self.restore_gpx_geometry_original
+            self.gpx_geometry_tools_frame,
+            text="↷",
+            width=3,
+            command=self.redo_gpx_geometry_edit
         ).pack(side="left", padx=2)
 
+        self.gpx_geometry_restore_button = tk.Button(
+            self.gpx_geometry_tools_frame,
+            text="Restaurer",
+            command=self.restore_gpx_geometry_original
+        )
+        self.gpx_geometry_restore_button.pack(side="left", padx=2)
+
+        self.gpx_geometry_orientation_frame = tk.Frame(
+            self.gpx_geometry_edit_toolbar,
+            bg="#fff3cd"
+        )
+        tk.Label(
+            self.gpx_geometry_orientation_frame,
+            text="Quel point est en amont ?",
+            bg="#fff3cd",
+            fg="#6b4f00"
+        ).pack(side="left", padx=(0, 4))
         tk.Button(
+            self.gpx_geometry_orientation_frame,
+            text="A",
+            width=4,
+            command=lambda: self.finish_gpx_segment_creation("A")
+        ).pack(side="left", padx=2)
+        tk.Button(
+            self.gpx_geometry_orientation_frame,
+            text="B",
+            width=4,
+            command=lambda: self.finish_gpx_segment_creation("B")
+        ).pack(side="left", padx=2)
+        tk.Button(
+            self.gpx_geometry_orientation_frame,
+            text="Retour au dessin",
+            command=self.return_to_gpx_segment_creation_drawing
+        ).pack(side="left", padx=(6, 2))
+
+        self.gpx_geometry_quit_button = tk.Button(
             self.gpx_geometry_edit_toolbar,
             text="✕ Quitter",
-            command=self.quit_gpx_geometry_edit
-        ).pack(side="right", padx=(2, 0))
+            command=self.quit_gpx_geometry_mode
+        )
+        self.gpx_geometry_quit_button.pack(side="right", padx=(2, 0))
 
         self.gpx_geometry_save_button = tk.Button(
             self.gpx_geometry_edit_toolbar,
             text="✓ Enregistrer",
             width=15,
-            command=self.save_gpx_geometry_edit,
+            command=self.validate_gpx_geometry_mode,
             bg="#27ae60",
             fg="white"
         )
@@ -12946,14 +13724,22 @@ namespace GestionBissesFolderPicker
             wraplength=470
         ).pack(fill="x", pady=(0, 6))
 
-        # Le bouton v52 n'est inséré que pour une sélection simple. Le cadre
-        # reste dépaqueté sinon : aucune hauteur supplémentaire permanente.
+        # Une seule rangée compacte accueille les deux entrées géométriques.
+        # « Corriger » reste contextuel à une sélection simple ; « Créer »
+        # réemploie exactement la même zone et n'ajoute aucun panneau.
         self.gpx_geometry_edit_entry_frame = tk.Frame(parent)
-        tk.Button(
+        self.gpx_geometry_create_button = tk.Button(
+            self.gpx_geometry_edit_entry_frame,
+            text="＋ Créer un segment",
+            command=self.start_gpx_segment_creation
+        )
+        self.gpx_geometry_create_button.pack(side="left", fill="x", expand=True)
+
+        self.gpx_geometry_correct_button = tk.Button(
             self.gpx_geometry_edit_entry_frame,
             text="✏️ Corriger le tracé",
             command=self.start_gpx_geometry_edit
-        ).pack(fill="x")
+        )
 
         category_row = tk.Frame(parent)
         category_row.pack(fill="x", pady=4)
@@ -13601,6 +14387,11 @@ namespace GestionBissesFolderPicker
         return main, main
 
     def apply_gpx_advanced_display_options(self):
+        if self.gpx_geometry_edit_active:
+            self.gpx_workshop_status_var.set(
+                "Terminez ou quittez le mode géométrique avant de modifier l’affichage du segment."
+            )
+            return
         ids = self.get_selected_gpx_segment_ids()
         if not ids:
             messagebox.showwarning("Aucun segment", "Sélectionnez au moins un segment.")
@@ -13693,7 +14484,10 @@ namespace GestionBissesFolderPicker
 
     def on_gpx_segment_selected(self, _event=None):
         ids = self.get_selected_gpx_segment_ids()
-        if self.gpx_geometry_edit_active:
+        if (
+            self.gpx_geometry_edit_active
+            and self.gpx_geometry_edit_kind == "edit"
+        ):
             expected = self.gpx_geometry_edit_segment_id
             if ids != [expected]:
                 try:
@@ -13807,7 +14601,10 @@ namespace GestionBissesFolderPicker
         if not messagebox.askyesno("Retirer la branche", message):
             return
 
-        self.snapshot_gpx_segments(f"Retrait branche {source_name}")
+        self.snapshot_gpx_segments(
+            f"Retrait branche {source_name}",
+            include_sources=True
+        )
 
         # Retirer la source.
         workshop["sources"] = [
@@ -14048,6 +14845,11 @@ namespace GestionBissesFolderPicker
         return (float(first[0]), float(first[1])), (float(last[0]), float(last[1]))
 
     def set_selected_source_orientation(self, upstream_endpoint):
+        if self.gpx_geometry_edit_active:
+            self.gpx_workshop_status_var.set(
+                "Terminez ou quittez le mode géométrique avant de modifier le sens d’une branche."
+            )
+            return
         source = self.find_gpx_source(self.gpx_workshop_selected_source_id)
         if not source:
             messagebox.showwarning("Aucune branche", "Sélectionnez d'abord une branche GPX.")
@@ -14095,6 +14897,11 @@ namespace GestionBissesFolderPicker
         )
 
     def move_selected_source_order(self, delta):
+        if self.gpx_geometry_edit_active:
+            self.gpx_workshop_status_var.set(
+                "Terminez ou quittez le mode géométrique avant de réordonner les branches."
+            )
+            return
         source = self.find_gpx_source(self.gpx_workshop_selected_source_id)
         if not source:
             messagebox.showwarning("Aucune branche", "Sélectionnez d'abord une branche GPX.")
@@ -14112,14 +14919,45 @@ namespace GestionBissesFolderPicker
         if new_index == current_index:
             return
 
+        workshop = self.get_gpx_workshop_state()
+        previous_sources = copy.deepcopy(workshop.get("sources", []))
+        previous_segments = copy.deepcopy(workshop.get("segments", []))
+        previous_undo_stack = copy.deepcopy(self.gpx_workshop_undo_stack)
+        previous_redo_stack = copy.deepcopy(self.gpx_workshop_redo_stack)
+        self.snapshot_gpx_segments(
+            "Réorganisation des branches",
+            include_sources=True
+        )
+
         sources.insert(new_index, sources.pop(current_index))
+        branch_order_by_source = {}
         for order, src in enumerate(sources, start=1):
             src["branch_order"] = order
+            branch_order_by_source[src.get("id")] = order
 
-        workshop = self.get_gpx_workshop_state()
         workshop["sources"] = sources
-        self.save_gpx_workshop_state()
+        for segment in workshop.get("segments", []):
+            for part in segment.get("parts", []):
+                order = branch_order_by_source.get(part.get("source_id"))
+                if order is not None:
+                    part["branch_order"] = order
+
+        try:
+            self.save_gpx_workshop_state()
+        except Exception as exc:
+            workshop["sources"] = previous_sources
+            workshop["segments"] = previous_segments
+            self.gpx_workshop_undo_stack = previous_undo_stack
+            self.gpx_workshop_redo_stack = previous_redo_stack
+            messagebox.showerror(
+                "Enregistrement impossible",
+                "L’ordre des branches n’a pas été modifié.\n\n"
+                f"{exc}"
+            )
+            return
+
         self.refresh_gpx_source_tree()
+        self.refresh_gpx_segment_tree()
         self.gpx_source_tree.selection_set(source.get("id"))
         self.draw_gpx_workshop_map()
         self.gpx_workshop_status_var.set(
@@ -14611,7 +15449,43 @@ namespace GestionBissesFolderPicker
                 if endpoint_b:
                     self.add_gpx_endpoint_marker(endpoint_b[0], endpoint_b[1], "B")
 
-        if self.gpx_geometry_edit_active:
+        if (
+            self.gpx_geometry_edit_active
+            and self.gpx_geometry_edit_kind == "create"
+        ):
+            draft_segment = {
+                # Aucun identifiant volontairement : la ligne provisoire reste
+                # purement visuelle et ne reçoit aucun callback direct.
+                "id": None,
+                "category_id": "non_classe",
+                "visible": True,
+                "parts": copy.deepcopy(self.gpx_geometry_edit_draft_parts)
+            }
+            for part in draft_segment["parts"]:
+                self.draw_gpx_segment_part_on_editor_map(
+                    draft_segment,
+                    part,
+                    selected=True
+                )
+
+            if self.gpx_geometry_creation_phase == "orientation":
+                points = self.gpx_geometry_creation_points()
+                if len(points) >= 2:
+                    self.add_gpx_endpoint_marker(
+                        float(points[0][0]),
+                        float(points[0][1]),
+                        "A"
+                    )
+                    self.add_gpx_endpoint_marker(
+                        float(points[-1][0]),
+                        float(points[-1][1]),
+                        "B"
+                    )
+
+        if (
+            self.gpx_geometry_edit_active
+            and self.gpx_geometry_creation_phase != "orientation"
+        ):
             self.draw_gpx_geometry_control_points()
 
         self.update_gpx_endpoint_toggle_button()
@@ -14920,6 +15794,14 @@ namespace GestionBissesFolderPicker
             return None
 
         if self.gpx_geometry_edit_active:
+            if (
+                self.gpx_geometry_edit_kind == "create"
+                and self.gpx_geometry_creation_phase == "orientation"
+            ):
+                self.gpx_workshop_status_var.set(
+                    "Utilisez « Retour au dessin » avant d’annuler un point."
+                )
+                return "break"
             self.undo_gpx_geometry_edit()
             return "break"
 
@@ -14939,6 +15821,14 @@ namespace GestionBissesFolderPicker
             return None
 
         if self.gpx_geometry_edit_active:
+            if (
+                self.gpx_geometry_edit_kind == "create"
+                and self.gpx_geometry_creation_phase == "orientation"
+            ):
+                self.gpx_workshop_status_var.set(
+                    "Utilisez « Retour au dessin » avant de rétablir un point."
+                )
+                return "break"
             self.redo_gpx_geometry_edit()
             return "break"
 
@@ -14952,7 +15842,7 @@ namespace GestionBissesFolderPicker
 
     def handle_global_escape_key(self, _event=None):
         if self.gpx_geometry_edit_active:
-            self.quit_gpx_geometry_edit()
+            self.quit_gpx_geometry_mode()
             return "break"
 
         if self.gpx_workshop_click_mode == "cut":
@@ -15063,6 +15953,509 @@ namespace GestionBissesFolderPicker
             except Exception:
                 pass
 
+    def show_gpx_geometry_drawing_controls(self):
+        if self.gpx_geometry_orientation_frame:
+            try:
+                self.gpx_geometry_orientation_frame.pack_forget()
+            except Exception:
+                pass
+        if self.gpx_geometry_tools_frame:
+            try:
+                if not self.gpx_geometry_tools_frame.winfo_manager():
+                    self.gpx_geometry_tools_frame.pack(side="left")
+            except Exception:
+                pass
+        if self.gpx_geometry_save_button:
+            try:
+                if not self.gpx_geometry_save_button.winfo_manager():
+                    options = {"side": "right", "padx": 2}
+                    if self.gpx_geometry_quit_button:
+                        options["before"] = self.gpx_geometry_quit_button
+                    self.gpx_geometry_save_button.pack(**options)
+            except Exception:
+                pass
+
+    def show_gpx_geometry_orientation_controls(self):
+        if self.gpx_geometry_tools_frame:
+            try:
+                self.gpx_geometry_tools_frame.pack_forget()
+            except Exception:
+                pass
+        if self.gpx_geometry_save_button:
+            try:
+                self.gpx_geometry_save_button.pack_forget()
+            except Exception:
+                pass
+        if self.gpx_geometry_orientation_frame:
+            try:
+                if not self.gpx_geometry_orientation_frame.winfo_manager():
+                    self.gpx_geometry_orientation_frame.pack(side="left")
+            except Exception:
+                pass
+
+    def gpx_geometry_creation_points(self, parts=None):
+        source_parts = (
+            self.gpx_geometry_edit_draft_parts
+            if parts is None
+            else parts
+        )
+        if not source_parts:
+            return []
+        return source_parts[0].get("points", [])
+
+    def start_gpx_segment_creation(self):
+        if self.gpx_geometry_edit_active:
+            return
+
+        selected = self.get_selected_gpx_segment_ids()
+        anchor_id = selected[0] if len(selected) == 1 else None
+        draft_part = {
+            "source_id": None,
+            "source_filename": "Création manuelle",
+            "branch_order": 10**9,
+            "part_order": 0,
+            "start_fraction": 0.0,
+            "end_fraction": 1.0,
+            "manual_source": True,
+            "points": []
+        }
+
+        self.cancel_gpx_cut_mode(silent=True)
+        self.gpx_geometry_edit_active = True
+        self.gpx_geometry_edit_kind = "create"
+        self.gpx_geometry_edit_segment_id = None
+        self.gpx_geometry_create_anchor_segment_id = anchor_id
+        self.gpx_geometry_creation_phase = "drawing"
+        self.gpx_geometry_creation_snap_count = 0
+        self.gpx_geometry_edit_draft_parts = [draft_part]
+        self.gpx_geometry_edit_session_original_parts = [
+            copy.deepcopy(draft_part)
+        ]
+        self.gpx_geometry_edit_history = []
+        self.gpx_geometry_edit_redo_history = []
+        self.gpx_geometry_edit_dirty = False
+        self.gpx_geometry_edit_selected_point = None
+        self.gpx_geometry_edit_linked_endpoint_updates = []
+        self.gpx_geometry_edit_quality_baseline = {
+            "duplicates": 0,
+            "jumps": 0
+        }
+        self.gpx_geometry_edit_tool_var.set("add")
+        self.gpx_geometry_toolbar_title_var.set("＋ Création")
+        self.gpx_geometry_edit_last_zoom = self.get_map_zoom_value(
+            self.gpx_editor_map
+        )
+        self.gpx_geometry_edit_last_view_signature = None
+        self.show_gpx_geometry_drawing_controls()
+        if self.gpx_geometry_restore_button:
+            try:
+                self.gpx_geometry_restore_button.pack_forget()
+            except Exception:
+                pass
+        if self.gpx_geometry_quit_button:
+            self.gpx_geometry_quit_button.config(text="✕ Annuler")
+
+        self.set_gpx_geometry_navigation_locked(True)
+        self.enter_gpx_segment_edit_photo_mode()
+        if self.gpx_geometry_edit_toolbar and self.gpx_map_viewer_paned:
+            self.gpx_geometry_edit_toolbar.pack(
+                fill="x",
+                padx=8,
+                pady=(0, 4),
+                before=self.gpx_map_viewer_paned
+            )
+
+        self.update_gpx_geometry_edit_entry_visibility()
+        self.update_gpx_geometry_dirty_indicator()
+        self.start_gpx_geometry_edit_view_watch()
+        self.draw_gpx_workshop_map()
+        anchor_note = (
+            " · la nouvelle branche sera placée après le segment sélectionné"
+            if anchor_id
+            else " · la nouvelle branche sera placée à la fin"
+        )
+        self.gpx_workshop_status_var.set(
+            "Création active · cliquez de point en point pour dessiner "
+            f"le segment{anchor_note} · Ctrl+Z / Ctrl+Y."
+        )
+
+    def cancel_gpx_segment_creation(self):
+        if (
+            not self.gpx_geometry_edit_active
+            or self.gpx_geometry_edit_kind != "create"
+        ):
+            return True
+
+        if self.gpx_geometry_edit_dirty:
+            if not messagebox.askyesno(
+                "Annuler la création ?",
+                "Le nouveau segment non enregistré sera perdu.\n\nAnnuler la création ?"
+            ):
+                return False
+
+        self.reset_gpx_geometry_edit_session(redraw=True)
+        self.gpx_workshop_status_var.set("Création du segment annulée.")
+        return True
+
+    def handle_gpx_segment_creation_add_click(self, coords):
+        if (
+            self.gpx_geometry_edit_kind != "create"
+            or self.gpx_geometry_creation_phase != "drawing"
+        ):
+            return
+
+        points = self.gpx_geometry_creation_points()
+        new_point = [float(coords[0]), float(coords[1])]
+        tolerance = self.gpx_geometry_edit_tolerance_m(
+            new_point[0],
+            pixels=24
+        )
+
+        if points:
+            nearest_point_distance = min(
+                self.point_distance_m(point, new_point)
+                for point in points
+            )
+            if nearest_point_distance <= 0.10:
+                self.gpx_workshop_status_var.set(
+                    "Point non ajouté : il se confond avec un point existant."
+                )
+                return
+
+        insert_index = len(points)
+        edge = self.nearest_gpx_geometry_edge(coords) if len(points) >= 2 else None
+        if edge and edge[0] <= tolerance:
+            _distance, part_index, point_index, _ratio = edge
+            if part_index == 0:
+                distance_to_last = self.point_distance_m(
+                    points[-1],
+                    new_point
+                )
+                if distance_to_last > tolerance:
+                    insert_index = point_index + 1
+
+        self.snapshot_gpx_geometry_draft()
+        points.insert(insert_index, new_point)
+        self.gpx_geometry_edit_selected_point = None
+        self.gpx_geometry_edit_dirty = True
+        self.update_gpx_geometry_dirty_indicator()
+        self.draw_gpx_workshop_map()
+        action = (
+            "inséré dans le tracé"
+            if insert_index < len(points) - 1
+            else "ajouté à la suite"
+        )
+        self.gpx_workshop_status_var.set(
+            f"Point {action} · création non enregistrée."
+        )
+
+    def snapped_gpx_creation_parts(self, tolerance_m=2.0):
+        parts = copy.deepcopy(self.gpx_geometry_edit_draft_parts)
+        points = self.gpx_geometry_creation_points(parts)
+        if len(points) < 2:
+            return parts, 0
+
+        endpoints = []
+        for segment in self.get_gpx_workshop_state().get("segments", []):
+            for part in segment.get("parts", []):
+                existing = part.get("points", [])
+                if len(existing) >= 2:
+                    endpoints.append(existing[0])
+                    endpoints.append(existing[-1])
+
+        snapped = 0
+        for index in (0, len(points) - 1):
+            if not endpoints:
+                break
+            nearest = min(
+                endpoints,
+                key=lambda point: self.point_distance_m(
+                    points[index],
+                    point
+                )
+            )
+            if self.point_distance_m(points[index], nearest) <= tolerance_m:
+                if points[index] != nearest:
+                    points[index] = copy.deepcopy(nearest)
+                    snapped += 1
+
+        return parts, snapped
+
+    def begin_gpx_segment_creation_orientation(self):
+        if (
+            not self.gpx_geometry_edit_active
+            or self.gpx_geometry_edit_kind != "create"
+        ):
+            return
+        if self.gpx_geometry_creation_phase == "orientation":
+            return
+
+        valid, error = self.validate_gpx_geometry_parts(
+            self.gpx_geometry_edit_draft_parts
+        )
+        if not valid:
+            messagebox.showwarning(
+                "Segment incomplet",
+                "Dessinez au moins deux points distincts avant de terminer.\n\n"
+                f"{error}"
+            )
+            return
+
+        snapped_parts, snap_count = self.snapped_gpx_creation_parts()
+        if snap_count:
+            self.snapshot_gpx_geometry_draft()
+            self.gpx_geometry_edit_draft_parts = snapped_parts
+        self.gpx_geometry_creation_snap_count = snap_count
+        self.gpx_geometry_creation_phase = "orientation"
+        self.gpx_geometry_edit_selected_point = None
+        self.gpx_geometry_toolbar_title_var.set("↕ Sens")
+        self.show_gpx_geometry_orientation_controls()
+        self.clear_gpx_geometry_control_markers()
+        self.draw_gpx_workshop_map()
+        snap_note = (
+            f" · {snap_count} extrémité(s) raccordée(s) exactement"
+            if snap_count
+            else ""
+        )
+        self.gpx_workshop_status_var.set(
+            "Choisissez le point amont : A conserve le dessin, "
+            f"B inverse son ordre{snap_note}."
+        )
+
+    def return_to_gpx_segment_creation_drawing(self):
+        if (
+            self.gpx_geometry_edit_kind != "create"
+            or self.gpx_geometry_creation_phase != "orientation"
+        ):
+            return
+
+        self.gpx_geometry_creation_phase = "drawing"
+        self.gpx_geometry_toolbar_title_var.set("＋ Création")
+        self.show_gpx_geometry_drawing_controls()
+        if self.gpx_geometry_restore_button:
+            try:
+                self.gpx_geometry_restore_button.pack_forget()
+            except Exception:
+                pass
+        self.update_gpx_geometry_dirty_indicator()
+        self.draw_gpx_workshop_map()
+        self.gpx_workshop_status_var.set(
+            "Création active · poursuivez le dessin ou corrigez ses points."
+        )
+
+    def next_gpx_manual_source_label(self):
+        existing = {
+            str(source.get("source_filename", "")).strip().casefold()
+            for source in self.get_gpx_workshop_state().get("sources", [])
+        }
+        number = 1
+        while True:
+            label = f"Création manuelle {number:02d}"
+            if label.casefold() not in existing:
+                return label
+            number += 1
+
+    def gpx_creation_insert_index(self, ordered_sources):
+        anchor = self.find_gpx_segment(
+            self.gpx_geometry_create_anchor_segment_id
+        )
+        if not anchor:
+            return len(ordered_sources)
+
+        source_ids = {
+            part.get("source_id")
+            for part in anchor.get("parts", [])
+            if part.get("source_id")
+        }
+        positions = [
+            index
+            for index, source in enumerate(ordered_sources)
+            if source.get("id") in source_ids
+        ]
+        return max(positions) + 1 if positions else len(ordered_sources)
+
+    def build_gpx_segment_creation_state(self, upstream_label):
+        if upstream_label not in {"A", "B"}:
+            return None, None, None, "Le choix du point amont est invalide."
+
+        parts = copy.deepcopy(self.gpx_geometry_edit_draft_parts)
+        if upstream_label == "B":
+            parts = list(reversed(parts))
+            for part in parts:
+                part["points"] = list(reversed(part.get("points", [])))
+
+        valid, error = self.validate_gpx_geometry_parts(parts)
+        if not valid:
+            return None, None, None, error
+
+        workshop = self.get_gpx_workshop_state()
+        ordered_sources = sorted(
+            copy.deepcopy(workshop.get("sources", [])),
+            key=lambda source: (
+                source.get("branch_order", 10**9),
+                source.get("source_filename", "").lower()
+            )
+        )
+        insert_index = self.gpx_creation_insert_index(ordered_sources)
+        source_id = uuid.uuid4().hex
+        segment_id = uuid.uuid4().hex
+        label = self.next_gpx_manual_source_label()
+        timestamp = datetime.now().isoformat(timespec="seconds")
+
+        source = {
+            "id": source_id,
+            "label": label,
+            "source_filename": label,
+            "source_relative_path": None,
+            "imported_at": timestamp,
+            "created_manually": True,
+            "parts": [
+                copy.deepcopy(part.get("points", []))
+                for part in parts
+            ],
+            "orientation_defined": True,
+            "orientation_label": f"{upstream_label} = amont",
+            "upstream_endpoint": upstream_label,
+            "branch_order": insert_index + 1,
+            "visible": True
+        }
+        ordered_sources.insert(insert_index, source)
+
+        branch_order_by_source = {}
+        for order, item in enumerate(ordered_sources, start=1):
+            item["branch_order"] = order
+            branch_order_by_source[item.get("id")] = order
+
+        new_segments = copy.deepcopy(workshop.get("segments", []))
+        for segment in new_segments:
+            for part in segment.get("parts", []):
+                source_order = branch_order_by_source.get(
+                    part.get("source_id")
+                )
+                if source_order is not None:
+                    part["branch_order"] = source_order
+                else:
+                    try:
+                        old_order = int(part.get("branch_order", 10**9))
+                        if old_order >= insert_index + 1:
+                            part["branch_order"] = old_order + 1
+                    except (TypeError, ValueError):
+                        pass
+
+        segment_parts = []
+        for part_order, part in enumerate(parts):
+            segment_parts.append({
+                "source_id": source_id,
+                "source_filename": label,
+                "branch_order": insert_index + 1,
+                "part_order": part_order,
+                "start_fraction": 0.0,
+                "end_fraction": 1.0,
+                "manual_source": True,
+                "points": copy.deepcopy(part.get("points", []))
+            })
+
+        segment = {
+            "id": segment_id,
+            "category_id": "non_classe",
+            "visible": True,
+            "parts": segment_parts,
+            "created_at": timestamp,
+            "created_manually": True
+        }
+        new_segments.append(segment)
+        return ordered_sources, new_segments, segment_id, ""
+
+    def finish_gpx_segment_creation(self, upstream_label):
+        if (
+            not self.gpx_geometry_edit_active
+            or self.gpx_geometry_edit_kind != "create"
+            or self.gpx_geometry_creation_phase != "orientation"
+        ):
+            return
+
+        sources, segments, segment_id, error = (
+            self.build_gpx_segment_creation_state(upstream_label)
+        )
+        if sources is None:
+            messagebox.showerror("Création impossible", error)
+            return
+
+        warnings = self.gpx_geometry_new_quality_warning(
+            self.gpx_geometry_edit_draft_parts,
+            self.gpx_geometry_edit_quality_baseline
+        )
+        if warnings:
+            if not messagebox.askyesno(
+                "Contrôle du tracé",
+                "Le nouveau segment semble contenir :\n\n"
+                + "\n".join(f"• {item}" for item in warnings)
+                + "\n\nCréer tout de même le segment ?"
+            ):
+                self.gpx_workshop_status_var.set(
+                    "Création suspendue après le contrôle du tracé."
+                )
+                return
+
+        workshop = self.get_gpx_workshop_state()
+        # Le plan a été construit sur des copies profondes : les listes
+        # vivantes peuvent donc servir directement de point de retour sans
+        # multiplier inutilement en mémoire les gros GPX sources.
+        previous_sources = workshop.get("sources", [])
+        previous_segments = workshop.get("segments", [])
+        previous_undo_stack = list(self.gpx_workshop_undo_stack)
+        previous_redo_stack = list(self.gpx_workshop_redo_stack)
+        self.snapshot_gpx_segments(
+            "Création manuelle d’un segment",
+            include_sources=True
+        )
+        workshop["sources"] = sources
+        workshop["segments"] = segments
+
+        try:
+            self.save_gpx_workshop_state()
+        except Exception as exc:
+            workshop["sources"] = previous_sources
+            workshop["segments"] = previous_segments
+            self.gpx_workshop_undo_stack = previous_undo_stack
+            self.gpx_workshop_redo_stack = previous_redo_stack
+            messagebox.showerror(
+                "Enregistrement impossible",
+                "Le nouveau segment n’a pas été créé.\n\n"
+                f"{exc}"
+            )
+            self.gpx_workshop_status_var.set(
+                "Échec d’enregistrement · le dessin est conservé."
+            )
+            self.log(f"❌ Création du segment impossible : {exc}")
+            return
+
+        snap_count = self.gpx_geometry_creation_snap_count
+        self.reset_gpx_geometry_edit_session(redraw=False)
+        self.refresh_gpx_source_tree()
+        self.refresh_gpx_segment_tree()
+        if self.gpx_segment_tree:
+            try:
+                self.gpx_segment_tree.selection_set(segment_id)
+                self.gpx_segment_tree.focus(segment_id)
+            except Exception:
+                pass
+        self.on_gpx_segment_selected()
+        self.draw_gpx_workshop_map()
+        snap_note = (
+            f" · {snap_count} extrémité(s) raccordée(s)"
+            if snap_count
+            else ""
+        )
+        self.gpx_workshop_status_var.set(
+            "✓ Segment créé · catégorie : Non classé "
+            f"· {upstream_label} défini comme amont{snap_note}."
+        )
+        self.log(
+            f"＋ Segment manuel créé : {segment_id[:8]} "
+            f"· {upstream_label} = amont"
+        )
+
     def update_gpx_geometry_edit_entry_visibility(self):
         frame = self.gpx_geometry_edit_entry_frame
         if not frame:
@@ -15073,25 +16466,42 @@ namespace GestionBissesFolderPicker
                 frame.pack_forget()
                 return
 
+            options = {"fill": "x", "pady": (0, 5)}
+            if self.gpx_geometry_edit_category_row:
+                options["before"] = self.gpx_geometry_edit_category_row
+            frame.pack(**options)
+
             if len(self.get_selected_gpx_segment_ids()) == 1:
-                options = {"fill": "x", "pady": (0, 5)}
-                if self.gpx_geometry_edit_category_row:
-                    options["before"] = self.gpx_geometry_edit_category_row
-                frame.pack(**options)
+                if self.gpx_geometry_correct_button:
+                    self.gpx_geometry_correct_button.pack(
+                        side="left",
+                        fill="x",
+                        expand=True,
+                        padx=(4, 0)
+                    )
             else:
-                frame.pack_forget()
+                if self.gpx_geometry_correct_button:
+                    self.gpx_geometry_correct_button.pack_forget()
         except Exception:
             pass
 
     def leave_gpx_workshop(self):
-        if self.gpx_geometry_edit_active and not self.quit_gpx_geometry_edit():
+        if (
+            self.gpx_geometry_edit_active
+            and not self.quit_gpx_geometry_mode()
+        ):
             return
         self.load_folder(self.base_folder)
 
     def save_gpx_workshop_from_ui(self):
         if self.gpx_geometry_edit_active:
+            action = (
+                "Terminez la création et choisissez le point amont A/B."
+                if self.gpx_geometry_edit_kind == "create"
+                else "Utilisez « ✓ Enregistrer » dans la barre de correction pour valider le tracé."
+            )
             self.gpx_workshop_status_var.set(
-                "Utilisez « ✓ Enregistrer » dans la barre de correction pour valider le tracé."
+                action
             )
             return
         try:
@@ -15154,10 +16564,14 @@ namespace GestionBissesFolderPicker
         if not button:
             return
         try:
+            if self.gpx_geometry_edit_kind == "create":
+                label = "✓ Terminer"
+            else:
+                label = "✓ Enregistrer"
             button.config(
-                text="✓ Enregistrer *"
+                text=f"{label} *"
                 if self.gpx_geometry_edit_dirty
-                else "✓ Enregistrer"
+                else label
             )
         except Exception:
             pass
@@ -15197,7 +16611,11 @@ namespace GestionBissesFolderPicker
         # point de contrôle ne peut survivre à « Quitter ».
         self.clear_gpx_geometry_control_markers()
         self.gpx_geometry_edit_active = False
+        self.gpx_geometry_edit_kind = None
         self.gpx_geometry_edit_segment_id = None
+        self.gpx_geometry_create_anchor_segment_id = None
+        self.gpx_geometry_creation_phase = None
+        self.gpx_geometry_creation_snap_count = 0
         self.gpx_geometry_edit_draft_parts = []
         self.gpx_geometry_edit_session_original_parts = []
         self.gpx_geometry_edit_history = []
@@ -15210,6 +16628,8 @@ namespace GestionBissesFolderPicker
         self.gpx_geometry_edit_last_view_signature = None
         self.gpx_geometry_visible_control_points = []
         self.gpx_geometry_edit_tool_var.set("move")
+        self.gpx_geometry_toolbar_title_var.set("✏️ Correction")
+        self.show_gpx_geometry_drawing_controls()
         self.update_gpx_geometry_dirty_indicator()
 
         if self.gpx_geometry_edit_toolbar:
@@ -15252,7 +16672,10 @@ namespace GestionBissesFolderPicker
 
         self.cancel_gpx_cut_mode(silent=True)
         self.gpx_geometry_edit_active = True
+        self.gpx_geometry_edit_kind = "edit"
         self.gpx_geometry_edit_segment_id = ids[0]
+        self.gpx_geometry_create_anchor_segment_id = None
+        self.gpx_geometry_creation_phase = None
         self.gpx_geometry_edit_draft_parts = parts
         self.gpx_geometry_edit_session_original_parts = copy.deepcopy(parts)
         self.gpx_geometry_edit_history = []
@@ -15264,6 +16687,12 @@ namespace GestionBissesFolderPicker
             self.gpx_geometry_quality_counts(parts)
         )
         self.gpx_geometry_edit_tool_var.set("move")
+        self.gpx_geometry_toolbar_title_var.set("✏️ Correction")
+        self.show_gpx_geometry_drawing_controls()
+        if self.gpx_geometry_restore_button:
+            self.gpx_geometry_restore_button.pack(side="left", padx=2)
+        if self.gpx_geometry_quit_button:
+            self.gpx_geometry_quit_button.config(text="✕ Quitter")
         self.gpx_geometry_edit_last_zoom = self.get_map_zoom_value(self.gpx_editor_map)
         self.gpx_geometry_edit_last_view_signature = None
         self.set_gpx_geometry_navigation_locked(True)
@@ -15300,6 +16729,16 @@ namespace GestionBissesFolderPicker
         self.gpx_workshop_status_var.set("Correction du tracé quittée.")
         return True
 
+    def quit_gpx_geometry_mode(self):
+        if self.gpx_geometry_edit_kind == "create":
+            return self.cancel_gpx_segment_creation()
+        return self.quit_gpx_geometry_edit()
+
+    def validate_gpx_geometry_mode(self):
+        if self.gpx_geometry_edit_kind == "create":
+            return self.begin_gpx_segment_creation_orientation()
+        return self.save_gpx_geometry_edit()
+
     def on_gpx_geometry_edit_tool_changed(self):
         if not self.gpx_geometry_edit_active:
             return
@@ -15312,7 +16751,19 @@ namespace GestionBissesFolderPicker
             "delete": "Supprimer : cliquez sur le point à retirer.",
         }
         self.draw_gpx_workshop_map()
-        self.gpx_workshop_status_var.set(f"Correction active · {messages.get(tool, '')}")
+        prefix = (
+            "Création active"
+            if self.gpx_geometry_edit_kind == "create"
+            else "Correction active"
+        )
+        if self.gpx_geometry_edit_kind == "create" and tool == "add":
+            detail = (
+                "Ajouter : cliquez pour prolonger le tracé ; "
+                "cliquez près d’une portion pour y insérer un point."
+            )
+        else:
+            detail = messages.get(tool, "")
+        self.gpx_workshop_status_var.set(f"{prefix} · {detail}")
 
     def snapshot_gpx_geometry_draft(self):
         self.gpx_geometry_edit_history.append(
@@ -15492,8 +16943,13 @@ namespace GestionBissesFolderPicker
 
         zoom = self.get_map_zoom_value(self.gpx_editor_map)
         if zoom is not None and zoom < self.gpx_geometry_edit_min_zoom():
+            mode_label = (
+                "Création"
+                if self.gpx_geometry_edit_kind == "create"
+                else "Correction"
+            )
             self.gpx_workshop_status_var.set(
-                "Correction active · zoomez davantage pour afficher et modifier les points."
+                f"{mode_label} active · zoomez davantage pour afficher et modifier les points."
             )
             return
 
@@ -15839,6 +17295,11 @@ namespace GestionBissesFolderPicker
     def handle_gpx_geometry_edit_click(self, coords):
         if not self.gpx_geometry_edit_active:
             return
+        if self.gpx_geometry_creation_phase == "orientation":
+            self.gpx_workshop_status_var.set(
+                "Choisissez A ou B dans le bandeau, ou revenez au dessin."
+            )
+            return
 
         zoom = self.get_map_zoom_value(self.gpx_editor_map)
         if zoom is not None and zoom < self.gpx_geometry_edit_min_zoom():
@@ -15848,6 +17309,10 @@ namespace GestionBissesFolderPicker
             return
 
         tool = self.gpx_geometry_edit_tool_var.get()
+        if self.gpx_geometry_edit_kind == "create" and tool == "add":
+            self.handle_gpx_segment_creation_add_click(coords)
+            return
+
         if tool == "move":
             if self.gpx_geometry_edit_selected_point is None:
                 key, _distance = self.nearest_visible_gpx_geometry_point(coords)
@@ -15893,7 +17358,10 @@ namespace GestionBissesFolderPicker
             linked_targets = []
             continuity_declined = False
 
-            if endpoint_side:
+            if (
+                endpoint_side
+                and self.gpx_geometry_edit_kind == "edit"
+            ):
                 existing_group = self.find_gpx_geometry_linked_endpoint_group(
                     part_index,
                     endpoint_side
@@ -15964,7 +17432,12 @@ namespace GestionBissesFolderPicker
                     "· correction non enregistrée."
                 )
             else:
-                status = "Point déplacé · correction non enregistrée."
+                pending_label = (
+                    "création"
+                    if self.gpx_geometry_edit_kind == "create"
+                    else "correction"
+                )
+                status = f"Point déplacé · {pending_label} non enregistrée."
             self.gpx_workshop_status_var.set(status)
             return
 
@@ -16009,7 +17482,10 @@ namespace GestionBissesFolderPicker
 
             part_index, point_index = key
             points = self.gpx_geometry_edit_draft_parts[part_index].get("points", [])
-            if len(points) <= 2:
+            if (
+                self.gpx_geometry_edit_kind == "edit"
+                and len(points) <= 2
+            ):
                 self.gpx_workshop_status_var.set(
                     "Suppression impossible : une partie doit conserver au moins deux points."
                 )
@@ -16019,7 +17495,10 @@ namespace GestionBissesFolderPicker
                 part_index,
                 point_index
             )
-            if endpoint_side:
+            if (
+                endpoint_side
+                and self.gpx_geometry_edit_kind == "edit"
+            ):
                 shared = self.find_shared_gpx_segment_endpoints(
                     points[point_index],
                     excluded_segment_id=self.gpx_geometry_edit_segment_id,
@@ -16042,7 +17521,10 @@ namespace GestionBissesFolderPicker
 
             self.snapshot_gpx_geometry_draft()
             del points[point_index]
-            if endpoint_side:
+            if (
+                endpoint_side
+                and self.gpx_geometry_edit_kind == "edit"
+            ):
                 self.remove_gpx_geometry_linked_endpoint_group(
                     part_index,
                     endpoint_side
@@ -16055,7 +17537,14 @@ namespace GestionBissesFolderPicker
             )
             self.update_gpx_geometry_dirty_indicator()
             self.draw_gpx_workshop_map()
-            self.gpx_workshop_status_var.set("Point supprimé · correction non enregistrée.")
+            pending_label = (
+                "création"
+                if self.gpx_geometry_edit_kind == "create"
+                else "correction"
+            )
+            self.gpx_workshop_status_var.set(
+                f"Point supprimé · {pending_label} non enregistrée."
+            )
 
     def validate_gpx_geometry_parts(self, parts):
         if not parts:
@@ -16792,6 +18281,11 @@ namespace GestionBissesFolderPicker
         self.gpx_workshop_status_var.set(f"{len(ids)} segment(s) retiré(s) de l’atelier.")
 
     def apply_category_to_selected_segments(self):
+        if self.gpx_geometry_edit_active:
+            self.gpx_workshop_status_var.set(
+                "Terminez ou quittez le mode géométrique avant de classer un segment."
+            )
+            return
         ids = self.get_selected_gpx_segment_ids()
         if not ids:
             messagebox.showwarning("Aucun segment", "Sélectionnez au moins un segment.")
