@@ -11,7 +11,12 @@
    ```
 
 4. Faire **Push origin**.
-5. Attendre que le workflow **Validation Abisses** soit vert.
+5. Attendre que les quatre variantes du workflow **Validation Abisses** soient
+   vertes.
+6. Attendre aussi que les deux constructions **Installateur Windows** et
+   **Paquet Ubuntu** du workflow **Construire et publier Abisses** soient
+   vertes. Ce second contrôle installe réellement les deux paquets et lance
+   l'auto-test avant toute Release.
 
 ## 2. Créer la Release beta.1
 

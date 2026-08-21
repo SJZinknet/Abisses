@@ -15,10 +15,10 @@ jobs:
 
     steps:
       - name: Récupérer le code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Installer Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -33,8 +33,11 @@ jobs:
           abisses_update_ui.py
           packaging/build_icons.py
 
-      - name: Exécuter les tests
-        run: python -m unittest discover -s tests -v
+      - name: Tester les chemins locaux
+        run: python -m unittest discover -s tests -p "test_abisses_paths.py" -v
+
+      - name: Tester les mises à jour
+        run: python -m unittest discover -s tests -p "test_abisses_update.py" -v
 
       - name: Vérifier les espaces et marqueurs Git
         run: git diff --check

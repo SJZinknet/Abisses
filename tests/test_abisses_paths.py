@@ -94,7 +94,11 @@ class AbissesPathsTests(unittest.TestCase):
             ):
                 result = abisses_paths.prepare_user_environment(legacy_dir)
 
-            self.assertEqual(result.migrated_settings_from, legacy_settings)
+            self.assertIsNotNone(result.migrated_settings_from)
+            self.assertTrue(
+                result.migrated_settings_from.samefile(legacy_settings),
+                "Le réglage migré doit référencer exactement le fichier source.",
+            )
             self.assertTrue(legacy_settings.exists())
             self.assertEqual(
                 json.loads(result.settings_file.read_text(encoding="utf-8")),

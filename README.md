@@ -60,13 +60,16 @@ l'utilisateur.
 
 1. mettre à jour `VERSION` ;
 2. valider et pousser le code ;
-3. créer un tag identique préfixé par `v`, par exemple
+3. attendre que les validations et les constructions d'installation Windows et
+   Ubuntu soient vertes ;
+4. créer un tag identique préfixé par `v`, par exemple
    `v0.55.0-beta.1` ;
-4. pousser le tag.
+5. pousser le tag.
 
-GitHub Actions valide alors le code, construit les installateurs Windows et
-Ubuntu, génère `SHA256SUMS` et publie la Release. Les binaires ne sont pas
-committés dans le dépôt.
+À chaque push sur `main`, GitHub Actions construit et installe réellement les
+deux paquets sur des ordinateurs de test. Le tag relance ensuite exactement la
+même construction validée, génère `SHA256SUMS` et crée la Release. Les binaires
+ne sont pas committés dans le dépôt.
 
 ## Principe des données
 
