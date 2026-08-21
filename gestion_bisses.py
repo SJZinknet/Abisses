@@ -27,13 +27,14 @@ import piexif
 
 pillow_heif.register_heif_opener()
 
+APP_VERSION = "v54"
+
 
 class BisseManagerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Gestionnaire de Bisses - Édition Pro")
-        self.root.geometry("1580x920")
-        self.root.minsize(1280, 760)
+        self.root.title(f"Gestionnaire de Bisses - Édition Pro {APP_VERSION}")
+        self.configure_main_window_geometry()
 
         # Données globales du logiciel
         # GitHub contient le code. Le dossier Gestion_Bisses_Data peut être
@@ -188,11 +189,12 @@ class BisseManagerApp:
         self.rename_map_selected_plan_index = None
         self.rename_tree_selection_guard = False
         self.rename_map_hit_targets = []
-        # v52e : le mode GPS peut utiliser automatiquement la géométrie du
-        # GPX qui a fourni les coordonnées des photos. Ce guide est purement
-        # spatial : les horodatages du GPX ne participent jamais au tri.
+        # v53 : le mode GPS peut réunir plusieurs GPX topo/live dans un même
+        # réseau géométrique. Ce guide est purement spatial : les horodatages
+        # des GPX ne participent jamais au tri des photos.
         self.rename_gpx_source_choice = None
         self.rename_gpx_guidance_info = None
+        self.rename_manual_gpx_sources = []
 
         # Atelier GPX restructuré
         self.gpx_editor_map = None
@@ -387,6 +389,107 @@ class BisseManagerApp:
         self.root.bind("<Control-Shift-Z>", self.handle_global_redo_key, add="+")
 
         self.create_welcome_screen()
+
+    def configure_main_window_geometry(self):
+        """
+        Prépare une fenêtre principale adaptée à l'écran, puis demande au
+        gestionnaire de fenêtres de la maximiser.
+
+        Il s'agit volontairement d'une fenêtre maximisée, pas du mode plein
+        écran exclusif : la barre de titre, le dock et la barre des tâches
+        restent accessibles. Une géométrie de secours proche du plein écran
+        est appliquée d'abord pour les environnements où Tk ne sait pas
+        demander la maximisation (ou lorsque le gestionnaire de fenêtres
+        refuse cette demande).
+        """
+        screen_w, screen_h = self._get_main_screen_size()
+
+        # L'ancienne taille minimale 1280x760 dépassait la zone réellement
+        # disponible sur certains portables Linux. On conserve une taille
+        # confortable quand l'écran le permet, sans jamais bloquer une petite
+        # résolution dans une fenêtre plus grande que l'écran.
+        min_width = min(900, max(480, screen_w - 80))
+        min_height = min(620, max(360, screen_h - 120))
+        try:
+            self.root.minsize(min_width, min_height)
+        except Exception:
+            pass
+
+        self._apply_main_window_fallback_geometry(screen_w, screen_h)
+
+        # Deux tentatives rapprochées sont utiles avec certains gestionnaires
+        # Linux : la première prépare l'état, la seconde intervient une fois
+        # la fenêtre effectivement affichée. Elles restent limitées au tout
+        # début du lancement et ne gênent ensuite jamais le redimensionnement
+        # manuel de l'utilisateur.
+        try:
+            self.root.after(80, self._maximize_main_window)
+            self.root.after(320, self._maximize_main_window)
+        except Exception:
+            self._maximize_main_window()
+
+    def _get_main_screen_size(self):
+        """Retourne une taille d'écran exploitable, même si Tk répond mal."""
+        try:
+            screen_w = int(self.root.winfo_screenwidth())
+            screen_h = int(self.root.winfo_screenheight())
+            if screen_w > 0 and screen_h > 0:
+                return screen_w, screen_h
+        except Exception:
+            pass
+        return 1280, 800
+
+    def _apply_main_window_fallback_geometry(self, screen_w=None, screen_h=None):
+        """Dimensionne la fenêtre sans recouvrir les barres système usuelles."""
+        if screen_w is None or screen_h is None:
+            screen_w, screen_h = self._get_main_screen_size()
+
+        width = max(480, int(screen_w * 0.96))
+        height = max(360, int(screen_h * 0.90))
+        width = min(width, screen_w)
+        height = min(height, screen_h)
+        x = max(0, (screen_w - width) // 2)
+        y = max(0, min(24, (screen_h - height) // 3))
+
+        try:
+            self.root.geometry(f"{width}x{height}+{x}+{y}")
+        except Exception:
+            pass
+
+    def _maximize_main_window(self):
+        """Demande la maximisation avec la commande Tk propre à la plateforme."""
+        try:
+            self.root.update_idletasks()
+        except Exception:
+            pass
+
+        if sys.platform.startswith("win"):
+            attempts = (
+                lambda: self.root.state("zoomed"),
+                lambda: self.root.attributes("-zoomed", True),
+            )
+        elif sys.platform.startswith("linux"):
+            attempts = (
+                lambda: self.root.attributes("-zoomed", True),
+                lambda: self.root.state("zoomed"),
+            )
+        else:
+            # macOS et autres implémentations Tk : essayer les deux variantes,
+            # puis conserver simplement la géométrie de secours si aucune
+            # n'est prise en charge.
+            attempts = (
+                lambda: self.root.state("zoomed"),
+                lambda: self.root.attributes("-zoomed", True),
+            )
+
+        for maximize in attempts:
+            try:
+                maximize()
+                return
+            except Exception:
+                continue
+
+        self._apply_main_window_fallback_geometry()
 
     # ============================================================
     # OUTILS GÉNÉRAUX
@@ -8028,7 +8131,7 @@ namespace GestionBissesFolderPicker
         return ordered
 
     # ============================================================
-    # V52E — TRI GPS GUIDÉ PAR LA TOPOLOGIE DU GPX SOURCE
+    # V53 — TRI GPS GUIDÉ PAR UN RÉSEAU DE PLUSIEURS GPX TOPO/LIVE
     # ============================================================
 
     def normalize_rename_gpx_source_name(self, value):
@@ -8123,7 +8226,7 @@ namespace GestionBissesFolderPicker
         return unique
 
     def collect_rename_gpx_source_candidates(self, items):
-        """Recense les GPX utilisables, en privilégiant la source des photos."""
+        """Recense les GPX utilisables et leur provenance connue."""
         declared_counts = {}
         for item in items:
             entry = item.get("entry", {}) or {}
@@ -8131,6 +8234,13 @@ namespace GestionBissesFolderPicker
             normalized = self.normalize_rename_gpx_source_name(source_name)
             if normalized:
                 declared_counts[normalized] = declared_counts.get(normalized, 0) + 1
+
+        last_sync = (self.catalog_container or {}).get("last_photo_gpx_sync", {}) or {}
+        last_sync_names = {
+            self.normalize_rename_gpx_source_name(source_name)
+            for source_name in last_sync.get("gpx_files", []) or []
+            if self.normalize_rename_gpx_source_name(source_name)
+        }
 
         candidates = []
         workshop = (self.catalog_container or {}).get("gpx_workshop", {}) or {}
@@ -8158,6 +8268,8 @@ namespace GestionBissesFolderPicker
                     "normalized_name": normalized,
                     "parts": parts,
                     "declared_count": declared_counts.get(normalized, 0),
+                    "last_sync_source": normalized in last_sync_names,
+                    "live_topo": False,
                     "point_count": sum(len(part) for part in parts)
                 })
 
@@ -8176,25 +8288,43 @@ namespace GestionBissesFolderPicker
                     "normalized_name": normalized,
                     "parts": parts,
                     "declared_count": declared_counts.get(normalized, 0),
+                    "last_sync_source": normalized in last_sync_names,
+                    "live_topo": True,
                     "point_count": sum(len(part) for part in parts)
                 })
 
         # Un ancien catalogue peut déclarer la provenance sans encore avoir
         # importé la source dans l'atelier. Le fichier local reste exploitable.
         existing_names = {candidate["normalized_name"] for candidate in candidates}
-        for normalized, count in declared_counts.items():
+        source_names_to_load = {
+            normalized: {
+                "count": count,
+                "original_name": next(
+                    (
+                        (item.get("entry", {}) or {}).get("gps_source_file")
+                        for item in items
+                        if self.normalize_rename_gpx_source_name(
+                            (item.get("entry", {}) or {}).get("gps_source_file")
+                        ) == normalized
+                    ),
+                    normalized
+                )
+            }
+            for normalized, count in declared_counts.items()
+        }
+        for source_name in last_sync.get("gpx_files", []) or []:
+            normalized = self.normalize_rename_gpx_source_name(source_name)
+            if normalized:
+                source_names_to_load.setdefault(normalized, {
+                    "count": 0,
+                    "original_name": os.path.basename(str(source_name))
+                })
+
+        for normalized, source_info in source_names_to_load.items():
             if normalized in existing_names:
                 continue
-            original_name = next(
-                (
-                    (item.get("entry", {}) or {}).get("gps_source_file")
-                    for item in items
-                    if self.normalize_rename_gpx_source_name(
-                        (item.get("entry", {}) or {}).get("gps_source_file")
-                    ) == normalized
-                ),
-                normalized
-            )
+            count = source_info.get("count", 0)
+            original_name = source_info.get("original_name") or normalized
             for path in self.rename_gpx_source_file_candidates(original_name):
                 if not os.path.exists(path):
                     continue
@@ -8207,6 +8337,8 @@ namespace GestionBissesFolderPicker
                         "normalized_name": normalized,
                         "parts": parts,
                         "declared_count": count,
+                        "last_sync_source": normalized in last_sync_names,
+                        "live_topo": False,
                         "point_count": sum(len(part) for part in parts)
                     })
                     break
@@ -8217,72 +8349,159 @@ namespace GestionBissesFolderPicker
         for candidate in candidates:
             name = candidate["normalized_name"] or candidate["key"]
             previous = deduplicated.get(name)
-            if previous is None or candidate["point_count"] > previous["point_count"]:
+            if previous is None:
                 deduplicated[name] = candidate
+                continue
+
+            # La géométrie la plus détaillée est conservée, mais les indices de
+            # provenance issus des autres sections du catalogue ne sont pas
+            # perdus pendant la déduplication.
+            if candidate["point_count"] > previous["point_count"]:
+                candidate["declared_count"] = max(
+                    candidate.get("declared_count", 0),
+                    previous.get("declared_count", 0)
+                )
+                candidate["last_sync_source"] = bool(
+                    candidate.get("last_sync_source")
+                    or previous.get("last_sync_source")
+                )
+                candidate["live_topo"] = bool(
+                    candidate.get("live_topo") or previous.get("live_topo")
+                )
+                deduplicated[name] = candidate
+            else:
+                previous["declared_count"] = max(
+                    previous.get("declared_count", 0),
+                    candidate.get("declared_count", 0)
+                )
+                previous["last_sync_source"] = bool(
+                    previous.get("last_sync_source")
+                    or candidate.get("last_sync_source")
+                )
+                previous["live_topo"] = bool(
+                    previous.get("live_topo") or candidate.get("live_topo")
+                )
 
         return sorted(
             deduplicated.values(),
             key=lambda candidate: (
                 -candidate.get("declared_count", 0),
+                -int(bool(candidate.get("last_sync_source"))),
+                -int(bool(candidate.get("live_topo"))),
                 -candidate.get("point_count", 0),
                 candidate.get("label", "").casefold()
             )
         )
 
-    def choose_rename_gpx_source(self, items):
-        """Choisit silencieusement la source déclarée, ou demande si nécessaire."""
+    def choose_rename_gpx_sources(self, items):
+        """
+        Réunit les GPX topo/live pertinents pour le tri spatial.
+
+        La provenance par photo est prioritaire. À défaut, la dernière
+        synchronisation puis les traces explicitement rangées comme live/topo
+        sont utilisées. Aucun horodatage n'est chargé ici.
+        """
         candidates = self.collect_rename_gpx_source_candidates(items)
         if not candidates:
-            return None
+            candidates = list(getattr(self, "rename_manual_gpx_sources", []) or [])
+        if not candidates:
+            initialdir = (
+                self.gpx_folder
+                if self.gpx_folder and os.path.isdir(self.gpx_folder)
+                else self.base_folder
+            )
+            selected_paths = filedialog.askopenfilenames(
+                title="Choisir un ou plusieurs GPX topo pour le tri des photos",
+                filetypes=[("Fichiers GPX", "*.gpx"), ("Tous les fichiers", "*.*")],
+                initialdir=initialdir if initialdir and os.path.isdir(initialdir) else None
+            )
+            for path in selected_paths:
+                parts = self.load_rename_gpx_parts_from_file(path)
+                if not parts:
+                    continue
+                source_name = os.path.basename(path)
+                candidates.append({
+                    "key": f"manual:{os.path.abspath(path)}",
+                    "label": os.path.splitext(source_name)[0],
+                    "source_filename": source_name,
+                    "normalized_name": self.normalize_rename_gpx_source_name(source_name),
+                    "parts": parts,
+                    "declared_count": 0,
+                    "last_sync_source": False,
+                    "live_topo": True,
+                    "point_count": sum(len(part) for part in parts)
+                })
+            self.rename_manual_gpx_sources = list(candidates)
+
+        if not candidates:
+            self.rename_gpx_source_choice = "__gps_autonomous__"
+            return []
 
         declared = [candidate for candidate in candidates if candidate.get("declared_count", 0) > 0]
-        if len(declared) == 1:
-            self.rename_gpx_source_choice = declared[0]["key"]
-            return declared[0]
-
-        pool = declared or candidates
-        if len(pool) == 1:
-            self.rename_gpx_source_choice = pool[0]["key"]
-            return pool[0]
-
-        for candidate in pool:
-            if candidate["key"] == self.rename_gpx_source_choice:
-                return candidate
-
-        if self.rename_gpx_source_choice == "__gps_autonomous__":
-            return None
-
-        lines = [
-            "Plusieurs GPX peuvent guider l'ordre des photos.",
-            "Choisissez le dessin topographique à utiliser :",
-            ""
-        ]
-        for index, candidate in enumerate(pool, start=1):
-            suffix = " · source des photos" if candidate.get("declared_count", 0) else ""
-            lines.append(f"{index}. {candidate['label']}{suffix}")
-
-        choice = simpledialog.askinteger(
-            "GPX topo pour le tri GPS",
-            "\n".join(lines),
-            parent=self.root,
-            minvalue=1,
-            maxvalue=len(pool)
+        recent = [candidate for candidate in candidates if candidate.get("last_sync_source")]
+        live_topo = [candidate for candidate in candidates if candidate.get("live_topo")]
+        preferred_keys = {
+            candidate["key"]
+            for candidate in declared + recent + live_topo
+        }
+        pool = (
+            [candidate for candidate in candidates if candidate["key"] in preferred_keys]
+            if preferred_keys
+            else candidates
         )
-        if choice is None:
-            self.rename_gpx_source_choice = "__gps_autonomous__"
+
+        # La sélection est mémorisée comme un ensemble stable. Tous les GPX du
+        # groupe pertinent participent au réseau au lieu de forcer un choix
+        # unique qui perdrait une portion du bisse.
+        pool = sorted(pool, key=lambda candidate: candidate.get("source_filename", "").casefold())
+        self.rename_gpx_source_choice = "|".join(candidate["key"] for candidate in pool)
+        return pool
+
+    def combine_rename_gpx_sources(self, sources):
+        """Assemble plusieurs sources sans perdre leur identité individuelle."""
+        if not sources:
             return None
 
-        selected = pool[choice - 1]
-        self.rename_gpx_source_choice = selected["key"]
-        return selected
+        parts = []
+        source_filenames = []
+        labels = []
+        for source in sources:
+            parts.extend(source.get("parts", []) or [])
+            filename = source.get("source_filename") or source.get("label") or "GPX topo"
+            if filename not in source_filenames:
+                source_filenames.append(filename)
+            label = source.get("label") or os.path.splitext(filename)[0]
+            if label not in labels:
+                labels.append(label)
 
-    def build_rename_topology_graph(self, parts, snap_m=1.5):
+        if len(source_filenames) == 1:
+            display_name = source_filenames[0]
+            display_label = labels[0] if labels else display_name
+        else:
+            display_name = f"{len(source_filenames)} GPX topo"
+            display_label = " + ".join(labels[:3])
+            if len(labels) > 3:
+                display_label += f" + {len(labels) - 3} autre(s)"
+
+        return {
+            "key": "|".join(source.get("key", "") for source in sources),
+            "label": display_label,
+            "source_filename": display_name,
+            "source_filenames": source_filenames,
+            "parts": parts,
+            "point_count": sum(len(part) for part in parts)
+        }
+
+    def build_rename_topology_graph(self, parts, snap_m=1.5, bridge_endpoints_m=18.0):
         """
-        Construit un graphe non orienté à partir de la géométrie du GPX.
+        Construit un graphe non orienté à partir d'une ou plusieurs géométries.
 
         Les heures, le sens d'enregistrement et la vitesse sont absents de ce
         modèle. Le léger raccord des points presque identiques permet de
         reconnaître un passage répété sans fusionner les branches d'un lacet.
+        Les extrémités de parties distinctes peuvent rejoindre un point d'une
+        autre partie seulement à très courte distance. Aucun pont n'est créé
+        entre deux portions éloignées du bisse.
         """
         valid_parts = [part for part in parts or [] if len(part) >= 2]
         if not valid_parts:
@@ -8297,6 +8516,7 @@ namespace GestionBissesFolderPicker
         nodes = []
         adjacency = []
         buckets = {}
+        part_endpoints = []
 
         def local_xy(lat, lon):
             return lon * meters_per_lon, lat * meters_per_lat
@@ -8327,8 +8547,11 @@ namespace GestionBissesFolderPicker
 
         for part in valid_parts:
             previous = None
+            first = None
             for lat, lon in part:
                 current = get_node(float(lat), float(lon))
+                if first is None:
+                    first = current
                 if previous is not None and previous != current:
                     a = nodes[previous]
                     b = nodes[current]
@@ -8340,6 +8563,80 @@ namespace GestionBissesFolderPicker
                             adjacency[current][previous] = length
                 previous = current
 
+            if first is not None and previous is not None:
+                part_endpoints.extend((first, previous))
+
+        def connected_components():
+            component_by_node = [-1] * len(nodes)
+            component_count = 0
+            for start in range(len(nodes)):
+                if component_by_node[start] >= 0:
+                    continue
+                component_by_node[start] = component_count
+                stack = [start]
+                while stack:
+                    node_index = stack.pop()
+                    for neighbour in adjacency[node_index]:
+                        if component_by_node[neighbour] < 0:
+                            component_by_node[neighbour] = component_count
+                            stack.append(neighbour)
+                component_count += 1
+            return component_by_node, component_count
+
+        # Les enregistrements live successifs se recouvrent souvent de quelques
+        # mètres sans partager exactement le même point. On ne raccorde que les
+        # extrémités de partie, et seulement vers une géométrie située dans la
+        # tolérance courte ci-dessous. Cela réunit les prises successives sans
+        # transformer un passage voisin ou un lacet en raccourci artificiel.
+        bridge_limit = max(snap_m, float(bridge_endpoints_m))
+        bridge_count = 0
+        unique_endpoints = sorted(set(part_endpoints))
+
+        while unique_endpoints:
+            components, component_count = connected_components()
+            if component_count <= 1:
+                break
+
+            cell_size = bridge_limit
+            node_buckets = {}
+            for node_index, node in enumerate(nodes):
+                cell = (
+                    math.floor(node["x"] / cell_size),
+                    math.floor(node["y"] / cell_size)
+                )
+                node_buckets.setdefault(cell, []).append(node_index)
+
+            best_bridge = None
+            for endpoint_index in unique_endpoints:
+                endpoint = nodes[endpoint_index]
+                cell = (
+                    math.floor(endpoint["x"] / cell_size),
+                    math.floor(endpoint["y"] / cell_size)
+                )
+                for dx in (-1, 0, 1):
+                    for dy in (-1, 0, 1):
+                        for node_index in node_buckets.get((cell[0] + dx, cell[1] + dy), []):
+                            if components[node_index] == components[endpoint_index]:
+                                continue
+                            node = nodes[node_index]
+                            distance = math.hypot(
+                                endpoint["x"] - node["x"],
+                                endpoint["y"] - node["y"]
+                            )
+                            if distance > bridge_limit:
+                                continue
+                            candidate = (distance, endpoint_index, node_index)
+                            if best_bridge is None or candidate < best_bridge:
+                                best_bridge = candidate
+
+            if best_bridge is None:
+                break
+
+            distance, endpoint_index, node_index = best_bridge
+            adjacency[endpoint_index][node_index] = distance
+            adjacency[node_index][endpoint_index] = distance
+            bridge_count += 1
+
         edges = []
         for node_index, neighbours in enumerate(adjacency):
             for other_index, length in neighbours.items():
@@ -8349,10 +8646,13 @@ namespace GestionBissesFolderPicker
         if len(nodes) < 2 or not edges:
             return None
 
+        _components, component_count = connected_components()
         return {
             "nodes": nodes,
             "adjacency": adjacency,
-            "edges": edges
+            "edges": edges,
+            "component_count": component_count,
+            "bridge_count": bridge_count
         }
 
     def project_rename_point_on_topology(self, lat, lon, graph):
@@ -8498,11 +8798,11 @@ namespace GestionBissesFolderPicker
 
     def sort_by_gps_guided_by_topo(self, items):
         """
-        Trie les photos le long du dessin du GPX source.
+        Trie les photos le long du réseau formé par les GPX topo/live sources.
 
-        Le GPX est un réseau géométrique non orienté. Aucun horodatage du GPX
-        ou des photos n'est utilisé pour choisir la progression globale. La
-        date ne reste qu'un départage stable à l'intérieur d'un agrégat.
+        Le réseau est géométrique et non orienté. Aucun horodatage des GPX ou
+        des photos n'est utilisé pour choisir la progression globale. La date
+        ne reste qu'un départage stable à l'intérieur d'un agrégat.
         """
         self.rename_gpx_guidance_info = None
         gps_items = [item for item in items if item.get("gps")]
@@ -8511,7 +8811,8 @@ namespace GestionBissesFolderPicker
         if len(gps_items) <= 1:
             return self.sort_by_gps_autonomous(items)
 
-        source = self.choose_rename_gpx_source(gps_items)
+        sources = self.choose_rename_gpx_sources(gps_items)
+        source = self.combine_rename_gpx_sources(sources)
         if not source:
             return self.sort_by_gps_autonomous(items)
 
@@ -8639,6 +8940,7 @@ namespace GestionBissesFolderPicker
             for item in cluster["items"]:
                 item["gps_guided_by_topo"] = True
                 item["gps_topo_source"] = source["source_filename"]
+                item["gps_topo_sources"] = list(source.get("source_filenames", []))
                 ordered.append(item)
 
         ordered.extend(sorted(
@@ -8653,16 +8955,20 @@ namespace GestionBissesFolderPicker
             "used": True,
             "source_label": source["label"],
             "source_filename": source["source_filename"],
+            "source_filenames": list(source.get("source_filenames", [])),
             "display_path": display_path,
             "clusters_count": len(clusters),
             "p90_offset_m": p90,
             "max_offset_m": max(offsets),
-            "network_span_m": endpoint_distance
+            "network_span_m": endpoint_distance,
+            "network_components": graph.get("component_count", 1),
+            "network_bridges": graph.get("bridge_count", 0)
         }
         self.log(
-            f"🧭 Ordre GPS guidé par le GPX topo : {source['source_filename']} · "
+            f"🧭 Ordre GPS guidé par {source['source_filename']} · "
             f"{len(clusters)} groupe(s) · écart médian "
-            f"{offsets[len(offsets) // 2]:.1f} m."
+            f"{offsets[len(offsets) // 2]:.1f} m · "
+            f"{graph.get('bridge_count', 0)} raccord(s) géométrique(s) court(s)."
         )
         return ordered
 
@@ -11552,6 +11858,7 @@ namespace GestionBissesFolderPicker
         self.rename_map_selected_plan_index = None
         self.rename_gpx_source_choice = None
         self.rename_gpx_guidance_info = None
+        self.rename_manual_gpx_sources = []
 
         controls = tk.LabelFrame(
             self.main_frame,
@@ -11814,6 +12121,11 @@ namespace GestionBissesFolderPicker
                 if p["gps_guided_by_topo"]
                 else ""
             )
+            p["gps_topo_sources"] = (
+                list(guidance.get("source_filenames", []))
+                if p["gps_guided_by_topo"]
+                else []
+            )
 
             plan.append(p)
             number += 1
@@ -11909,11 +12221,17 @@ namespace GestionBissesFolderPicker
             if p.get("order_mode") != "gps":
                 expected_guidance = ""
             expected_source = p.get("gps_topo_source", "") if p.get("gps_guided_by_topo") else ""
+            expected_sources = (
+                list(p.get("gps_topo_sources", []))
+                if p.get("gps_guided_by_topo")
+                else []
+            )
             if (
                 int(entry.get("platform_order") or 0) != int(p["order_number"])
                 or entry.get("photo_order_mode") != p.get("order_mode")
                 or str(entry.get("photo_order_guidance") or "") != expected_guidance
                 or str(entry.get("photo_order_gpx_source") or "") != expected_source
+                or list(entry.get("photo_order_gpx_sources") or []) != expected_sources
             ):
                 metadata_changes.append(p)
 
@@ -12004,8 +12322,10 @@ namespace GestionBissesFolderPicker
 
                 if p.get("gps_guided_by_topo") and p.get("gps_topo_source"):
                     entry["photo_order_gpx_source"] = p["gps_topo_source"]
+                    entry["photo_order_gpx_sources"] = list(p.get("gps_topo_sources", []))
                 else:
                     entry.pop("photo_order_gpx_source", None)
+                    entry.pop("photo_order_gpx_sources", None)
 
             self.save_catalog()
 
@@ -18782,7 +19102,12 @@ namespace GestionBissesFolderPicker
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
-    def write_catalog_gps_to_jpg_metadata(self, ask_confirmation=True, only_ok=True):
+    def write_catalog_gps_to_jpg_metadata(
+        self,
+        ask_confirmation=True,
+        only_ok=True,
+        sync_run_id=None
+    ):
         """
         Écrit les coordonnées GPS du catalogue dans les JPG utilisés par le logiciel.
         """
@@ -18810,6 +19135,13 @@ namespace GestionBissesFolderPicker
                 continue
 
             if only_ok and not str(entry.get("gps_sync", "")).startswith("OK"):
+                continue
+
+            # Lors de l'écriture automatique qui suit une synchronisation, on
+            # ne touche qu'aux photos effectivement mises à jour pendant cette
+            # exécution. Une photo hors plage dont les coordonnées préexistaient
+            # reste donc totalement intacte dans le JPG.
+            if sync_run_id and entry.get("gps_sync_run_id") != sync_run_id:
                 continue
 
             image_path = self.get_entry_image_path(entry)
@@ -18900,7 +19232,7 @@ namespace GestionBissesFolderPicker
             )
         )
 
-    def offer_write_gps_to_jpg_after_sync(self, synced_count):
+    def offer_write_gps_to_jpg_after_sync(self, synced_count, sync_run_id=None):
         """
         Après synchronisation GPX, écrit automatiquement dans les JPG si cela
         a été approuvé dans la fenêtre de synchronisation.
@@ -18910,7 +19242,10 @@ namespace GestionBissesFolderPicker
 
         if getattr(self, "write_exif_after_gpx_sync", False):
             self.log("✍️ Écriture EXIF JPG automatique après synchronisation GPX...")
-            self.write_catalog_gps_to_jpg_metadata(ask_confirmation=False)
+            self.write_catalog_gps_to_jpg_metadata(
+                ask_confirmation=False,
+                sync_run_id=sync_run_id
+            )
         else:
             self.log("📝 Coordonnées GPS gardées dans le catalogue uniquement. Écriture EXIF JPG non exécutée.")
 
@@ -19572,6 +19907,8 @@ namespace GestionBissesFolderPicker
                 return
 
             max_gap_seconds = getattr(self, "gpx_sync_max_gap_minutes", 30) * 60
+            sync_run_id = uuid.uuid4().hex
+            sync_attempt_at = datetime.now().isoformat(timespec="seconds")
 
             self.log("-" * 40)
             self.log("🛰️ Segments GPX horodatés chargés :")
@@ -19585,6 +19922,7 @@ namespace GestionBissesFolderPicker
             nearest_count = 0
             ambiguous_count = 0
             out_of_range_count = 0
+            preserved_existing_count = 0
             error_time_count = 0
             missing_file_count = 0
             per_source_count = {}
@@ -19610,6 +19948,7 @@ namespace GestionBissesFolderPicker
                     continue
 
                 result = self.get_gps_from_time_segments(segments, photo_time, max_gap_seconds)
+                existing_gps = self.get_entry_gps_latlon(entry)
 
                 if result.get("ok"):
                     lat = result["lat"]
@@ -19618,6 +19957,27 @@ namespace GestionBissesFolderPicker
                     segment = result["segment"]
                     match_type = result["match_type"]
                     gap_seconds = result.get("gap_seconds", 0)
+
+                    # Un point terminal est nécessairement hors de l'intervalle
+                    # horodaté. S'il existe déjà une position valable (catalogue
+                    # ou métadonnées lues auparavant), elle est plus informative
+                    # et ne doit jamais être remplacée par cette approximation.
+                    if match_type == "NEAREST_ENDPOINT" and existing_gps:
+                        entry["last_gpx_sync_status"] = "HORS_PLAGE_COORDONNEES_CONSERVEES"
+                        entry["last_gpx_sync_detail"] = "NEAREST_ENDPOINT_SKIPPED_EXISTING"
+                        entry["last_gpx_sync_gap_seconds"] = round(gap_seconds, 1)
+                        entry["last_gpx_sync_source_file"] = segment["source_name"]
+                        entry["last_gpx_sync_at"] = sync_attempt_at
+                        entry["last_gpx_sync_run_id"] = sync_run_id
+                        preserved_existing_count += 1
+                        out_of_range_count += 1
+                        self.log(
+                            f"🛡️ Hors plage GPX : {filename} · coordonnées existantes conservées "
+                            f"(point terminal ignoré à {gap_seconds/60:.1f} min)."
+                        )
+                        self.progress["value"] = ((i + 1) / total) * 100
+                        self.root.update_idletasks()
+                        continue
 
                     entry["gps_coordinates"] = {
                         "lat": lat,
@@ -19631,6 +19991,13 @@ namespace GestionBissesFolderPicker
                     entry["gps_source_segment"] = segment["segment_label"]
                     entry["gps_sync_detail"] = match_type
                     entry["gps_match_seconds"] = round(gap_seconds, 1)
+                    entry["gps_sync_run_id"] = sync_run_id
+                    entry["last_gpx_sync_status"] = "OK_GPX_MULTI"
+                    entry["last_gpx_sync_detail"] = match_type
+                    entry["last_gpx_sync_gap_seconds"] = round(gap_seconds, 1)
+                    entry["last_gpx_sync_source_file"] = segment["source_name"]
+                    entry["last_gpx_sync_at"] = sync_attempt_at
+                    entry["last_gpx_sync_run_id"] = sync_run_id
 
                     synced_count += 1
                     per_source_count[segment["source_name"]] = per_source_count.get(segment["source_name"], 0) + 1
@@ -19664,16 +20031,47 @@ namespace GestionBissesFolderPicker
 
                 else:
                     nearest_gap = result.get("nearest_gap_seconds")
-                    entry["gps_sync"] = "HORS_PLAGE_GPX_MULTI"
-                    entry["gps_source"] = "GPX_MULTI"
-                    entry["gps_sync_detail"] = "OUT_OF_RANGE"
-                    entry["gps_match_seconds"] = round(nearest_gap, 1) if nearest_gap is not None else None
+                    nearest_segment = result.get("nearest_segment") or {}
+                    entry["last_gpx_sync_status"] = (
+                        "HORS_PLAGE_COORDONNEES_CONSERVEES"
+                        if existing_gps
+                        else "HORS_PLAGE_GPX_MULTI"
+                    )
+                    entry["last_gpx_sync_detail"] = "OUT_OF_RANGE"
+                    entry["last_gpx_sync_gap_seconds"] = (
+                        round(nearest_gap, 1) if nearest_gap is not None else None
+                    )
+                    entry["last_gpx_sync_source_file"] = nearest_segment.get("source_name", "")
+                    entry["last_gpx_sync_at"] = sync_attempt_at
+                    entry["last_gpx_sync_run_id"] = sync_run_id
+
+                    if existing_gps:
+                        # gps_coordinates, gps_source, gps_source_file et
+                        # gps_sync restent volontairement inchangés : ils
+                        # décrivent la position conservée, pas l'essai échoué.
+                        preserved_existing_count += 1
+                    else:
+                        entry["gps_sync"] = "HORS_PLAGE_GPX_MULTI"
+                        entry["gps_sync_detail"] = "OUT_OF_RANGE"
+                        entry["gps_match_seconds"] = (
+                            round(nearest_gap, 1) if nearest_gap is not None else None
+                        )
+                        entry.pop("gps_sync_run_id", None)
                     out_of_range_count += 1
 
                     if nearest_gap is not None:
-                        self.log(f"⚠️ Hors plage GPX : {filename} · plus proche à {nearest_gap/60:.1f} min")
+                        if existing_gps:
+                            self.log(
+                                f"🛡️ Hors plage GPX : {filename} · coordonnées existantes conservées "
+                                f"(trace la plus proche à {nearest_gap/60:.1f} min)."
+                            )
+                        else:
+                            self.log(f"⚠️ Hors plage GPX : {filename} · plus proche à {nearest_gap/60:.1f} min")
                     else:
-                        self.log(f"⚠️ Hors plage GPX : {filename}")
+                        if existing_gps:
+                            self.log(f"🛡️ Hors plage GPX : {filename} · coordonnées existantes conservées.")
+                        else:
+                            self.log(f"⚠️ Hors plage GPX : {filename}")
 
                 self.progress["value"] = ((i + 1) / total) * 100
                 self.root.update_idletasks()
@@ -19683,6 +20081,7 @@ namespace GestionBissesFolderPicker
 
             self.catalog_container["last_photo_gpx_sync"] = {
                 "synced_at": datetime.now().isoformat(timespec="seconds"),
+                "sync_run_id": sync_run_id,
                 "mode": "multi_gpx",
                 "photo_timezone": self.photo_timezone_name,
                 "max_gap_minutes": getattr(self, "gpx_sync_max_gap_minutes", 30),
@@ -19694,6 +20093,7 @@ namespace GestionBissesFolderPicker
                 "nearest_count": nearest_count,
                 "ambiguous_count": ambiguous_count,
                 "out_of_range_count": out_of_range_count,
+                "preserved_existing_count": preserved_existing_count,
                 "error_time_count": error_time_count,
                 "missing_file_count": missing_file_count,
                 "per_source_count": per_source_count
@@ -19708,6 +20108,7 @@ namespace GestionBissesFolderPicker
             self.log(f"   • Point le plus proche hors plage : {nearest_count}")
             self.log(f"   • Ambiguës / chevauchement : {ambiguous_count}")
             self.log(f"⚪ Hors plage : {out_of_range_count}")
+            self.log(f"🛡️ Coordonnées préexistantes conservées : {preserved_existing_count}")
             self.log(f"⚠️ Erreurs d'heure : {error_time_count}")
             self.log(f"⚠️ Fichiers introuvables : {missing_file_count}")
 
@@ -19724,12 +20125,13 @@ namespace GestionBissesFolderPicker
                     f"Interpolées dans une trace : {interpolated_count}\n"
                     f"Point le plus proche hors plage : {nearest_count}\n"
                     f"Hors plage : {out_of_range_count}\n"
+                    f"Coordonnées existantes conservées : {preserved_existing_count}\n"
                     f"Erreurs d'heure : {error_time_count}\n"
                     f"Fichiers introuvables : {missing_file_count}"
                 )
             )
 
-            self.offer_write_gps_to_jpg_after_sync(synced_count)
+            self.offer_write_gps_to_jpg_after_sync(synced_count, sync_run_id=sync_run_id)
 
             self.load_folder(self.base_folder)
 
