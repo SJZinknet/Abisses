@@ -44,6 +44,28 @@ class AbissesPathsTests(unittest.TestCase):
             Path("/tmp/cache/Abisses"),
         )
 
+    def test_explicit_platform_directories_do_not_require_home(self):
+        """Windows CI peut volontairement exécuter sans USERPROFILE/HOME."""
+        with patch.object(
+            abisses_paths.Path,
+            "home",
+            side_effect=RuntimeError("dossier personnel indisponible"),
+        ):
+            windows_path = abisses_paths.get_user_config_dir(
+                "win32",
+                {"LOCALAPPDATA": r"C:\Users\xy\AppData\Local"},
+            )
+            linux_path = abisses_paths.get_user_config_dir(
+                "linux",
+                {"XDG_CONFIG_HOME": "/tmp/config"},
+            )
+
+        self.assertEqual(
+            str(windows_path).replace("\\", "/"),
+            "C:/Users/xy/AppData/Local/Abisses",
+        )
+        self.assertEqual(linux_path, Path("/tmp/config/Abisses"))
+
     def test_foreign_paths_are_detected(self):
         self.assertTrue(abisses_paths.path_looks_foreign(r"C:\Bisses\Data", "linux"))
         self.assertTrue(abisses_paths.path_looks_foreign("/home/xy/Bisses", "win32"))

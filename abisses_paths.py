@@ -63,16 +63,17 @@ def get_user_config_dir(
 ) -> Path:
     platform_value = _platform_name(platform_name)
     env = _environment(environ)
-    home_path = _home_path(home)
 
     if platform_value.startswith("win"):
         base = env.get("LOCALAPPDATA") or env.get("APPDATA")
-        return Path(base) / APP_NAME if base else home_path / "AppData" / "Local" / APP_NAME
+        if base:
+            return Path(base) / APP_NAME
+        return _home_path(home) / "AppData" / "Local" / APP_NAME
     if platform_value == "darwin":
-        return home_path / "Library" / "Application Support" / APP_NAME
+        return _home_path(home) / "Library" / "Application Support" / APP_NAME
 
     base = env.get("XDG_CONFIG_HOME")
-    return (Path(base) if base else home_path / ".config") / APP_NAME
+    return (Path(base) if base else _home_path(home) / ".config") / APP_NAME
 
 
 def get_user_data_dir(
@@ -82,16 +83,17 @@ def get_user_data_dir(
 ) -> Path:
     platform_value = _platform_name(platform_name)
     env = _environment(environ)
-    home_path = _home_path(home)
 
     if platform_value.startswith("win"):
         base = env.get("LOCALAPPDATA") or env.get("APPDATA")
-        return Path(base) / APP_NAME if base else home_path / "AppData" / "Local" / APP_NAME
+        if base:
+            return Path(base) / APP_NAME
+        return _home_path(home) / "AppData" / "Local" / APP_NAME
     if platform_value == "darwin":
-        return home_path / "Library" / "Application Support" / APP_NAME
+        return _home_path(home) / "Library" / "Application Support" / APP_NAME
 
     base = env.get("XDG_DATA_HOME")
-    return (Path(base) if base else home_path / ".local" / "share") / APP_NAME
+    return (Path(base) if base else _home_path(home) / ".local" / "share") / APP_NAME
 
 
 def get_user_log_dir(
@@ -101,15 +103,14 @@ def get_user_log_dir(
 ) -> Path:
     platform_value = _platform_name(platform_name)
     env = _environment(environ)
-    home_path = _home_path(home)
 
     if platform_value.startswith("win"):
-        return get_user_data_dir(platform_value, env, home_path) / "logs"
+        return get_user_data_dir(platform_value, env, home) / "logs"
     if platform_value == "darwin":
-        return home_path / "Library" / "Logs" / APP_NAME
+        return _home_path(home) / "Library" / "Logs" / APP_NAME
 
     base = env.get("XDG_STATE_HOME")
-    return (Path(base) if base else home_path / ".local" / "state") / APP_NAME / "logs"
+    return (Path(base) if base else _home_path(home) / ".local" / "state") / APP_NAME / "logs"
 
 
 def get_user_cache_dir(
@@ -119,15 +120,14 @@ def get_user_cache_dir(
 ) -> Path:
     platform_value = _platform_name(platform_name)
     env = _environment(environ)
-    home_path = _home_path(home)
 
     if platform_value.startswith("win"):
-        return get_user_data_dir(platform_value, env, home_path) / "cache"
+        return get_user_data_dir(platform_value, env, home) / "cache"
     if platform_value == "darwin":
-        return home_path / "Library" / "Caches" / APP_NAME
+        return _home_path(home) / "Library" / "Caches" / APP_NAME
 
     base = env.get("XDG_CACHE_HOME")
-    return (Path(base) if base else home_path / ".cache") / APP_NAME
+    return (Path(base) if base else _home_path(home) / ".cache") / APP_NAME
 
 
 def settings_file_path() -> Path:
