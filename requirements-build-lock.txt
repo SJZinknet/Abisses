@@ -1,4 +1,4 @@
-# Versions validées pour fabriquer les installateurs 0.55.0-beta.1.
+# Versions validées pour fabriquer les installateurs v56.
 # Les dépendances propres à Windows (pefile, pywin32-ctypes) sont résolues
 # automatiquement par PyInstaller sur le runner Windows.
 altgraph==0.17.5

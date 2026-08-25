@@ -135,6 +135,20 @@ class BisseManagerApp:
         self.geolocated_photos = []
         self.current_photo = None
 
+        # Atelier Photos : les trois panneaux restent indépendants et peuvent
+        # être affichés, masqués ou redimensionnés sans recharger les photos.
+        self.photo_workspace_paned = None
+        self.photo_workspace_panels = {}
+        self.photo_workspace_layout_after_id = None
+        self.photo_panel_visibility_vars = {
+            "map": tk.BooleanVar(value=True),
+            "viewer": tk.BooleanVar(value=True),
+            "metadata": tk.BooleanVar(value=True),
+        }
+        self.photo_panels_button = None
+        self.photo_layers_button = None
+        self.photo_map_expand_button = None
+
         # Couche photo commune aux cartes de l'atelier Photos et de l'atelier GPX.
         # Les clusters sont uniquement visuels : les coordonnées réelles ne changent jamais.
         self.photo_cluster_icon_cache = {}
@@ -650,6 +664,13 @@ class BisseManagerApp:
         self.show_text_tooltip(text, event.x_root, event.y_root)
 
     def clear_main_frame(self):
+        if self.photo_workspace_layout_after_id:
+            try:
+                self.root.after_cancel(self.photo_workspace_layout_after_id)
+            except Exception:
+                pass
+        self.photo_workspace_layout_after_id = None
+
         try:
             self.stop_rename_map_watch()
         except Exception:
@@ -691,6 +712,11 @@ class BisseManagerApp:
         self.photo_spider_state = {"photo": None, "gpx": None}
         self.photo_layer_last_signature = {"photo": None, "gpx": None}
         self.current_photo = None
+        self.photo_workspace_paned = None
+        self.photo_workspace_panels = {}
+        self.photo_panels_button = None
+        self.photo_layers_button = None
+        self.photo_map_expand_button = None
         self.gpx_map_viewer_paned = None
         self.gpx_map_holder = None
         self.gpx_photo_integrated_frame = None
@@ -20651,6 +20677,32 @@ namespace GestionBissesFolderPicker
             command=self.show_photo_preparation_dialog
         ).pack(side="left", padx=4)
 
+        self.photo_panels_button = tk.Menubutton(
+            row_a,
+            text="Panneaux (3) ▾",
+            relief="raised",
+            padx=8
+        )
+        panels_menu = tk.Menu(self.photo_panels_button, tearoff=False)
+        for panel_key, label in (
+            ("map", "Carte"),
+            ("viewer", "Photo"),
+            ("metadata", "Métadonnées"),
+        ):
+            panels_menu.add_checkbutton(
+                label=label,
+                variable=self.photo_panel_visibility_vars[panel_key],
+                command=lambda key=panel_key: self.on_photo_panel_visibility_changed(key)
+            )
+        panels_menu.add_separator()
+        panels_menu.add_command(
+            label="Afficher les trois panneaux",
+            command=self.show_all_photo_panels
+        )
+        self.photo_panels_button.config(menu=panels_menu)
+        self.photo_panels_button.pack(side="right", padx=(8, 0))
+        self.update_photo_panels_button_label()
+
         row_b = tk.Frame(toolbar)
         row_b.pack(fill="x")
 
@@ -20735,20 +20787,39 @@ namespace GestionBissesFolderPicker
             command=self.show_current_photo_technical_details
         ).pack(side="left", padx=4)
 
-        paned = tk.PanedWindow(self.main_frame, orient=tk.HORIZONTAL, sashwidth=7)
-        paned.pack(fill="both", expand=True)
+        self.photo_workspace_paned = tk.PanedWindow(
+            self.main_frame,
+            orient=tk.HORIZONTAL,
+            sashwidth=9,
+            sashrelief="raised",
+            showhandle=True,
+            handlesize=9,
+            handlepad=24,
+            bg="#cbd3d8"
+        )
+        self.photo_workspace_paned.pack(fill="both", expand=True)
 
-        map_panel = tk.Frame(paned, bg="#eeeeee")
-        viewer_panel = tk.Frame(paned, bg="#222222")
-        meta_panel = tk.Frame(paned, bg="#f4f4f4", padx=12, pady=10)
+        map_panel = tk.Frame(self.photo_workspace_paned, bg="#eeeeee")
+        viewer_panel = tk.Frame(self.photo_workspace_paned, bg="#222222")
+        meta_panel = tk.Frame(
+            self.photo_workspace_paned,
+            bg="#f4f4f4",
+            padx=12,
+            pady=10
+        )
+        self.photo_workspace_panels = {
+            "map": map_panel,
+            "viewer": viewer_panel,
+            "metadata": meta_panel,
+        }
 
-        paned.add(map_panel, minsize=380, width=470)
-        paned.add(viewer_panel, minsize=620, width=760)
-        paned.add(meta_panel, minsize=310, width=340)
-
-        self.build_map_panel(map_panel)
+        # Les trois modules sont construits une seule fois. Leur visibilité
+        # change ensuite dans le PanedWindow sans perdre la photo courante ni
+        # le contenu saisi dans les métadonnées.
         self.build_viewer_panel(viewer_panel)
         self.build_metadata_panel(meta_panel)
+        self.build_map_panel(map_panel)
+        self.refresh_photo_workspace_panes()
 
         self.set_swisstopo_layer("color")
         self.draw_bisse_traces_on_map()
@@ -20760,13 +20831,16 @@ namespace GestionBissesFolderPicker
         # Le cadrage global juste après suffit.
         self.select_photo_on_map(photos[0], center_map=False)
         self.fit_map_to_content()
+        # Le cadrage est refait une fois les dimensions réelles connues : la
+        # carte reçoit environ 44 % de la largeur au lieu des 470 px fixes.
+        self.schedule_photo_workspace_layout(refit_map=True)
         self.start_photo_layer_watch("photo")
 
         self.log(f"🗺️ Atelier Photos ouvert avec {len(photos)} photo(s).")
 
     def build_map_panel(self, parent):
         header = tk.Frame(parent, bg="#eeeeee")
-        header.pack(fill="x", padx=8, pady=(6, 3))
+        header.pack(fill="x", padx=8, pady=(6, 4))
 
         tk.Label(
             header,
@@ -20775,69 +20849,42 @@ namespace GestionBissesFolderPicker
             bg="#eeeeee"
         ).pack(side="left")
 
-        tk.Label(
-            parent,
-            text=(
-                "Pastilles bleues = photos. Les photos proches sont regroupées ; "
-                "un clic zoome, puis déploie virtuellement les positions encore superposées."
-            ),
-            font=("Arial", 9),
-            fg="#555555",
-            bg="#eeeeee",
-            wraplength=470,
-            justify="left"
-        ).pack(anchor="w", padx=8, pady=(0, 4))
+        self.photo_map_expand_button = tk.Button(
+            header,
+            text="⛶ Carte seule",
+            command=self.toggle_photo_map_expanded,
+            padx=7
+        )
+        self.photo_map_expand_button.pack(side="right", padx=(4, 0))
 
-        trace_controls = tk.LabelFrame(parent, text="Affichage", bg="#eeeeee", padx=6, pady=5)
-        trace_controls.pack(fill="x", padx=8, pady=(0, 6))
-
-        tk.Checkbutton(
-            trace_controls,
-            text="Photos",
-            variable=self.show_photos_on_map_var,
-            command=self.refresh_map_markers,
-            bg="#eeeeee"
-        ).grid(row=0, column=0, sticky="w", padx=(0, 8))
-
-        tk.Checkbutton(
-            trace_controls,
-            text="Ciel ouvert",
-            variable=self.show_trace_ciel_var,
-            command=self.refresh_trace_display,
-            bg="#eeeeee"
-        ).grid(row=0, column=1, sticky="w", padx=(0, 8))
-
-        tk.Checkbutton(
-            trace_controls,
-            text="Canalisé",
-            variable=self.show_trace_canalise_var,
-            command=self.refresh_trace_display,
-            bg="#eeeeee"
-        ).grid(row=0, column=2, sticky="w", padx=(0, 8))
-
-        tk.Checkbutton(
-            trace_controls,
-            text="Abandonné",
-            variable=self.show_trace_abandonne_var,
-            command=self.refresh_trace_display,
-            bg="#eeeeee"
-        ).grid(row=1, column=0, sticky="w", padx=(0, 8))
-
-        tk.Checkbutton(
-            trace_controls,
-            text="Trace topo",
-            variable=self.show_trace_topo_var,
-            command=self.refresh_trace_display,
-            bg="#eeeeee"
-        ).grid(row=1, column=1, sticky="w", padx=(0, 8))
-
-        tk.Checkbutton(
-            trace_controls,
-            text="Inconnus / autres",
-            variable=self.show_trace_inconnu_var,
-            command=self.refresh_trace_display,
-            bg="#eeeeee"
-        ).grid(row=1, column=2, sticky="w", padx=(0, 8))
+        self.photo_layers_button = tk.Menubutton(
+            header,
+            text="Couches 4/6 ▾",
+            relief="raised",
+            padx=7
+        )
+        layers_menu = tk.Menu(self.photo_layers_button, tearoff=False)
+        for layer_key, label, variable in (
+            ("photos", "Photos", self.show_photos_on_map_var),
+            ("ciel", "Tracé · ciel ouvert", self.show_trace_ciel_var),
+            ("canalise", "Tracé · canalisé", self.show_trace_canalise_var),
+            ("abandonne", "Tracé · abandonné", self.show_trace_abandonne_var),
+            ("topo", "Trace topo", self.show_trace_topo_var),
+            ("inconnu", "Tracé · inconnus / autres", self.show_trace_inconnu_var),
+        ):
+            layers_menu.add_checkbutton(
+                label=label,
+                variable=variable,
+                command=lambda key=layer_key: self.on_photo_layer_visibility_changed(key)
+            )
+        layers_menu.add_separator()
+        layers_menu.add_command(
+            label="Affichage par défaut",
+            command=self.reset_photo_map_layers
+        )
+        self.photo_layers_button.config(menu=layers_menu)
+        self.photo_layers_button.pack(side="right", padx=(4, 0))
+        self.update_photo_layers_button_label()
 
         self.map_widget = tkintermapview.TkinterMapView(
             parent,
@@ -20856,6 +20903,180 @@ namespace GestionBissesFolderPicker
             self.map_widget.bind("<Right>", self.handle_photo_navigation_key)
         except Exception:
             pass
+
+    def photo_workspace_visible_keys(self):
+        """Retourne les modules demandés, dans leur ordre d'affichage."""
+        order = ("map", "viewer", "metadata")
+        return [
+            key
+            for key in order
+            if self.photo_panel_visibility_vars[key].get()
+        ]
+
+    def update_photo_panels_button_label(self):
+        if not self.photo_panels_button:
+            return
+        try:
+            count = len(self.photo_workspace_visible_keys())
+            self.photo_panels_button.config(text=f"Panneaux ({count}) ▾")
+        except Exception:
+            pass
+
+    def on_photo_panel_visibility_changed(self, _panel_key=None):
+        self.refresh_photo_workspace_panes()
+
+    def show_all_photo_panels(self):
+        for variable in self.photo_panel_visibility_vars.values():
+            variable.set(True)
+        self.refresh_photo_workspace_panes()
+
+    def toggle_photo_map_expanded(self):
+        map_only = self.photo_workspace_visible_keys() == ["map"]
+        self.photo_panel_visibility_vars["map"].set(True)
+        self.photo_panel_visibility_vars["viewer"].set(map_only)
+        self.photo_panel_visibility_vars["metadata"].set(map_only)
+        self.refresh_photo_workspace_panes()
+
+    def refresh_photo_workspace_panes(self):
+        """
+        Applique la sélection de panneaux sans détruire leurs widgets.
+
+        Si les trois cases sont désactivées, la carte reste visible afin que
+        l'atelier ne puisse jamais se retrouver avec une zone centrale vide.
+        """
+        paned = self.photo_workspace_paned
+        panels = self.photo_workspace_panels
+        if not paned or not panels:
+            return
+
+        visible_keys = self.photo_workspace_visible_keys()
+        if not visible_keys:
+            self.photo_panel_visibility_vars["map"].set(True)
+            visible_keys = ["map"]
+
+        map_was_attached = False
+        viewer_was_attached = False
+        try:
+            attached = {str(pane) for pane in paned.panes()}
+            map_was_attached = str(panels["map"]) in attached
+            viewer_was_attached = str(panels["viewer"]) in attached
+            for panel in panels.values():
+                if str(panel) in attached:
+                    paned.forget(panel)
+
+            pane_options = {
+                "map": {"minsize": 260, "width": 680, "stretch": "always"},
+                "viewer": {"minsize": 320, "width": 570, "stretch": "always"},
+                "metadata": {"minsize": 240, "width": 310, "stretch": "always"},
+            }
+            for key in visible_keys:
+                paned.add(panels[key], **pane_options[key])
+        except Exception:
+            return
+
+        self.update_photo_panels_button_label()
+        if self.photo_map_expand_button:
+            try:
+                self.photo_map_expand_button.config(
+                    text="↩ Vue complète"
+                    if visible_keys == ["map"]
+                    else "⛶ Carte seule"
+                )
+            except Exception:
+                pass
+        self.schedule_photo_workspace_layout(
+            refit_map="map" in visible_keys and not map_was_attached
+        )
+        if "viewer" in visible_keys and not viewer_was_attached:
+            try:
+                self.root.after(160, self.viewer_fit_to_panel)
+            except Exception:
+                pass
+
+    def schedule_photo_workspace_layout(self, refit_map=False):
+        """Attend la géométrie réelle avant de placer les séparateurs."""
+        if self.photo_workspace_layout_after_id:
+            try:
+                self.root.after_cancel(self.photo_workspace_layout_after_id)
+            except Exception:
+                pass
+
+        def apply_layout():
+            self.photo_workspace_layout_after_id = None
+            self.apply_photo_workspace_layout()
+            if (
+                refit_map
+                and self.map_widget
+                and self.photo_panel_visibility_vars["map"].get()
+            ):
+                try:
+                    self.fit_map_to_content()
+                except Exception:
+                    pass
+
+        try:
+            self.photo_workspace_layout_after_id = self.root.after(120, apply_layout)
+        except Exception:
+            self.photo_workspace_layout_after_id = None
+
+    def apply_photo_workspace_layout(self):
+        """Donne la priorité à la carte tout en respectant les petits écrans."""
+        paned = self.photo_workspace_paned
+        if not paned:
+            return
+
+        try:
+            paned.update_idletasks()
+            width = max(1, int(paned.winfo_width()))
+            visible_keys = self.photo_workspace_visible_keys()
+
+            if len(visible_keys) == 3:
+                # Carte 44 %, photo 36 %, métadonnées 20 %.
+                paned.sash_place(0, int(width * 0.44), 0)
+                paned.sash_place(1, int(width * 0.80), 0)
+            elif visible_keys == ["map", "viewer"]:
+                paned.sash_place(0, int(width * 0.58), 0)
+            elif visible_keys == ["map", "metadata"]:
+                paned.sash_place(0, int(width * 0.70), 0)
+            elif visible_keys == ["viewer", "metadata"]:
+                paned.sash_place(0, int(width * 0.70), 0)
+        except Exception:
+            pass
+
+    def on_photo_layer_visibility_changed(self, layer_key):
+        self.update_photo_layers_button_label()
+        if layer_key == "photos":
+            self.refresh_map_markers()
+        else:
+            self.refresh_trace_display()
+
+    def update_photo_layers_button_label(self):
+        if not self.photo_layers_button:
+            return
+        variables = (
+            self.show_photos_on_map_var,
+            self.show_trace_ciel_var,
+            self.show_trace_canalise_var,
+            self.show_trace_abandonne_var,
+            self.show_trace_topo_var,
+            self.show_trace_inconnu_var,
+        )
+        try:
+            count = sum(bool(variable.get()) for variable in variables)
+            self.photo_layers_button.config(text=f"Couches {count}/6 ▾")
+        except Exception:
+            pass
+
+    def reset_photo_map_layers(self):
+        self.show_photos_on_map_var.set(True)
+        self.show_trace_ciel_var.set(True)
+        self.show_trace_canalise_var.set(True)
+        self.show_trace_abandonne_var.set(True)
+        self.show_trace_topo_var.set(False)
+        self.show_trace_inconnu_var.set(False)
+        self.update_photo_layers_button_label()
+        self.refresh_trace_display()
+        self.refresh_map_markers()
 
     def build_viewer_panel(self, parent):
         top = tk.Frame(parent, bg="#222222")

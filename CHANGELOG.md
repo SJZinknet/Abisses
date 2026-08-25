@@ -1,5 +1,16 @@
 # Journal des versions
 
+## v56
+
+- Atelier Photos organisé en trois panneaux indépendants : carte, photo et
+  métadonnées ;
+- séparateurs visibles et déplaçables, avec des tailles minimales réduites ;
+- carte agrandie à l'ouverture et mode « Carte seule » en un clic ;
+- menu « Panneaux » pour afficher ou masquer chaque module sans perdre le
+  travail en cours ;
+- commandes des couches cartographiques regroupées dans un menu compact ;
+- version stable courte `v56`, sans suffixe bêta.
+
 ## 0.55.0-beta.1
 
 - nom Abisses dans l'application et les nouveaux paquets;

@@ -28,7 +28,7 @@ except Exception:  # pragma: no cover - repli pour une exécution source minimal
 GITHUB_REPOSITORY = "SJZinknet/Abisses"
 GITHUB_API_ROOT = f"https://api.github.com/repos/{GITHUB_REPOSITORY}"
 GITHUB_RELEASES_URL = f"https://github.com/{GITHUB_REPOSITORY}/releases"
-DEFAULT_VERSION = "0.55.0-beta.1"
+DEFAULT_VERSION = "56"
 DOWNLOAD_BLOCK_SIZE = 1024 * 1024
 
 

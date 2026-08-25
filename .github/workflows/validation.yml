@@ -39,6 +39,9 @@ jobs:
       - name: Tester les mises à jour
         run: python -m unittest discover -s tests -p "test_abisses_update.py" -v
 
+      - name: Tester la disposition de l'Atelier Photos
+        run: python -m unittest discover -s tests -p "test_photo_workspace_layout.py" -v
+
       - name: Vérifier les espaces et marqueurs Git
         run: git diff --check
 
