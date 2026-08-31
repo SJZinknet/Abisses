@@ -18361,6 +18361,87 @@ namespace GestionBissesFolderPicker
         if not silent:
             self.gpx_workshop_status_var.set("Mode découpe annulé.")
 
+    def prepare_precise_gpx_cut(self, points, coords):
+        """
+        Prépare une coupe au point du tracé le plus proche du clic.
+
+        Le point de coupe est projeté sur l'arête GPX concernée : le clic ne
+        déforme donc jamais le tracé. S'il tombe entre deux sommets, un nouveau
+        point commun est inséré à la fin de la partie gauche et au début de la
+        partie droite.
+        """
+        if len(points) < 2:
+            return None
+
+        best = None
+        for edge_index in range(len(points) - 1):
+            distance, edge_ratio = self.point_to_gpx_edge_distance(
+                coords,
+                points[edge_index],
+                points[edge_index + 1]
+            )
+            if best is None or distance < best[0]:
+                best = (distance, edge_index, edge_ratio)
+
+        if best is None:
+            return None
+
+        distance, edge_index, edge_ratio = best
+        edge_ratio = max(0.0, min(1.0, float(edge_ratio)))
+        point_a = points[edge_index]
+        point_b = points[edge_index + 1]
+        epsilon = 1e-7
+
+        if edge_ratio <= epsilon:
+            split_position = float(edge_index)
+            cut_point = copy.deepcopy(point_a)
+            left_points = copy.deepcopy(points[:edge_index + 1])
+            right_points = copy.deepcopy(points[edge_index:])
+            inserted = False
+        elif edge_ratio >= 1.0 - epsilon:
+            split_index = edge_index + 1
+            split_position = float(split_index)
+            cut_point = copy.deepcopy(point_b)
+            left_points = copy.deepcopy(points[:split_index + 1])
+            right_points = copy.deepcopy(points[split_index:])
+            inserted = False
+        else:
+            split_position = edge_index + edge_ratio
+            cut_point = [
+                float(point_a[0])
+                + (float(point_b[0]) - float(point_a[0])) * edge_ratio,
+                float(point_a[1])
+                + (float(point_b[1]) - float(point_a[1])) * edge_ratio,
+            ]
+
+            # Les points importés contiennent généralement l'altitude en
+            # troisième position. Elle est interpolée quand c'est possible.
+            if len(point_a) > 2 or len(point_b) > 2:
+                try:
+                    elevation_a = float(point_a[2])
+                    elevation_b = float(point_b[2])
+                    cut_point.append(
+                        elevation_a
+                        + (elevation_b - elevation_a) * edge_ratio
+                    )
+                except (IndexError, TypeError, ValueError):
+                    cut_point.append(None)
+
+            left_points = copy.deepcopy(points[:edge_index + 1])
+            left_points.append(copy.deepcopy(cut_point))
+            right_points = [copy.deepcopy(cut_point)]
+            right_points.extend(copy.deepcopy(points[edge_index + 1:]))
+            inserted = True
+
+        return {
+            "distance_m": float(distance),
+            "split_position": float(split_position),
+            "cut_point": cut_point,
+            "left_points": left_points,
+            "right_points": right_points,
+            "inserted": inserted,
+        }
+
     def cut_selected_gpx_segment_at_coords(self, coords):
         segment_id = self.gpx_workshop_pending_segment_id
         segment = self.find_gpx_segment(segment_id)
@@ -18380,7 +18461,7 @@ namespace GestionBissesFolderPicker
 
         part = parts[0]
         points = part.get("points", [])
-        if len(points) < 3:
+        if len(points) < 2:
             self.gpx_workshop_status_var.set("Découpe impossible : segment trop court.")
             self.gpx_workshop_click_mode = None
             self.gpx_workshop_pending_segment_id = None
@@ -18388,25 +18469,35 @@ namespace GestionBissesFolderPicker
             return
 
         click_lat, click_lon = float(coords[0]), float(coords[1])
-        nearest_index = min(
-            range(len(points)),
-            key=lambda i: self.haversine_distance_m(
-                click_lat, click_lon,
-                float(points[i][0]), float(points[i][1])
-            )
+        prepared_cut = self.prepare_precise_gpx_cut(
+            points,
+            (click_lat, click_lon)
         )
+        if not prepared_cut:
+            self.gpx_workshop_status_var.set("Découpe impossible : tracé inexploitable.")
+            return
 
-        if nearest_index <= 0 or nearest_index >= len(points) - 1:
+        tolerance_m = self.gpx_geometry_edit_tolerance_m(
+            click_lat,
+            pixels=26
+        )
+        if prepared_cut["distance_m"] > tolerance_m:
+            self.gpx_workshop_status_var.set(
+                "Cliquez plus près du tracé pour effectuer la découpe."
+            )
+            return
+
+        n = max(1, len(points) - 1)
+        split_position = prepared_cut["split_position"]
+        if split_position <= 1e-7 or split_position >= n - 1e-7:
             self.gpx_workshop_status_var.set(
                 "Découpe trop proche d'une extrémité : cliquez un peu plus à l'intérieur du segment."
             )
             return
 
-        left_points = copy.deepcopy(points[:nearest_index + 1])
-        right_points = copy.deepcopy(points[nearest_index:])
-
-        n = max(1, len(points) - 1)
-        split_ratio = nearest_index / n
+        left_points = prepared_cut["left_points"]
+        right_points = prepared_cut["right_points"]
+        split_ratio = split_position / n
         start_fraction = float(part.get("start_fraction", 0.0))
         end_fraction = float(part.get("end_fraction", 1.0))
         mid_fraction = start_fraction + (end_fraction - start_fraction) * split_ratio
@@ -18455,7 +18546,7 @@ namespace GestionBissesFolderPicker
         self.gpx_workshop_click_mode = None
         self.gpx_workshop_pending_segment_id = None
         self.exit_gpx_segment_edit_photo_mode()
-        self.gpx_workshop_status_var.set("✂️ Segment découpé.")
+        self.gpx_workshop_status_var.set("✂️ Segment découpé au point précis.")
 
     def point_distance_m(self, a, b):
         return self.haversine_distance_m(float(a[0]), float(a[1]), float(b[0]), float(b[1]))
