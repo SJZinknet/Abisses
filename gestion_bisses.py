@@ -43,8 +43,6 @@ from abisses_update_ui import AbissesUpdateController
 pillow_heif.register_heif_opener()
 
 APP_VERSION = get_current_version()
-# v65b : interface Cartographie allégée — états techniques conservés en interne,
-# seuls les avertissements nécessitant une action restent visibles.
 
 def atomic_write_json_file(
     path,
@@ -261,6 +259,7 @@ class BisseManagerApp:
         self.photo_status_var = tk.StringVar(value="")
         self.photo_index_var = tk.StringVar(value="")
         self.platform_selected_var = tk.BooleanVar(value=False)
+        self.platform_order_var = tk.IntVar(value=0)
 
         # v63 : le panneau Photos n'écrit plus rien lors d'une simple
         # navigation. Les valeurs affichées sont comparées à cette référence
@@ -334,14 +333,6 @@ class BisseManagerApp:
         self.gpx_workshop_pending_segment_id = None
         self.gpx_workshop_undo_stack = []
         self.gpx_workshop_redo_stack = []
-
-        # v65 : cycle de vie persistant des sources GPX.
-        self.gpx_source_refresh_running = False
-        self.gpx_source_refresh_queue = None
-        self.gpx_source_refresh_poll_after_id = None
-        self.gpx_source_refresh_button = None
-        self.gpx_reintegrate_button = None
-        self.gpx_progress_previous_header = None
 
         # v64 : ordonnanceur central des redessins Cartographie.
         self.gpx_redraw_after_id = None
@@ -5663,14 +5654,6 @@ class BisseManagerApp:
             "categories": self.default_gpx_categories(),
             "sources": [],
             "segments": [],
-            # v65 : l'initialisation ne doit avoir lieu qu'une seule fois.
-            # Une liste sources vide peut être un choix volontaire de l'utilisateur.
-            "sources_initialized": False,
-            "sources_initialized_at": None,
-            # Registre léger des branches retirées : il empêche leur retour lors
-            # d'un rafraîchissement manuel sans supprimer le fichier GPX du disque.
-            "retired_sources": [],
-            "last_sources_refresh_at": None,
             "last_export_at": None
         }
 
@@ -6654,6 +6637,7 @@ class BisseManagerApp:
         for index, entry in enumerate(raw.get("photos", []), start=1):
             if isinstance(entry, dict):
                 entry.setdefault("platform_selected", False)
+                entry.setdefault("platform_order", 0)
                 entry.setdefault("platform_caption", "")
 
         raw.setdefault("gpx_traces", {})
@@ -7656,6 +7640,7 @@ class BisseManagerApp:
                     "title": "",
                     "description": "",
                     "platform_selected": False,
+                    "platform_order": 0,
                     "platform_caption": "",
                 }
                 entries.append(entry)
@@ -7676,6 +7661,7 @@ class BisseManagerApp:
             entry.setdefault("original_filename", source_name)
             entry.setdefault("source_relative_path", source_rel)
             entry.setdefault("platform_selected", False)
+            entry.setdefault("platform_order", 0)
             entry.setdefault("platform_caption", "")
             entry.setdefault("title", "")
             entry.setdefault("description", "")
@@ -12090,7 +12076,7 @@ namespace GestionBissesFolderPicker
         )
 
     def show_contextual_interface(self, has_raw, has_export, has_cat, is_geo):
-        """Tableau de bord : six étapes métier et trois accès rapides."""
+        """Tableau de bord v61 : cinq étapes métier et trois accès rapides."""
         self.clear_main_frame()
         outer = self.make_scrollable_page(padx=4, pady=2)
 
@@ -12115,10 +12101,6 @@ namespace GestionBissesFolderPicker
         selected_count = sum(
             1 for entry in photos
             if entry.get("platform_selected")
-        )
-        final_renamed_count = sum(
-            1 for entry in photos
-            if entry.get("final_renamed")
         )
 
         workshop = container.get("gpx_workshop", {}) or {}
@@ -12285,7 +12267,7 @@ namespace GestionBissesFolderPicker
                     if photo_count else "Aucune photo"
                 )
             ),
-            self.show_photo_order_interface,
+            self.show_rename_interface,
             "#8e44ad"
         )
 
@@ -12307,7 +12289,7 @@ namespace GestionBissesFolderPicker
             4,
             "Photos",
             (
-                f"{selected_count} photo(s) choisie(s) pour la plateforme"
+                f"{selected_count} photo(s) retenue(s)"
                 if selected_count
                 else "À travailler"
             ),
@@ -12318,23 +12300,6 @@ namespace GestionBissesFolderPicker
         add_step(
             4,
             5,
-            "Renommage des photos finales",
-            (
-                "Aucune photo dans le corpus"
-                if not photo_count
-                else (
-                    "Renommage terminé"
-                    if final_renamed_count == photo_count
-                    else f"{final_renamed_count}/{photo_count} photo(s) renommée(s)"
-                )
-            ),
-            self.show_final_photo_rename_interface,
-            "#7d3c98"
-        )
-
-        add_step(
-            5,
-            6,
             "Rendu / Prévisualisation",
             "Disponible à tout moment",
             self.show_render_preview_module,
@@ -13210,7 +13175,7 @@ namespace GestionBissesFolderPicker
 
         photos.sort(
             key=lambda item: (
-                int(item[1].get("photo_order") or 999999),
+                int(item[1].get("platform_order") or 999999),
                 item[1].get("date_taken") or "",
                 item[1].get("filename") or ""
             )
@@ -13248,9 +13213,7 @@ namespace GestionBissesFolderPicker
                 "date": entry.get("date_taken", "") or "",
                 "lat": coords.get("lat"),
                 "lon": coords.get("lon"),
-                # Ordre plateforme dérivé automatiquement de l’ordre du corpus ;
-                # aucun second ordre n’est demandé à l’utilisateur.
-                "platform_order": number
+                "platform_order": int(entry.get("platform_order") or number)
             })
 
         return exported
@@ -14488,6 +14451,7 @@ namespace GestionBissesFolderPicker
                         "title": title,
                         "description": description,
                         "platform_selected": False,
+                        "platform_order": 0,
                         "platform_caption": ""
                     }
 
@@ -14515,6 +14479,7 @@ namespace GestionBissesFolderPicker
                         "title": "",
                         "description": "",
                         "platform_selected": False,
+                        "platform_order": 0,
                         "platform_caption": ""
                     })
 
@@ -14541,7 +14506,7 @@ namespace GestionBissesFolderPicker
                     f"JPG utilisés directement : {direct_jpg_count}\n"
                     f"HEIC/HEIF convertis : {convert_count}\n"
                     f"GPS EXIF trouvés : {gps_found_count}\n\n"
-                    "Vous pouvez maintenant ordonner, géolocaliser ou ouvrir la carte."
+                    "Vous pouvez maintenant renommer, géolocaliser ou ouvrir la carte."
                 )
             )
 
@@ -14552,60 +14517,29 @@ namespace GestionBissesFolderPicker
             self.log(f"❌ Erreur générale : {e}")
 
     # ============================================================
-    # MODULE ORDRE / RENOMMAGE FINAL — v65d : ordre unique du corpus
+    # MODULE RENOMMAGE
     # ============================================================
 
-    def show_photo_order_interface(self):
-        """Étape 2 : définir l'ordre du corpus sans renommer les fichiers."""
-        self.show_rename_interface(mode="order")
-
-    def show_final_photo_rename_interface(self):
-        """Étape 5 : renommer les photos restantes du corpus dans l’ordre de l’étape 2."""
-        self.show_rename_interface(mode="final")
-
-    def show_rename_interface(self, mode="order"):
+    def show_rename_interface(self):
         try:
             self.catalog_data = self.read_catalog()
         except Exception as e:
             messagebox.showerror("Erreur", f"Impossible de lire le catalogue :\n{e}")
             return
 
-        mode = "final" if mode == "final" else "order"
-        self.rename_workflow_mode = mode
-
-        active_entries = [
-            entry for entry in self.catalog_data
-            if isinstance(entry, dict) and entry.get("status") == "OK"
-        ]
-        if not active_entries:
+        if not self.catalog_data:
             messagebox.showwarning(
-                "Photos indisponibles",
-                "Aucune photo active n’est disponible dans ce bisse."
+                "Renommage indisponible",
+                (
+                    "Aucune photo active n’est disponible.\n\n"
+                    "Ouvrez un bisse contenant des photos avant de définir leur ordre."
+                )
             )
             return
 
-        if mode == "final":
-            unordered_count = sum(
-                1 for entry in active_entries
-                if int(entry.get("photo_order") or 0) <= 0
-            )
-            if unordered_count:
-                messagebox.showwarning(
-                    "Ordre incomplet",
-                    (
-                        f"{unordered_count} photo(s) encore présente(s) dans le corpus "
-                        "n’ont pas d’ordre enregistré.\n\n"
-                        "Terminez d’abord l’étape 2 · Ordre des photos."
-                    )
-                )
-                return
-
         self.stop_rename_map_watch()
         self.clear_main_frame()
-        if mode == "final":
-            self.status_header.config(text="Renommage des photos finales", fg="#7d3c98")
-        else:
-            self.status_header.config(text="Ordre des photos", fg="#8e44ad")
+        self.status_header.config(text="Ordre des photos", fg="#8e44ad")
 
         top = tk.Frame(self.main_frame)
         top.pack(fill="x", pady=(0, 6))
@@ -14620,145 +14554,105 @@ namespace GestionBissesFolderPicker
         self.rename_prefix_var.set(default_prefix)
         self.rename_year_var.set(str(datetime.now().year))
         self.rename_start_var.set(1)
+        self.rename_order_mode_var.set("datetime")
+        self.rename_reverse_var.set(False)
         self.rename_map_selected_plan_index = None
         self.rename_gpx_source_choice = None
         self.rename_gpx_guidance_info = None
         self.rename_manual_gpx_sources = []
 
-        if mode == "order":
-            self.rename_order_mode_var.set("datetime")
-            self.rename_reverse_var.set(False)
-            controls = tk.LabelFrame(
-                self.main_frame,
-                text="Ordre des photos",
-                padx=8,
-                pady=6
-            )
-            controls.pack(fill="x", pady=(0, 6))
+        controls = tk.LabelFrame(
+            self.main_frame,
+            text="Ordre et renommage de travail",
+            padx=8,
+            pady=6
+        )
+        controls.pack(fill="x", pady=(0, 6))
 
-            action_row = tk.Frame(controls)
-            action_row.pack(fill="x", pady=(0, 6))
+        tk.Label(controls, text="Préfixe").grid(row=0, column=0, sticky="w", padx=(4, 3))
+        tk.Entry(
+            controls,
+            textvariable=self.rename_prefix_var,
+            width=28
+        ).grid(row=0, column=1, sticky="w", padx=(0, 10))
 
-            tk.Label(
-                action_row,
-                text="Définir l’ordre du corpus sans modifier les noms de fichiers.",
-                fg="#555555"
-            ).pack(side="left", padx=(4, 12))
+        tk.Label(controls, text="Année").grid(row=0, column=2, sticky="w", padx=(0, 3))
+        tk.Entry(
+            controls,
+            textvariable=self.rename_year_var,
+            width=8
+        ).grid(row=0, column=3, sticky="w", padx=(0, 10))
 
-            tk.Button(
-                action_row,
-                text="👁️ Prévisualiser",
-                command=self.preview_rename_plan
-            ).pack(side="right", padx=(6, 4))
+        tk.Label(controls, text="Premier numéro").grid(row=0, column=4, sticky="w", padx=(0, 3))
+        tk.Spinbox(
+            controls,
+            from_=1,
+            to=99999,
+            textvariable=self.rename_start_var,
+            width=7
+        ).grid(row=0, column=5, sticky="w", padx=(0, 14))
 
-            tk.Button(
-                action_row,
-                text="✅ Enregistrer l’ordre",
-                command=self.apply_rename_plan,
-                bg="#8e44ad",
-                fg="white"
-            ).pack(side="right", padx=(4, 6))
+        tk.Button(
+            controls,
+            text="👁️ Prévisualiser",
+            command=self.preview_rename_plan
+        ).grid(row=0, column=6, padx=(0, 10))
 
-            order_frame = tk.Frame(controls)
-            order_frame.pack(fill="x", pady=(2, 0))
-            order_frame.grid_columnconfigure(7, weight=1)
+        tk.Button(
+            controls,
+            text="✅ Appliquer l’ordre / renommage",
+            command=self.apply_rename_plan,
+            bg="#8e44ad",
+            fg="white"
+        ).grid(row=0, column=7, padx=(0, 4))
 
-            def order_changed():
-                self.rename_map_fit_done = False
-                self.preview_rename_plan()
+        order_frame = tk.Frame(controls)
+        order_frame.grid(row=1, column=0, columnspan=8, sticky="ew", pady=(7, 0))
+        order_frame.grid_columnconfigure(7, weight=1)
 
-            tk.Label(order_frame, text="Ordre :").grid(row=0, column=0, sticky="w", padx=(4, 8))
+        def order_changed():
+            self.rename_map_fit_done = False
+            self.preview_rename_plan()
 
-            tk.Radiobutton(
-                order_frame,
-                text="Date / heure",
-                variable=self.rename_order_mode_var,
-                value="datetime",
-                command=order_changed
-            ).grid(row=0, column=1, sticky="w", padx=(0, 10))
+        tk.Label(order_frame, text="Ordre :").grid(row=0, column=0, sticky="w", padx=(4, 8))
 
-            tk.Radiobutton(
-                order_frame,
-                text="Position GPS",
-                variable=self.rename_order_mode_var,
-                value="gps",
-                command=order_changed
-            ).grid(row=0, column=2, sticky="w", padx=(0, 10))
+        tk.Radiobutton(
+            order_frame,
+            text="Date / heure",
+            variable=self.rename_order_mode_var,
+            value="datetime",
+            command=order_changed
+        ).grid(row=0, column=1, sticky="w", padx=(0, 10))
 
-            tk.Checkbutton(
-                order_frame,
-                text="Inverser",
-                variable=self.rename_reverse_var,
-                command=order_changed
-            ).grid(row=0, column=3, sticky="w", padx=(0, 12))
+        tk.Radiobutton(
+            order_frame,
+            text="Position GPS",
+            variable=self.rename_order_mode_var,
+            value="gps",
+            command=order_changed
+        ).grid(row=0, column=2, sticky="w", padx=(0, 10))
 
-            tk.Label(order_frame, text="Proximité").grid(row=0, column=4, sticky="e", padx=(0, 4))
-            tk.Spinbox(
-                order_frame,
-                from_=0,
-                to=80,
-                increment=1,
-                textvariable=self.rename_gps_group_radius_var,
-                width=5,
-                command=order_changed
-            ).grid(row=0, column=5, sticky="w")
-            tk.Label(order_frame, text="m").grid(row=0, column=6, sticky="w", padx=(3, 0))
-        else:
-            controls = tk.LabelFrame(
-                self.main_frame,
-                text="Renommage des photos finales",
-                padx=8,
-                pady=6
-            )
-            controls.pack(fill="x", pady=(0, 6))
+        tk.Checkbutton(
+            order_frame,
+            text="Inverser",
+            variable=self.rename_reverse_var,
+            command=order_changed
+        ).grid(row=0, column=3, sticky="w", padx=(0, 12))
 
-            tk.Label(
-                controls,
-                text=(
-                    "Toutes les photos encore présentes dans le corpus sont renommées, "
-                    "dans l’ordre fixé à l’étape 2. Les photos écartées sont ignorées."
-                ),
-                fg="#555555",
-                anchor="w"
-            ).grid(row=0, column=0, columnspan=8, sticky="ew", padx=4, pady=(0, 7))
+        tk.Label(order_frame, text="Proximité").grid(row=0, column=4, sticky="e", padx=(0, 4))
+        tk.Spinbox(
+            order_frame,
+            from_=0,
+            to=80,
+            increment=1,
+            textvariable=self.rename_gps_group_radius_var,
+            width=5,
+            command=order_changed
+        ).grid(row=0, column=5, sticky="w")
+        tk.Label(order_frame, text="m").grid(row=0, column=6, sticky="w", padx=(3, 0))
 
-            tk.Label(controls, text="Préfixe").grid(row=1, column=0, sticky="w", padx=(4, 3))
-            tk.Entry(
-                controls,
-                textvariable=self.rename_prefix_var,
-                width=28
-            ).grid(row=1, column=1, sticky="w", padx=(0, 10))
-
-            tk.Label(controls, text="Année").grid(row=1, column=2, sticky="w", padx=(0, 3))
-            tk.Entry(
-                controls,
-                textvariable=self.rename_year_var,
-                width=8
-            ).grid(row=1, column=3, sticky="w", padx=(0, 10))
-
-            tk.Label(controls, text="Premier numéro").grid(row=1, column=4, sticky="w", padx=(0, 3))
-            tk.Spinbox(
-                controls,
-                from_=1,
-                to=99999,
-                textvariable=self.rename_start_var,
-                width=7
-            ).grid(row=1, column=5, sticky="w", padx=(0, 14))
-
-            tk.Button(
-                controls,
-                text="👁️ Prévisualiser",
-                command=self.preview_rename_plan
-            ).grid(row=1, column=6, padx=(0, 10))
-
-            tk.Button(
-                controls,
-                text="✅ Renommer les photos finales",
-                command=self.apply_rename_plan,
-                bg="#7d3c98",
-                fg="white"
-            ).grid(row=1, column=7, padx=(0, 4))
-
+        # Agencement principal : tableau à gauche, carte à droite.
+        # Ratio visé : 60% tableau / 40% carte.
         content = tk.PanedWindow(
             self.main_frame,
             orient=tk.HORIZONTAL,
@@ -14775,11 +14669,7 @@ namespace GestionBissesFolderPicker
 
         self.build_rename_order_map_panel(map_frame)
 
-        if mode == "final":
-            columns = ("order", "current", "new", "status")
-        else:
-            columns = ("order", "date", "current", "status")
-
+        columns = ("order", "date", "current", "new", "status")
         self.rename_tree = ttk.Treeview(
             table_frame,
             columns=columns,
@@ -14787,22 +14677,16 @@ namespace GestionBissesFolderPicker
         )
 
         self.rename_tree.heading("order", text="#")
-        self.rename_tree.column("order", width=55, anchor="center", stretch=False)
+        self.rename_tree.heading("date", text="Date de prise de vue")
+        self.rename_tree.heading("current", text="Nom actuel")
+        self.rename_tree.heading("new", text="Nouveau nom")
+        self.rename_tree.heading("status", text="Statut")
 
-        if mode == "final":
-            self.rename_tree.heading("current", text="Nom actuel")
-            self.rename_tree.heading("new", text="Nouveau nom")
-            self.rename_tree.heading("status", text="Statut")
-            self.rename_tree.column("current", width=260)
-            self.rename_tree.column("new", width=280)
-            self.rename_tree.column("status", width=140, stretch=False)
-        else:
-            self.rename_tree.heading("date", text="Date de prise de vue")
-            self.rename_tree.heading("current", text="Nom actuel")
-            self.rename_tree.heading("status", text="Ordre")
-            self.rename_tree.column("date", width=155, stretch=False)
-            self.rename_tree.column("current", width=300)
-            self.rename_tree.column("status", width=190, stretch=False)
+        self.rename_tree.column("order", width=55, anchor="center", stretch=False)
+        self.rename_tree.column("date", width=145, stretch=False)
+        self.rename_tree.column("current", width=215)
+        self.rename_tree.column("new", width=245)
+        self.rename_tree.column("status", width=170, stretch=False)
 
         y_scroll = tk.Scrollbar(table_frame, orient="vertical", command=self.rename_tree.yview)
         x_scroll = tk.Scrollbar(table_frame, orient="horizontal", command=self.rename_tree.xview)
@@ -14825,10 +14709,15 @@ namespace GestionBissesFolderPicker
                 index = children.index(selection[0])
             except Exception:
                 return
+
+            # v51f : carte passive. Le tableau mémorise la sélection seulement.
             self.rename_map_selected_plan_index = index
 
+        def on_tree_double_click(_event=None):
+            on_tree_select(_event)
+
         self.rename_tree.bind("<<TreeviewSelect>>", on_tree_select)
-        self.rename_tree.bind("<Double-1>", on_tree_select)
+        self.rename_tree.bind("<Double-1>", on_tree_double_click)
 
         self.preview_rename_plan()
 
@@ -14845,12 +14734,10 @@ namespace GestionBissesFolderPicker
             pass
 
 
-
     def build_rename_plan(self):
-        mode = getattr(self, "rename_workflow_mode", "order")
         prefix = self.sanitize_filename_part(self.rename_prefix_var.get())
         year = self.sanitize_filename_part(self.rename_year_var.get())
-        start = int(self.rename_start_var.get()) if mode == "final" else 1
+        start = int(self.rename_start_var.get())
 
         candidates = []
 
@@ -14901,70 +14788,47 @@ namespace GestionBissesFolderPicker
         sortable = [p for p in candidates if not p.get("skip")]
         skipped = [p for p in candidates if p.get("skip")]
 
-        if mode == "final":
-            def final_key(item):
-                entry = item.get("entry", {})
-                try:
-                    photo_order = int(entry.get("photo_order") or 0)
-                except Exception:
-                    photo_order = 0
-                return (
-                    photo_order if photo_order > 0 else 10**9,
-                    self.rename_photo_date_key(item),
-                    os.path.basename(item.get("source_path", "")).lower()
-                )
-            ordered = sorted(sortable, key=final_key)
-            self.rename_gpx_guidance_info = None
-        else:
-            ordered = self.sort_rename_candidates(sortable)
+        ordered = self.sort_rename_candidates(sortable)
 
         plan = []
         number = start
         mode_label = self.rename_order_mode_label()
         guidance = getattr(self, "rename_gpx_guidance_info", None) or {}
         gps_topo_used = bool(
-            mode == "order"
-            and self.rename_order_mode_var.get() == "gps"
+            self.rename_order_mode_var.get() == "gps"
             and guidance.get("used")
         )
 
         for p in ordered:
             folder = os.path.dirname(p["source_path"])
+            new_name = f"{prefix}_{year}_{number}.jpg"
+            target_path = os.path.join(folder, new_name)
 
-            if mode == "final":
-                new_name = f"{prefix}_{year}_{number}.jpg"
-                target_path = os.path.join(folder, new_name)
-                status = "À renommer"
-                if os.path.abspath(p["source_path"]) == os.path.abspath(target_path):
-                    status = "Déjà correct"
-                p["order_mode"] = "final"
-                p["gps_guided_by_topo"] = False
-                p["gps_topo_source"] = ""
-                p["gps_topo_sources"] = []
-            else:
-                new_name = os.path.basename(p["source_path"])
-                target_path = p["source_path"]
-                status_label = "GPS + topo" if gps_topo_used else mode_label
-                status = status_label
-                if self.rename_order_mode_var.get() == "gps" and not p.get("gps"):
-                    status += " · sans GPS, placé en fin"
-                p["order_mode"] = self.rename_order_mode_var.get()
-                p["gps_guided_by_topo"] = bool(p.get("gps") and gps_topo_used)
-                p["gps_topo_source"] = (
-                    guidance.get("source_filename", "")
-                    if p["gps_guided_by_topo"]
-                    else ""
-                )
-                p["gps_topo_sources"] = (
-                    list(guidance.get("source_filenames", []))
-                    if p["gps_guided_by_topo"]
-                    else []
-                )
+            status_label = "GPS + topo" if gps_topo_used else mode_label
+            status = f"À renommer · {status_label}"
+            if os.path.abspath(p["source_path"]) == os.path.abspath(target_path):
+                status = f"Déjà correct · {status_label}"
+
+            if self.rename_order_mode_var.get() == "gps" and not p.get("gps"):
+                status += " · sans GPS, placé en fin"
 
             p["target_path"] = target_path
             p["new_name"] = new_name
             p["status"] = status
             p["order_number"] = number
+            p["order_mode"] = self.rename_order_mode_var.get()
+            p["gps_guided_by_topo"] = bool(p.get("gps") and gps_topo_used)
+            p["gps_topo_source"] = (
+                guidance.get("source_filename", "")
+                if p["gps_guided_by_topo"]
+                else ""
+            )
+            p["gps_topo_sources"] = (
+                list(guidance.get("source_filenames", []))
+                if p["gps_guided_by_topo"]
+                else []
+            )
+
             plan.append(p)
             number += 1
 
@@ -14975,12 +14839,10 @@ namespace GestionBissesFolderPicker
 
         return plan
 
-
     def preview_rename_plan(self):
         if not self.rename_tree:
             return
 
-        mode = getattr(self, "rename_workflow_mode", "order")
         self.rename_plan = self.build_rename_plan()
 
         for item in self.rename_tree.get_children():
@@ -14997,134 +14859,57 @@ namespace GestionBissesFolderPicker
                 date_text = "—"
 
             raw_status = p.get("status", "")
-            if mode == "final":
+            if "Déjà correct" in raw_status:
+                status = "Déjà correct"
+            elif "sans GPS" in raw_status:
+                status = "Sans GPS"
+            elif "GPS + topo" in raw_status:
+                status = "À renommer · GPS + topo"
+            elif "GPS" in raw_status:
+                status = "À renommer · GPS"
+            elif "Date" in raw_status or "date" in raw_status:
+                status = "À renommer · Date"
+            else:
                 status = raw_status
-                values = (
+
+            self.rename_tree.insert(
+                "",
+                "end",
+                values=(
                     p.get("order_number", i),
+                    date_text,
                     os.path.basename(source_path),
                     os.path.basename(target_path),
                     status
                 )
-            else:
-                if "sans GPS" in raw_status:
-                    status = "Sans GPS · fin"
-                elif "GPS + topo" in raw_status:
-                    status = "GPS + topo"
-                elif "GPS" in raw_status:
-                    status = "GPS"
-                elif "Date" in raw_status or "date" in raw_status:
-                    status = "Date / heure"
-                else:
-                    status = raw_status
-                values = (
-                    p.get("order_number", i),
-                    date_text,
-                    os.path.basename(source_path),
-                    status
-                )
+            )
 
-            self.rename_tree.insert("", "end", values=values)
-
+        # v51g :
+        # Toute modification des paramètres d'ordre doit actualiser la carte.
+        # Le dessin reste différé pour attendre la taille réelle de la carte,
+        # mais il n'est plus conditionné par rename_map_fit_done.
         if self.rename_map_widget:
             self.schedule_initial_rename_map_draw()
 
-        if mode == "final":
-            self.log(
-                f"👁️ Aperçu du renommage final : {len(self.rename_plan)} entrée(s)."
-            )
-        else:
-            self.log(
-                f"👁️ Aperçu de l’ordre : {len(self.rename_plan)} entrée(s). "
-                f"{self.rename_plan_sort_text()}."
-            )
-
+        self.log(
+            f"👁️ Aperçu renommage généré : {len(self.rename_plan)} entrée(s). "
+            f"{self.rename_plan_sort_text()}."
+        )
 
     def apply_rename_plan(self):
-        mode = getattr(self, "rename_workflow_mode", "order")
+        # v51g : toujours reconstruire le plan au moment d'appliquer.
+        # Cela évite d'utiliser un aperçu périmé après un changement de préfixe,
+        # d'année, de premier numéro, de mode d'ordre, d'inversion ou de proximité.
         self.preview_rename_plan()
 
         if not self.rename_plan:
-            if mode == "final":
-                messagebox.showwarning("Aucun renommage", "Aucune photo du corpus à renommer.")
-            else:
-                messagebox.showwarning("Aucun ordre", "Aucun ordre de photos disponible.")
+            messagebox.showwarning("Aucun renommage", "Aucun plan de renommage disponible.")
             return
 
         ordered_plan = [
             p for p in self.rename_plan
             if not p.get("skip") and p.get("order_number")
         ]
-
-        if mode == "order":
-            metadata_changes = []
-            for p in ordered_plan:
-                entry = self.catalog_data[p["catalog_index"]]
-                expected_guidance = "gpx_topology" if p.get("gps_guided_by_topo") else "gps_autonomous"
-                if p.get("order_mode") != "gps":
-                    expected_guidance = ""
-                expected_source = p.get("gps_topo_source", "") if p.get("gps_guided_by_topo") else ""
-                expected_sources = (
-                    list(p.get("gps_topo_sources", []))
-                    if p.get("gps_guided_by_topo")
-                    else []
-                )
-                if (
-                    int(entry.get("photo_order") or 0) != int(p["order_number"])
-                    or entry.get("photo_order_mode") != p.get("order_mode")
-                    or str(entry.get("photo_order_guidance") or "") != expected_guidance
-                    or str(entry.get("photo_order_gpx_source") or "") != expected_source
-                    or list(entry.get("photo_order_gpx_sources") or []) != expected_sources
-                ):
-                    metadata_changes.append(p)
-
-            if not metadata_changes:
-                messagebox.showinfo("Rien à faire", "L’ordre des photos est déjà enregistré.")
-                return
-
-            if not messagebox.askyesno(
-                "Enregistrer l’ordre",
-                (
-                    f"Enregistrer l’ordre de {len(ordered_plan)} photo(s) ?\n\n"
-                    f"{self.rename_plan_sort_text()}.\n\n"
-                    "Les noms de fichiers ne seront pas modifiés."
-                )
-            ):
-                return
-
-            try:
-                for p in ordered_plan:
-                    entry = self.catalog_data[p["catalog_index"]]
-                    entry["photo_order"] = int(p["order_number"])
-                    entry["photo_order_mode"] = p.get("order_mode", self.rename_order_mode_var.get())
-                    entry["photo_order_label"] = self.rename_order_mode_label(p.get("order_mode"))
-                    entry["photo_order_date"] = datetime.now().isoformat(timespec="seconds")
-
-                    if p.get("order_mode") == "gps":
-                        entry["photo_order_guidance"] = (
-                            "gpx_topology"
-                            if p.get("gps_guided_by_topo")
-                            else "gps_autonomous"
-                        )
-                    else:
-                        entry.pop("photo_order_guidance", None)
-
-                    if p.get("gps_guided_by_topo") and p.get("gps_topo_source"):
-                        entry["photo_order_gpx_source"] = p["gps_topo_source"]
-                        entry["photo_order_gpx_sources"] = list(p.get("gps_topo_sources", []))
-                    else:
-                        entry.pop("photo_order_gpx_source", None)
-                        entry.pop("photo_order_gpx_sources", None)
-
-                self.save_catalog()
-                messagebox.showinfo(
-                    "Ordre enregistré",
-                    f"Ordre enregistré pour {len(ordered_plan)} photo(s).\nAucun fichier n’a été renommé."
-                )
-                self.load_folder(self.base_folder)
-            except Exception as e:
-                messagebox.showerror("Erreur", str(e))
-                self.log(f"❌ Erreur enregistrement ordre : {e}")
-            return
 
         active_plan = [
             p for p in ordered_plan
@@ -15134,23 +14919,36 @@ namespace GestionBissesFolderPicker
         metadata_changes = []
         for p in ordered_plan:
             entry = self.catalog_data[p["catalog_index"]]
+            expected_guidance = "gpx_topology" if p.get("gps_guided_by_topo") else "gps_autonomous"
+            if p.get("order_mode") != "gps":
+                expected_guidance = ""
+            expected_source = p.get("gps_topo_source", "") if p.get("gps_guided_by_topo") else ""
+            expected_sources = (
+                list(p.get("gps_topo_sources", []))
+                if p.get("gps_guided_by_topo")
+                else []
+            )
             if (
-                not entry.get("final_renamed")
-                or int(entry.get("final_rename_order") or 0) != int(p["order_number"])
-                or str(entry.get("final_rename_name") or "") != os.path.basename(p.get("target_path", ""))
+                int(entry.get("platform_order") or 0) != int(p["order_number"])
+                or entry.get("photo_order_mode") != p.get("order_mode")
+                or str(entry.get("photo_order_guidance") or "") != expected_guidance
+                or str(entry.get("photo_order_gpx_source") or "") != expected_source
+                or list(entry.get("photo_order_gpx_sources") or []) != expected_sources
             ):
                 metadata_changes.append(p)
 
         if not active_plan and not metadata_changes:
-            messagebox.showinfo("Rien à faire", "Les photos du corpus portent déjà les noms prévus.")
+            messagebox.showinfo("Rien à faire", "Tous les noms et ordres sont déjà corrects.")
             return
 
         if not messagebox.askyesno(
-            "Renommer les photos finales",
+            "Confirmation",
             (
-                f"Renommer {len(active_plan)} photo(s) parmi {len(ordered_plan)} photo(s) du corpus ?\n\n"
-                "Les photos écartées à l’étape Photos ne sont pas concernées.\n"
-                "L’ordre fixé à l’étape 2 est conservé ; la numérotation est simplement resserrée."
+                f"Renommer {len(active_plan)} photo(s) et mettre à jour "
+                f"l'ordre de {len(ordered_plan)} photo(s) dans le catalogue ?\n\n"
+                f"{self.rename_plan_sort_text()}.\n\n"
+                "Cette opération modifiera les fichiers JPG lorsque nécessaire, "
+                "mettra à jour le catalogue et n'altèrera pas les fichiers HEIC originaux."
             )
         ):
             return
@@ -15172,42 +14970,64 @@ namespace GestionBissesFolderPicker
                     return
 
             temp_moves = []
+
             for p in active_plan:
                 source_path = p["source_path"]
                 folder = os.path.dirname(source_path)
                 temp_name = f".tmp_rename_{uuid.uuid4().hex}_{os.path.basename(source_path)}"
                 temp_path = os.path.join(folder, temp_name)
+
                 os.rename(source_path, temp_path)
                 temp_moves.append((p, temp_path))
 
             active_by_catalog_index = {}
+
             for p, temp_path in temp_moves:
                 os.rename(temp_path, p["target_path"])
                 active_by_catalog_index[p["catalog_index"]] = p
+
                 self.log(
-                    f"🔤 Renommage final : {os.path.basename(p['source_path'])} -> {os.path.basename(p['target_path'])}"
+                    f"🔤 Renommé : {os.path.basename(p['source_path'])} -> {os.path.basename(p['target_path'])}"
                 )
 
-            now = datetime.now().isoformat(timespec="seconds")
             for p in ordered_plan:
                 entry = self.catalog_data[p["catalog_index"]]
                 active = active_by_catalog_index.get(p["catalog_index"])
 
                 if active:
                     self.set_entry_image_path(entry, active["target_path"])
+
                     if "original_filename_before_rename" not in entry:
                         entry["original_filename_before_rename"] = entry.get(
                             "original_filename",
                             os.path.basename(active["source_path"])
                         )
+
                     entry["renamed"] = True
-                    entry["rename_date"] = now
+                    entry["rename_date"] = datetime.now().isoformat(timespec="seconds")
                     entry["previous_filename"] = os.path.basename(active["source_path"])
 
-                entry["final_renamed"] = True
-                entry["final_rename_date"] = now
-                entry["final_rename_order"] = int(p["order_number"])
-                entry["final_rename_name"] = os.path.basename(p["target_path"])
+                entry["photo_order"] = int(p["order_number"])
+                entry["photo_order_mode"] = p.get("order_mode", self.rename_order_mode_var.get())
+                entry["photo_order_label"] = self.rename_order_mode_label(p.get("order_mode"))
+                entry["photo_order_date"] = datetime.now().isoformat(timespec="seconds")
+                entry["platform_order"] = int(p["order_number"])
+
+                if p.get("order_mode") == "gps":
+                    entry["photo_order_guidance"] = (
+                        "gpx_topology"
+                        if p.get("gps_guided_by_topo")
+                        else "gps_autonomous"
+                    )
+                else:
+                    entry.pop("photo_order_guidance", None)
+
+                if p.get("gps_guided_by_topo") and p.get("gps_topo_source"):
+                    entry["photo_order_gpx_source"] = p["gps_topo_source"]
+                    entry["photo_order_gpx_sources"] = list(p.get("gps_topo_sources", []))
+                else:
+                    entry.pop("photo_order_gpx_source", None)
+                    entry.pop("photo_order_gpx_sources", None)
 
             self.save_catalog()
 
@@ -15215,22 +15035,15 @@ namespace GestionBissesFolderPicker
                 "Renommage terminé",
                 (
                     f"{len(active_plan)} photo(s) renommée(s).\n"
-                    f"{len(ordered_plan)} photo(s) du corpus validée(s)."
+                    f"Ordre enregistré pour {len(ordered_plan)} photo(s)."
                 )
             )
+
             self.load_folder(self.base_folder)
 
         except Exception as e:
-            # Best-effort rollback for files still parked under temporary names.
-            for p, temp_path in locals().get("temp_moves", []):
-                try:
-                    if os.path.exists(temp_path) and not os.path.exists(p["source_path"]):
-                        os.rename(temp_path, p["source_path"])
-                except Exception:
-                    pass
             messagebox.showerror("Erreur", str(e))
-            self.log(f"❌ Erreur renommage final : {e}")
-
+            self.log(f"❌ Erreur renommage : {e}")
 
     def strip_accents(self, text):
         normalized = unicodedata.normalize("NFD", str(text))
@@ -15848,28 +15661,8 @@ namespace GestionBissesFolderPicker
             if new_abs:
                 source["source_filename"] = os.path.basename(new_abs)
                 source["source_relative_path"] = self.relative_to_base(new_abs)
-                source["source_key"] = self.normalize_gpx_source_key(
-                    source["source_relative_path"]
-                )
                 source["label"] = os.path.splitext(os.path.basename(new_abs))[0]
                 source["renamed_at"] = datetime.now().isoformat(timespec="seconds")
-
-        # Les retraits v65 suivent eux aussi un renommage effectué depuis Abisses.
-        for record in workshop.get("retired_sources", []):
-            old_rel = record.get("source_relative_path", "")
-            old_name = record.get("source_filename", "")
-            new_abs = None
-            if old_rel in old_rel_to_new_abs:
-                new_abs = old_rel_to_new_abs[old_rel]
-            elif old_name in old_name_to_new_abs:
-                new_abs = old_name_to_new_abs[old_name]
-            if new_abs:
-                record["source_filename"] = os.path.basename(new_abs)
-                record["source_relative_path"] = self.relative_to_base(new_abs)
-                record["source_key"] = self.normalize_gpx_source_key(
-                    record["source_relative_path"]
-                )
-                record["renamed_at"] = datetime.now().isoformat(timespec="seconds")
 
     def show_gpx_rename_dialog(self):
         """
@@ -16159,7 +15952,7 @@ namespace GestionBissesFolderPicker
 
 
     # ============================================================
-    # ATELIER TRACÉS GPX : SOURCES, SEGMENTATION, FUSION,
+    # ATELIER TRACÉS GPX : ORIENTATION, SEGMENTATION, FUSION,
     # CATÉGORIES LIBRES ET EXPORT
     # ============================================================
 
@@ -16172,48 +15965,7 @@ namespace GestionBissesFolderPicker
         workshop.setdefault("categories", self.default_gpx_categories())
         workshop.setdefault("sources", [])
         workshop.setdefault("segments", [])
-
-        # Migration v64 -> v65 : un atelier ancien qui contient déjà du travail
-        # est considéré comme initialisé. Cela évite qu'un premier passage en v65
-        # rescane automatiquement Fichiers GPX et fasse réapparaître une branche
-        # que l'utilisateur avait volontairement retirée sous une ancienne version.
-        # Les nouveaux fichiers restent récupérables avec le bouton Rafraîchir.
-        legacy_initialization_missing = "sources_initialized" not in workshop
-        legacy_workshop_has_work = bool(
-            workshop.get("sources") or workshop.get("segments")
-        )
-        if legacy_initialization_missing and legacy_workshop_has_work:
-            workshop["sources_initialized"] = True
-            workshop["sources_initialized_at"] = datetime.now().isoformat(
-                timespec="seconds"
-            )
-        else:
-            workshop.setdefault("sources_initialized", False)
-            workshop.setdefault("sources_initialized_at", None)
-
-        workshop.setdefault("retired_sources", [])
-        workshop.setdefault("last_sources_refresh_at", None)
         workshop.setdefault("last_export_at", None)
-
-        # Migration douce v65 : complète les métadonnées des anciennes sources
-        # sans modifier leur géométrie ni les segments existants.
-        for source in workshop.get("sources", []):
-            if not isinstance(source, dict):
-                continue
-            rel = source.get("source_relative_path")
-            if rel and not source.get("source_key"):
-                source["source_key"] = self.normalize_gpx_source_key(rel)
-            if not source.get("geometry_fingerprint") and source.get("parts"):
-                source["geometry_fingerprint"] = self.gpx_geometry_fingerprint(
-                    source.get("parts", [])
-                )
-            source.setdefault(
-                "origin",
-                "manual" if source.get("created_manually") or source.get("manual_source") else "folder"
-            )
-            source.setdefault("file_state", "active")
-            source.setdefault("duplicate_potential", False)
-            source.setdefault("duplicate_of", [])
 
         # Les anciennes informations de direction ne jouent plus aucun rôle.
         for source in workshop.get("sources", []):
@@ -16287,15 +16039,6 @@ namespace GestionBissesFolderPicker
             snapshot["sources"] = copy.deepcopy(
                 workshop.get("sources", [])
             )
-            snapshot["retired_sources"] = copy.deepcopy(
-                workshop.get("retired_sources", [])
-            )
-            snapshot["sources_initialized"] = bool(
-                workshop.get("sources_initialized", False)
-            )
-            snapshot["sources_initialized_at"] = workshop.get(
-                "sources_initialized_at"
-            )
         self.gpx_workshop_undo_stack.append(snapshot)
         self.gpx_workshop_redo_stack.clear()
         if len(self.gpx_workshop_undo_stack) > 80:
@@ -16322,27 +16065,9 @@ namespace GestionBissesFolderPicker
             future["sources"] = copy.deepcopy(
                 workshop.get("sources", [])
             )
-            future["retired_sources"] = copy.deepcopy(
-                workshop.get("retired_sources", [])
-            )
-            future["sources_initialized"] = bool(
-                workshop.get("sources_initialized", False)
-            )
-            future["sources_initialized_at"] = workshop.get(
-                "sources_initialized_at"
-            )
         self.gpx_workshop_redo_stack.append(future)
         if "sources" in previous:
             workshop["sources"] = copy.deepcopy(previous.get("sources", []))
-            workshop["retired_sources"] = copy.deepcopy(
-                previous.get("retired_sources", [])
-            )
-            workshop["sources_initialized"] = bool(
-                previous.get("sources_initialized", False)
-            )
-            workshop["sources_initialized_at"] = previous.get(
-                "sources_initialized_at"
-            )
         workshop["segments"] = previous.get("segments", [])
         self.save_gpx_workshop_state()
         self.refresh_gpx_source_tree()
@@ -16372,27 +16097,9 @@ namespace GestionBissesFolderPicker
             previous["sources"] = copy.deepcopy(
                 workshop.get("sources", [])
             )
-            previous["retired_sources"] = copy.deepcopy(
-                workshop.get("retired_sources", [])
-            )
-            previous["sources_initialized"] = bool(
-                workshop.get("sources_initialized", False)
-            )
-            previous["sources_initialized_at"] = workshop.get(
-                "sources_initialized_at"
-            )
         self.gpx_workshop_undo_stack.append(previous)
         if "sources" in future:
             workshop["sources"] = copy.deepcopy(future.get("sources", []))
-            workshop["retired_sources"] = copy.deepcopy(
-                future.get("retired_sources", [])
-            )
-            workshop["sources_initialized"] = bool(
-                future.get("sources_initialized", False)
-            )
-            workshop["sources_initialized_at"] = future.get(
-                "sources_initialized_at"
-            )
         workshop["segments"] = future.get("segments", [])
         self.save_gpx_workshop_state()
         self.refresh_gpx_source_tree()
@@ -16401,52 +16108,7 @@ namespace GestionBissesFolderPicker
         self.gpx_workshop_status_var.set(f"↷ Rétabli : {future.get('reason') or 'dernière action'}")
 
 
-    # ============================================================
-    # v65 — CYCLE DE VIE DES SOURCES GPX
-    # ============================================================
-
-    def normalize_gpx_source_key(self, relative_path):
-        """Clé stable pour comparer les chemins GPX entre Windows et JSON."""
-        value = str(relative_path or "").replace("\\", "/").strip()
-        value = re.sub(r"/+", "/", value)
-        while value.startswith("./"):
-            value = value[2:]
-        return value.casefold()
-
-    def gpx_file_sha256(self, path):
-        digest = hashlib.sha256()
-        with open(path, "rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
-        return digest.hexdigest()
-
-    def gpx_geometry_fingerprint(self, parts):
-        """
-        Empreinte de géométrie indépendante du sens de parcours et de l'ordre
-        des parties. L'altitude n'entre pas dans la comparaison de doublons.
-        """
-        canonical_parts = []
-        for part in parts or []:
-            coords = []
-            for point in part or []:
-                if not point or len(point) < 2:
-                    continue
-                try:
-                    coords.append((round(float(point[0]), 7), round(float(point[1]), 7)))
-                except (TypeError, ValueError):
-                    continue
-            if len(coords) < 2:
-                continue
-            forward = tuple(coords)
-            reverse = tuple(reversed(coords))
-            canonical_parts.append(min(forward, reverse))
-
-        canonical_parts.sort()
-        payload = json.dumps(canonical_parts, ensure_ascii=False, separators=(",", ":"))
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-    def parse_gpx_source_payload(self, gpx_path):
-        """Lecture GPX pure, utilisable depuis le thread de rafraîchissement."""
+    def parse_gpx_source_file(self, gpx_path):
         with open(gpx_path, "r", encoding="utf-8") as f:
             gpx = gpxpy.parse(f)
 
@@ -16454,634 +16116,20 @@ namespace GestionBissesFolderPicker
         if not parts:
             raise ValueError("Le GPX ne contient aucun tracé exploitable.")
 
-        return {
-            "parts": parts,
-            "geometry_fingerprint": self.gpx_geometry_fingerprint(parts),
-            "file_sha256": self.gpx_file_sha256(gpx_path),
-        }
-
-    def parse_gpx_source_file(self, gpx_path):
-        payload = self.parse_gpx_source_payload(gpx_path)
         branch_order = len(
             self.get_gpx_workshop_state().get("sources", [])
         ) + 1
-        rel = self.relative_to_base(gpx_path)
 
         return {
             "id": uuid.uuid4().hex,
             "label": os.path.splitext(os.path.basename(gpx_path))[0],
             "source_filename": os.path.basename(gpx_path),
-            "source_relative_path": rel,
-            "source_key": self.normalize_gpx_source_key(rel),
+            "source_relative_path": self.relative_to_base(gpx_path),
             "imported_at": datetime.now().isoformat(timespec="seconds"),
-            "origin": "folder",
-            "parts": payload["parts"],
-            "geometry_fingerprint": payload["geometry_fingerprint"],
-            "file_sha256": payload["file_sha256"],
-            "file_state": "active",
-            "duplicate_potential": False,
-            "duplicate_of": [],
+            "parts": parts,
             "branch_order": branch_order,
             "visible": True
         }
-
-    def begin_gpx_long_operation(self, text, total=None):
-        """Affiche la progression avant un traitement GPX perceptible."""
-        try:
-            if self.gpx_progress_previous_header is None:
-                self.gpx_progress_previous_header = str(
-                    self.status_header.cget("text") or ""
-                )
-            if total is None:
-                self.progress.configure(mode="indeterminate")
-                self.progress.start(10)
-            else:
-                self.progress.stop()
-                self.progress.configure(
-                    mode="determinate", maximum=max(1, int(total)), value=0
-                )
-            self.status_header.config(text=text, fg="#2c3e50")
-            self.gpx_workshop_status_var.set(text)
-            self.root.update_idletasks()
-        except Exception:
-            pass
-        self.set_gpx_source_actions_enabled(False)
-
-    def update_gpx_long_operation(self, position, total, text):
-        try:
-            self.progress.stop()
-            self.progress.configure(
-                mode="determinate", maximum=max(1, int(total or 1))
-            )
-            self.progress["value"] = max(0, int(position or 0))
-            self.status_header.config(text=text, fg="#2c3e50")
-            self.gpx_workshop_status_var.set(text)
-            self.root.update_idletasks()
-        except Exception:
-            pass
-
-    def end_gpx_long_operation(self):
-        try:
-            self.progress.stop()
-            self.progress.configure(mode="determinate", maximum=100, value=0)
-            if self.gpx_progress_previous_header:
-                self.status_header.config(text=self.gpx_progress_previous_header)
-            self.gpx_progress_previous_header = None
-            self.root.update_idletasks()
-        except Exception:
-            pass
-        self.set_gpx_source_actions_enabled(True)
-
-    def set_gpx_source_actions_enabled(self, enabled):
-        # Si un mode géométrique est actif, ses propres verrous restent prioritaires.
-        state = (
-            "normal"
-            if enabled and not getattr(self, "gpx_geometry_edit_active", False)
-            else "disabled"
-        )
-        buttons = [
-            getattr(self, "gpx_source_refresh_button", None),
-            getattr(self, "gpx_reintegrate_button", None),
-        ]
-        buttons.extend(getattr(self, "gpx_workshop_mutation_buttons", []) or [])
-        seen = set()
-        for button in buttons:
-            if not button or id(button) in seen:
-                continue
-            seen.add(id(button))
-            try:
-                button.config(state=state)
-            except Exception:
-                pass
-
-    def refresh_gpx_duplicate_flags(self, workshop=None):
-        workshop = workshop or self.get_gpx_workshop_state()
-        by_fingerprint = {}
-        for source in workshop.get("sources", []):
-            source["duplicate_potential"] = False
-            source["duplicate_of"] = []
-            fingerprint = source.get("geometry_fingerprint")
-            if fingerprint:
-                by_fingerprint.setdefault(fingerprint, []).append(source)
-
-        for group in by_fingerprint.values():
-            if len(group) < 2:
-                continue
-            ids = [item.get("id") for item in group if item.get("id")]
-            for source in group:
-                source["duplicate_potential"] = True
-                source["duplicate_of"] = [
-                    source_id for source_id in ids
-                    if source_id != source.get("id")
-                ]
-
-    def collect_gpx_folder_files(self):
-        os.makedirs(self.gpx_folder, exist_ok=True)
-        try:
-            names = os.listdir(self.gpx_folder)
-        except OSError:
-            return []
-        return sorted(
-            [
-                os.path.join(self.gpx_folder, name)
-                for name in names
-                if name.lower().endswith(".gpx")
-                and os.path.isfile(os.path.join(self.gpx_folder, name))
-            ],
-            key=lambda path: os.path.basename(path).casefold()
-        )
-
-    def refresh_gpx_sources_from_folder(self, initial=False):
-        """
-        Inventorie manuellement Fichiers GPX.
-
-        - ajoute seulement les nouveaux fichiers ;
-        - ne réintègre jamais une branche retirée ;
-        - ne remplace jamais la géométrie d'une source modifiée ;
-        - signale les fichiers modifiés et les doublons potentiels.
-        L'analyse lourde se fait hors du fil Tkinter.
-        """
-        if self.gpx_source_refresh_running:
-            self.gpx_workshop_status_var.set(
-                "Un rafraîchissement des branches est déjà en cours."
-            )
-            return
-
-        workshop = self.get_gpx_workshop_state()
-        files = self.collect_gpx_folder_files()
-        active_snapshot = copy.deepcopy(workshop.get("sources", []))
-        retired_snapshot = copy.deepcopy(workshop.get("retired_sources", []))
-        project_folder = os.path.abspath(self.base_folder or "")
-
-        self.gpx_source_refresh_running = True
-        self.gpx_source_refresh_queue = queue.Queue()
-        operation = (
-            "Initialisation des branches GPX…"
-            if initial else "Rafraîchissement des branches GPX…"
-        )
-        self.begin_gpx_long_operation(operation, total=max(1, len(files)))
-
-        def worker():
-            try:
-                active_by_key = {}
-                for source in active_snapshot:
-                    key = source.get("source_key") or self.normalize_gpx_source_key(
-                        source.get("source_relative_path")
-                    )
-                    if key:
-                        active_by_key[key] = source
-
-                retired_by_key = {}
-                for record in retired_snapshot:
-                    key = record.get("source_key") or self.normalize_gpx_source_key(
-                        record.get("source_relative_path")
-                    )
-                    if key:
-                        retired_by_key[key] = record
-
-                results = []
-                seen_keys = set()
-                total = len(files)
-
-                for index, path in enumerate(files, start=1):
-                    rel = self.relative_to_base(path)
-                    key = self.normalize_gpx_source_key(rel)
-                    seen_keys.add(key)
-                    name = os.path.basename(path)
-                    result = {
-                        "path": path,
-                        "rel": rel,
-                        "key": key,
-                        "name": name,
-                        "kind": "unknown"
-                    }
-
-                    try:
-                        sha = self.gpx_file_sha256(path)
-                        result["file_sha256"] = sha
-
-                        if key in retired_by_key:
-                            retired_record = retired_by_key[key]
-                            stored_sha = retired_record.get("file_sha256")
-                            stored_fp = retired_record.get("geometry_fingerprint")
-                            if stored_sha and stored_sha == sha:
-                                detected_fp = retired_record.get(
-                                    "detected_geometry_fingerprint"
-                                )
-                                if (
-                                    retired_record.get("file_state") == "modified"
-                                    and stored_fp
-                                    and detected_fp
-                                    and stored_fp != detected_fp
-                                ):
-                                    result["kind"] = "retired_modified"
-                                    result["geometry_fingerprint"] = detected_fp
-                                else:
-                                    result["kind"] = "retired"
-                            else:
-                                payload = self.parse_gpx_source_payload(path)
-                                result.update(payload)
-                                if stored_fp and stored_fp != payload["geometry_fingerprint"]:
-                                    result["kind"] = "retired_modified"
-                                else:
-                                    result["kind"] = "retired"
-                        elif key in active_by_key:
-                            existing = active_by_key[key]
-                            stored_sha = existing.get("file_sha256")
-                            stored_fp = existing.get("geometry_fingerprint")
-                            if stored_sha and stored_sha == sha:
-                                detected_fp = existing.get(
-                                    "detected_geometry_fingerprint"
-                                )
-                                if (
-                                    existing.get("file_state") == "modified"
-                                    and stored_fp
-                                    and detected_fp
-                                    and stored_fp != detected_fp
-                                ):
-                                    result["kind"] = "active_modified"
-                                    result["geometry_fingerprint"] = detected_fp
-                                else:
-                                    result["kind"] = "active_unchanged"
-                                    result["geometry_fingerprint"] = stored_fp
-                            else:
-                                payload = self.parse_gpx_source_payload(path)
-                                result.update(payload)
-                                if stored_fp and stored_fp != payload["geometry_fingerprint"]:
-                                    result["kind"] = "active_modified"
-                                else:
-                                    result["kind"] = "active_same_geometry"
-                        else:
-                            payload = self.parse_gpx_source_payload(path)
-                            result.update(payload)
-                            result["kind"] = "new"
-                    except Exception as exc:
-                        result["kind"] = "error"
-                        result["error"] = str(exc)
-
-                    results.append(result)
-                    self.gpx_source_refresh_queue.put((
-                        "progress", index, max(1, total), name
-                    ))
-
-                self.gpx_source_refresh_queue.put((
-                    "done", results, seen_keys, initial, project_folder
-                ))
-            except Exception as exc:
-                self.gpx_source_refresh_queue.put(("fatal", str(exc)))
-
-        threading.Thread(target=worker, daemon=True).start()
-        self.poll_gpx_source_refresh_queue()
-
-    def poll_gpx_source_refresh_queue(self):
-        if not self.gpx_source_refresh_running or not self.gpx_source_refresh_queue:
-            return
-
-        try:
-            while True:
-                message = self.gpx_source_refresh_queue.get_nowait()
-                kind = message[0]
-
-                if kind == "progress":
-                    _kind, position, total, name = message
-                    self.update_gpx_long_operation(
-                        position, total,
-                        f"Lecture des sources GPX · {position}/{total} · {name}"
-                    )
-                elif kind == "done":
-                    _kind, results, seen_keys, initial, project_folder = message
-                    self.finish_gpx_source_refresh(
-                        results, seen_keys, initial, project_folder
-                    )
-                    return
-                elif kind == "fatal":
-                    self.fail_gpx_source_refresh(message[1])
-                    return
-        except queue.Empty:
-            pass
-
-        self.gpx_source_refresh_poll_after_id = self.root.after(
-            80, self.poll_gpx_source_refresh_queue
-        )
-
-    def fail_gpx_source_refresh(self, error):
-        self.gpx_source_refresh_running = False
-        self.gpx_source_refresh_queue = None
-        self.gpx_source_refresh_poll_after_id = None
-        self.end_gpx_long_operation()
-        self.gpx_workshop_status_var.set(
-            f"Rafraîchissement interrompu : {error}"
-        )
-        self.log(f"❌ Rafraîchissement GPX impossible : {error}")
-
-    def finish_gpx_source_refresh(self, results, seen_keys, initial, project_folder):
-        if os.path.abspath(self.base_folder or "") != project_folder:
-            # L'utilisateur a changé de bisse pendant l'analyse : ne jamais
-            # appliquer les résultats au nouveau catalogue.
-            self.gpx_source_refresh_running = False
-            self.gpx_source_refresh_queue = None
-            self.gpx_source_refresh_poll_after_id = None
-            self.end_gpx_long_operation()
-            self.log(
-                "⚠️ Rafraîchissement GPX abandonné : le bisse actif a changé."
-            )
-            return
-
-        workshop = self.get_gpx_workshop_state()
-        previous_state = {
-            "sources": copy.deepcopy(workshop.get("sources", [])),
-            "retired_sources": copy.deepcopy(workshop.get("retired_sources", [])),
-            "sources_initialized": bool(workshop.get("sources_initialized", False)),
-            "sources_initialized_at": workshop.get("sources_initialized_at"),
-            "last_sources_refresh_at": workshop.get("last_sources_refresh_at")
-        }
-        sources = workshop.setdefault("sources", [])
-        by_key = {}
-        for source in sources:
-            key = source.get("source_key") or self.normalize_gpx_source_key(
-                source.get("source_relative_path")
-            )
-            if key:
-                source["source_key"] = key
-                by_key[key] = source
-
-        added = 0
-        retired_ignored = 0
-        retired_modified = 0
-        modified = 0
-        errors = 0
-
-        for result in results:
-            kind = result.get("kind")
-            key = result.get("key")
-
-            if kind in {"retired", "retired_modified"}:
-                retired_ignored += 1
-                for record in workshop.get("retired_sources", []):
-                    record_key = record.get("source_key") or self.normalize_gpx_source_key(
-                        record.get("source_relative_path")
-                    )
-                    if record_key != key:
-                        continue
-                    record["file_sha256"] = result.get("file_sha256") or record.get("file_sha256")
-                    if kind == "retired_modified":
-                        record["file_state"] = "modified"
-                        record["detected_geometry_fingerprint"] = result.get("geometry_fingerprint")
-                        record["file_modified_detected_at"] = datetime.now().isoformat(timespec="seconds")
-                        retired_modified += 1
-                        self.log(
-                            f"⚠️ Branche retirée dont le GPX a été modifié : {record.get('source_filename', result.get('name'))}"
-                        )
-                    else:
-                        record["file_state"] = "retired"
-                        record.pop("detected_geometry_fingerprint", None)
-                        record.pop("file_modified_detected_at", None)
-                    break
-                continue
-
-            if kind == "error":
-                errors += 1
-                self.log(
-                    f"❌ GPX illisible ({result.get('name')}): {result.get('error')}"
-                )
-                continue
-
-            if kind == "new":
-                source = {
-                    "id": uuid.uuid4().hex,
-                    "label": os.path.splitext(result.get("name", ""))[0],
-                    "source_filename": result.get("name", ""),
-                    "source_relative_path": result.get("rel", ""),
-                    "source_key": key,
-                    "imported_at": datetime.now().isoformat(timespec="seconds"),
-                    "origin": "folder",
-                    "parts": result.get("parts", []),
-                    "geometry_fingerprint": result.get("geometry_fingerprint"),
-                    "file_sha256": result.get("file_sha256"),
-                    "file_state": "active",
-                    "duplicate_potential": False,
-                    "duplicate_of": [],
-                    "visible": True
-                }
-                sources.append(source)
-                by_key[key] = source
-                added += 1
-                self.log(
-                    f"✅ Nouvelle branche détectée : {source.get('source_filename')}"
-                )
-                continue
-
-            source = by_key.get(key)
-            if not source:
-                continue
-            source["file_sha256"] = result.get("file_sha256") or source.get("file_sha256")
-            if result.get("geometry_fingerprint"):
-                if not source.get("geometry_fingerprint"):
-                    source["geometry_fingerprint"] = result.get("geometry_fingerprint")
-            if kind == "active_modified":
-                source["file_state"] = "modified"
-                source["detected_geometry_fingerprint"] = result.get("geometry_fingerprint")
-                source["file_modified_detected_at"] = datetime.now().isoformat(timespec="seconds")
-                modified += 1
-                self.log(
-                    f"⚠️ GPX modifié sur disque, géométrie atelier conservée : {source.get('source_filename')}"
-                )
-            else:
-                source["file_state"] = "active"
-                source.pop("detected_geometry_fingerprint", None)
-                source.pop("file_modified_detected_at", None)
-
-        # Un fichier manquant est signalé, jamais retiré automatiquement.
-        for source in sources:
-            key = source.get("source_key")
-            if not key:
-                continue
-            if key not in seen_keys:
-                source["file_state"] = "missing"
-
-        for order, source in enumerate(
-            sorted(
-                sources,
-                key=lambda item: (
-                    item.get("branch_order", 10**9),
-                    item.get("source_filename", "").casefold()
-                )
-            ),
-            start=1
-        ):
-            source["branch_order"] = order
-
-        self.refresh_gpx_duplicate_flags(workshop)
-        duplicate_count = sum(
-            1 for source in sources if source.get("duplicate_potential")
-        )
-
-        now = datetime.now().isoformat(timespec="seconds")
-        workshop["last_sources_refresh_at"] = now
-        if initial or not workshop.get("sources_initialized"):
-            workshop["sources_initialized"] = True
-            workshop["sources_initialized_at"] = workshop.get("sources_initialized_at") or now
-
-        try:
-            self.save_gpx_workshop_state()
-        except Exception as exc:
-            workshop["sources"] = previous_state["sources"]
-            workshop["retired_sources"] = previous_state["retired_sources"]
-            workshop["sources_initialized"] = previous_state["sources_initialized"]
-            workshop["sources_initialized_at"] = previous_state["sources_initialized_at"]
-            workshop["last_sources_refresh_at"] = previous_state["last_sources_refresh_at"]
-            self.fail_gpx_source_refresh(str(exc))
-            return
-
-        self.gpx_source_refresh_running = False
-        self.gpx_source_refresh_queue = None
-        self.gpx_source_refresh_poll_after_id = None
-        self.end_gpx_long_operation()
-        self.refresh_gpx_source_tree()
-        self.refresh_gpx_segment_tree()
-        self.request_gpx_redraw(reason="rafraîchissement sources")
-        if added:
-            self.fit_gpx_workshop_map_to_content()
-
-        self.gpx_workshop_status_var.set(
-            "Branches à jour : "
-            f"{added} nouvelle(s), {modified} fichier(s) modifié(s), "
-            f"{duplicate_count} doublon(s) potentiel(s), "
-            f"{retired_ignored} retirée(s) ignorée(s)"
-            + (f" dont {retired_modified} modifiée(s)" if retired_modified else "")
-            + f", {errors} erreur(s)."
-        )
-
-    def ensure_gpx_sources_initialized(self):
-        workshop = self.get_gpx_workshop_state()
-        if workshop.get("sources_initialized"):
-            return
-        self.refresh_gpx_sources_from_folder(initial=True)
-
-    def reintegrate_retired_gpx_source(self):
-        workshop = self.get_gpx_workshop_state()
-        retired = list(workshop.get("retired_sources", []))
-        if not retired:
-            messagebox.showinfo(
-                "Branches retirées",
-                "Aucune branche retirée n'est enregistrée pour ce bisse."
-            )
-            return
-
-        dialog = tk.Toplevel(self.root)
-        dialog.title("Réintégrer une branche retirée")
-        dialog.geometry("620x390")
-        dialog.transient(self.root)
-        dialog.grab_set()
-
-        tk.Label(
-            dialog,
-            text=(
-                "Choisissez une branche à réintégrer. Le GPX reste la source : "
-                "s'il a disparu du dossier, la réintégration n'est pas possible."
-            ),
-            justify="left", anchor="w", wraplength=580
-        ).pack(fill="x", padx=14, pady=(14, 8))
-
-        tree = ttk.Treeview(
-            dialog, columns=("date", "statut", "fichier"), show="headings", height=11
-        )
-        tree.heading("date", text="Retirée le")
-        tree.heading("statut", text="Statut")
-        tree.heading("fichier", text="GPX")
-        tree.column("date", width=135, anchor="w")
-        tree.column("statut", width=95, anchor="w")
-        tree.column("fichier", width=315, anchor="w")
-        tree.pack(fill="both", expand=True, padx=14, pady=6)
-
-        for index, record in enumerate(retired):
-            tree.insert(
-                "", "end", iid=str(index),
-                values=(
-                    record.get("removed_at", ""),
-                    "Modifié" if record.get("file_state") == "modified" else "Retiré",
-                    record.get("source_filename", "")
-                )
-            )
-
-        footer = tk.Frame(dialog)
-        footer.pack(fill="x", padx=14, pady=(6, 14))
-
-        def apply_reintegration():
-            selection = tree.selection()
-            if not selection:
-                messagebox.showwarning(
-                    "Branche", "Sélectionnez une branche retirée.", parent=dialog
-                )
-                return
-            record = retired[int(selection[0])]
-            rel = record.get("source_relative_path")
-            if not rel:
-                messagebox.showerror(
-                    "GPX introuvable",
-                    "Cette ancienne branche ne possède pas de chemin GPX enregistré.",
-                    parent=dialog
-                )
-                return
-            path = self.abs_from_base(rel)
-            if not os.path.isfile(path):
-                messagebox.showerror(
-                    "GPX introuvable",
-                    f"Le fichier n'existe plus dans Fichiers GPX :\n\n{path}",
-                    parent=dialog
-                )
-                return
-
-            previous_sources = copy.deepcopy(workshop.get("sources", []))
-            previous_retired = copy.deepcopy(workshop.get("retired_sources", []))
-            previous_undo_stack = list(self.gpx_workshop_undo_stack)
-            previous_redo_stack = list(self.gpx_workshop_redo_stack)
-
-            try:
-                self.begin_gpx_long_operation(
-                    f"Réintégration GPX · {os.path.basename(path)}", total=1
-                )
-                source = self.parse_gpx_source_file(path)
-                source["branch_order"] = len(workshop.get("sources", [])) + 1
-                self.snapshot_gpx_segments(
-                    f"Réintégration branche {source.get('source_filename')}",
-                    include_sources=True
-                )
-                workshop.setdefault("sources", []).append(source)
-                workshop["retired_sources"] = [
-                    item for item in workshop.get("retired_sources", [])
-                    if item is not record
-                    and item.get("source_key") != record.get("source_key")
-                ]
-                self.refresh_gpx_duplicate_flags(workshop)
-                self.save_gpx_workshop_state()
-                self.update_gpx_long_operation(1, 1, "Réintégration terminée")
-            except Exception as exc:
-                workshop["sources"] = previous_sources
-                workshop["retired_sources"] = previous_retired
-                self.gpx_workshop_undo_stack = previous_undo_stack
-                self.gpx_workshop_redo_stack = previous_redo_stack
-                messagebox.showerror(
-                    "Réintégration impossible", str(exc), parent=dialog
-                )
-                return
-            finally:
-                self.end_gpx_long_operation()
-
-            self.refresh_gpx_source_tree()
-            self.request_gpx_redraw(reason="réintégration source")
-            dialog.destroy()
-            self.gpx_workshop_status_var.set(
-                f"Branche réintégrée : {source.get('source_filename')}."
-            )
-
-        tk.Button(footer, text="Annuler", command=dialog.destroy).pack(side="right")
-        tk.Button(
-            footer, text="↩️ Réintégrer", command=apply_reintegration,
-            bg="#d35400", fg="white"
-        ).pack(side="right", padx=(0, 8))
-
-        self.root.wait_window(dialog)
 
 
     def show_gpx_workshop(self):
@@ -17114,6 +16162,16 @@ namespace GestionBissesFolderPicker
         ).pack(side="left", padx=(0, 4))
 
         self.gpx_workshop_mutation_buttons = []
+
+        import_sources_button = tk.Button(
+            left_actions,
+            text="📥 Importer des GPX sources",
+            command=self.import_gpx_sources_into_workshop,
+            bg="#d35400",
+            fg="white"
+        )
+        import_sources_button.pack(side="left", padx=4)
+        self.gpx_workshop_mutation_buttons.append(import_sources_button)
 
         rename_sources_button = tk.Button(
             left_actions,
@@ -17192,18 +16250,9 @@ namespace GestionBissesFolderPicker
         self.fit_gpx_workshop_map_to_content()
         self.start_photo_layer_watch("gpx")
 
-        workshop = self.get_gpx_workshop_state()
-        if workshop.get("sources_initialized"):
-            self.gpx_workshop_status_var.set(
-                "Branches restaurées depuis l’état enregistré. Ajoutez les nouveaux GPX dans « Fichiers GPX », puis utilisez « Rafraîchir » si nécessaire."
-            )
-        else:
-            self.gpx_workshop_status_var.set(
-                "Première ouverture : inventaire automatique de « Fichiers GPX »…"
-            )
-            # L'interface est d'abord rendue ; l'inventaire lourd démarre ensuite
-            # dans un thread afin que Tkinter reste réactif.
-            self.root.after(80, self.ensure_gpx_sources_initialized)
+        self.gpx_workshop_status_var.set(
+            "Importez les GPX sources, préparez les segments, puis utilisez les photos visibles ou discrètes comme repères de terrain."
+        )
         self.log("🗺️ Cartographie ouverte.")
 
 
@@ -17500,7 +16549,7 @@ namespace GestionBissesFolderPicker
         notebook = ttk.Notebook(parent)
         notebook.pack(fill="both", expand=True)
 
-        sources_tab = self.create_scrollable_tab(notebook, "1. Branches")
+        sources_tab = self.create_scrollable_tab(notebook, "1. Import / branches")
         segments_tab = self.create_scrollable_tab(notebook, "2. Segments")
         categories_tab = self.create_scrollable_tab(notebook, "3. Catégories")
 
@@ -17512,9 +16561,9 @@ namespace GestionBissesFolderPicker
         tk.Label(
             parent,
             text=(
-                "Les GPX présents dans « Fichiers GPX » sont inventoriés à la première ouverture de l’atelier. "
-                "Ensuite, l’état enregistré est restauré exactement : utilisez « Rafraîchir » seulement après "
-                "avoir ajouté un fichier au dossier. Une branche retirée reste retirée jusqu’à réintégration explicite."
+                "Zone d’import des GPX sources. Chaque fichier importé devient une branche de travail. "
+                "Vous pouvez retirer une branche de l’atelier sans supprimer le fichier GPX du disque. "
+                "L’ordre géométrique du GPX est conservé tel quel."
             ),
             justify="left",
             anchor="w",
@@ -17548,82 +16597,55 @@ namespace GestionBissesFolderPicker
             wraplength=470
         ).pack(fill="x", pady=(0, 6))
 
-        def register_mutation_button(button):
-            self.gpx_workshop_mutation_buttons.append(button)
-            return button
-
-        prep_frame = tk.LabelFrame(
-            parent, text="Branches / préparation GPX", padx=8, pady=6
-        )
+        prep_frame = tk.LabelFrame(parent, text="Import / préparation GPX", padx=8, pady=6)
         prep_frame.pack(fill="x", pady=4)
 
         import_row = tk.Frame(prep_frame)
         import_row.pack(fill="x", pady=3)
 
-        self.gpx_source_refresh_button = register_mutation_button(tk.Button(
+        tk.Button(
             import_row,
-            text="🔄 Rafraîchir depuis Fichiers GPX",
-            command=self.refresh_gpx_sources_from_folder,
+            text="📥 Importer des GPX sources",
+            command=self.import_gpx_sources_into_workshop,
             bg="#d35400",
             fg="white"
-        ))
-        self.gpx_source_refresh_button.pack(
-            side="left", fill="x", expand=True, padx=(0, 4)
-        )
+        ).pack(side="left", fill="x", expand=True, padx=(0, 4))
 
-        self.gpx_reintegrate_button = register_mutation_button(tk.Button(
+        tk.Button(
             import_row,
-            text="↩️ Réintégrer une branche retirée",
-            command=self.reintegrate_retired_gpx_source
-        ))
-        self.gpx_reintegrate_button.pack(
-            side="left", fill="x", expand=True, padx=(4, 0)
-        )
+            text="📥 Importer GPX déjà catégorisés",
+            command=self.import_bisse_traces_from_gpx_folder
+        ).pack(side="left", fill="x", expand=True, padx=(4, 0))
 
         prep_row = tk.Frame(prep_frame)
         prep_row.pack(fill="x", pady=3)
 
-        rename_button = register_mutation_button(tk.Button(
+        tk.Button(
             prep_row,
             text="✏️ Renommer les GPX du dossier",
             command=self.show_gpx_rename_dialog
-        ))
-        rename_button.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        ).pack(side="left", fill="x", expand=True, padx=(0, 4))
 
-        remove_button = register_mutation_button(tk.Button(
+        tk.Button(
             prep_row,
             text="🗑️ Retirer la branche sélectionnée",
             command=self.remove_selected_gpx_source_from_workshop
-        ))
-        remove_button.pack(side="left", fill="x", expand=True, padx=(4, 0))
-
-        legacy_frame = tk.LabelFrame(
-            parent, text="Récupération d’anciens dossiers", padx=8, pady=6
-        )
-        legacy_frame.pack(fill="x", pady=(8, 4))
-        legacy_button = register_mutation_button(tk.Button(
-            legacy_frame,
-            text="📥 Importer les anciens GPX déjà catégorisés",
-            command=self.import_bisse_traces_from_gpx_folder
-        ))
-        legacy_button.pack(fill="x")
+        ).pack(side="left", fill="x", expand=True, padx=(4, 0))
 
         order_row = tk.Frame(parent)
         order_row.pack(fill="x", pady=4)
 
-        up_button = register_mutation_button(tk.Button(
+        tk.Button(
             order_row,
             text="↑ Branche plus haute",
             command=lambda: self.move_selected_source_order(-1)
-        ))
-        up_button.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        ).pack(side="left", fill="x", expand=True, padx=(0, 4))
 
-        down_button = register_mutation_button(tk.Button(
+        tk.Button(
             order_row,
             text="↓ Branche plus basse",
             command=lambda: self.move_selected_source_order(1)
-        ))
-        down_button.pack(side="left", fill="x", expand=True, padx=(4, 0))
+        ).pack(side="left", fill="x", expand=True, padx=(4, 0))
 
         visibility_row = tk.Frame(parent)
         visibility_row.pack(fill="x", pady=4)
@@ -17634,15 +16656,14 @@ namespace GestionBissesFolderPicker
             command=self.show_all_gpx_sources
         ).pack(fill="x")
 
-        rebuild_button = register_mutation_button(tk.Button(
+        tk.Button(
             parent,
-            text="✂️ Créer / recréer les segments depuis les branches actives",
+            text="✂️ Créer / recréer les segments depuis les branches importées",
             command=self.prepare_workshop_segments_from_sources,
             bg="#d35400",
             fg="white",
             height=2
-        ))
-        rebuild_button.pack(fill="x", pady=(10, 4))
+        ).pack(fill="x", pady=(10, 4))
 
 
     def build_gpx_segments_tab(self, parent):
@@ -17672,7 +16693,7 @@ namespace GestionBissesFolderPicker
         self.gpx_segment_tree.heading("ordre", text="Ordre")
         self.gpx_segment_tree.heading("id", text="ID")
         self.gpx_segment_tree.column("visible", width=42, anchor="center")
-        self.gpx_segment_tree.column("categorie", width=220)
+        self.gpx_segment_tree.column("categorie", width=150)
         self.gpx_segment_tree.column("parties", width=60, anchor="center")
         self.gpx_segment_tree.column("ordre", width=70, anchor="center")
         self.gpx_segment_tree.column("id", width=90)
@@ -17698,14 +16719,12 @@ namespace GestionBissesFolderPicker
             command=self.start_gpx_segment_creation
         )
         self.gpx_geometry_create_button.pack(side="left", fill="x", expand=True)
-        self.gpx_workshop_mutation_buttons.append(self.gpx_geometry_create_button)
 
         self.gpx_geometry_correct_button = tk.Button(
             self.gpx_geometry_edit_entry_frame,
             text="✏️ Corriger le tracé",
             command=self.start_gpx_geometry_edit
         )
-        self.gpx_workshop_mutation_buttons.append(self.gpx_geometry_correct_button)
 
         category_row = tk.Frame(parent)
         category_row.pack(fill="x", pady=4)
@@ -18145,6 +17164,78 @@ namespace GestionBissesFolderPicker
         self.set_swisstopo_auto_mode("gpx", False)
         self.set_tile_server_for_widget(self.gpx_editor_map, "gpx", layer_name, force=True)
 
+    def import_gpx_sources_into_workshop(self):
+        if not os.path.exists(self.gpx_folder):
+            os.makedirs(self.gpx_folder, exist_ok=True)
+
+        selected_files = filedialog.askopenfilenames(
+            title="Choisir les GPX sources à intégrer à l’atelier",
+            initialdir=self.gpx_folder,
+            filetypes=[("Fichiers GPX", "*.gpx")]
+        )
+
+        if not selected_files:
+            return
+
+        workshop = self.get_gpx_workshop_state()
+        existing_rel = {
+            source.get("source_relative_path")
+            for source in workshop.get("sources", [])
+        }
+
+        imported = 0
+        skipped = 0
+        errors = 0
+
+        for raw_path in selected_files:
+            source_path = raw_path
+            try:
+                # Si le fichier vient d'ailleurs, on le copie dans le dossier GPX du projet.
+                source_path = os.path.abspath(source_path)
+                gpx_folder_abs = os.path.abspath(self.gpx_folder)
+                if os.path.dirname(source_path) != gpx_folder_abs:
+                    target_path = os.path.join(self.gpx_folder, os.path.basename(source_path))
+                    if os.path.exists(target_path) and os.path.abspath(target_path) != source_path:
+                        base, ext = os.path.splitext(os.path.basename(source_path))
+                        counter = 2
+                        while True:
+                            candidate = os.path.join(self.gpx_folder, f"{base}_{counter}{ext}")
+                            if not os.path.exists(candidate):
+                                target_path = candidate
+                                break
+                            counter += 1
+                    with open(source_path, "rb") as src, open(target_path, "wb") as dst:
+                        dst.write(src.read())
+                    source_path = target_path
+
+                rel = self.relative_to_base(source_path)
+                if rel in existing_rel:
+                    skipped += 1
+                    continue
+
+                record = self.parse_gpx_source_file(source_path)
+                workshop.setdefault("sources", []).append(record)
+                existing_rel.add(rel)
+                imported += 1
+                self.log(f"✅ GPX source importé dans l’atelier : {record.get('source_filename')}")
+            except Exception as e:
+                errors += 1
+                self.log(f"❌ Import GPX source impossible ({os.path.basename(raw_path)}): {e}")
+
+        # Réordonne proprement les branches.
+        for index, source in enumerate(workshop.get("sources", []), start=1):
+            source["branch_order"] = index
+
+        self.save_gpx_workshop_state()
+        self.refresh_gpx_source_tree()
+        self.request_gpx_redraw()
+        self.fit_gpx_workshop_map_to_content()
+
+        self.gpx_workshop_status_var.set(
+            f"Import terminé : {imported} source(s), {skipped} déjà présente(s), {errors} erreur(s)."
+        )
+
+
     def refresh_gpx_source_tree(self):
         if not self.gpx_source_tree:
             return
@@ -18160,14 +17251,6 @@ namespace GestionBissesFolderPicker
         )
 
         for source in sources:
-            warning = ""
-            if source.get("file_state") == "missing":
-                warning = "  ⚠ fichier absent"
-            elif source.get("file_state") == "modified":
-                warning = "  ⚠ fichier modifié"
-            elif source.get("duplicate_potential"):
-                warning = "  ⚠ doublon potentiel"
-
             self.gpx_source_tree.insert(
                 "",
                 "end",
@@ -18175,7 +17258,7 @@ namespace GestionBissesFolderPicker
                 values=(
                     "👁" if source.get("visible", True) else "🙈",
                     source.get("branch_order", ""),
-                    f"{source.get('source_filename', '')}{warning}"
+                    source.get("source_filename", "")
                 )
             )
 
@@ -18385,29 +17468,8 @@ namespace GestionBissesFolderPicker
         source = self.find_gpx_source(source_id)
 
         if source:
-            duplicate_note = ""
-            duplicate_ids = set(source.get("duplicate_of", []) or [])
-            if duplicate_ids:
-                duplicate_names = [
-                    item.get("source_filename", item.get("label", "branche"))
-                    for item in self.get_gpx_workshop_state().get("sources", [])
-                    if item.get("id") in duplicate_ids
-                ]
-                if duplicate_names:
-                    duplicate_note = " · même géométrie que : " + ", ".join(
-                        duplicate_names
-                    )
-            warning_note = ""
-            if source.get("file_state") == "missing":
-                warning_note = " · ⚠ fichier absent"
-            elif source.get("file_state") == "modified":
-                warning_note = " · ⚠ fichier modifié"
-            elif source.get("duplicate_potential"):
-                warning_note = " · ⚠ doublon potentiel"
-
             self.gpx_workshop_selected_source_var.set(
                 f"Branche sélectionnée : {source.get('source_filename')}"
-                f"{warning_note}{duplicate_note}"
             )
 
         self.request_gpx_redraw(reason="sélection source")
@@ -18473,7 +17535,7 @@ namespace GestionBissesFolderPicker
 
     def remove_selected_gpx_source_from_workshop(self):
         """
-        Retire une branche de l’atelier GPX.
+        Retire une branche de la zone d'import de l'atelier GPX.
 
         Important :
         - ne supprime jamais le fichier .gpx du dossier ;
@@ -18533,39 +17595,10 @@ namespace GestionBissesFolderPicker
         if not messagebox.askyesno("Retirer la branche", message):
             return
 
-        previous_sources = copy.deepcopy(workshop.get("sources", []))
-        previous_segments = copy.deepcopy(workshop.get("segments", []))
-        previous_retired = copy.deepcopy(workshop.get("retired_sources", []))
-        previous_undo_stack = list(self.gpx_workshop_undo_stack)
-        previous_redo_stack = list(self.gpx_workshop_redo_stack)
-
         self.snapshot_gpx_segments(
             f"Retrait branche {source_name}",
             include_sources=True
         )
-
-        # v65 : mémoriser le retrait pour qu'un rafraîchissement du dossier
-        # ne fasse pas réapparaître silencieusement la branche.
-        rel = source.get("source_relative_path")
-        source_key = source.get("source_key") or self.normalize_gpx_source_key(rel)
-        retired_record = {
-            "source_relative_path": rel,
-            "source_key": source_key,
-            "source_filename": source.get("source_filename", source_name),
-            "geometry_fingerprint": source.get("geometry_fingerprint")
-                or self.gpx_geometry_fingerprint(source.get("parts", [])),
-            "file_sha256": source.get("file_sha256"),
-            "removed_at": datetime.now().isoformat(timespec="seconds"),
-            "file_state": "retired",
-            "origin": source.get("origin")
-                or ("manual" if source.get("created_manually") else "folder")
-        }
-        retired_sources = workshop.setdefault("retired_sources", [])
-        retired_sources[:] = [
-            item for item in retired_sources
-            if item.get("source_key") != source_key
-        ]
-        retired_sources.append(retired_record)
 
         # Retirer la source.
         workshop["sources"] = [
@@ -18597,32 +17630,7 @@ namespace GestionBissesFolderPicker
         self.gpx_workshop_selected_source_id = None
         self.gpx_workshop_selected_source_var.set("Aucune branche sélectionnée")
 
-        self.refresh_gpx_duplicate_flags(workshop)
-        try:
-            self.save_gpx_workshop_state()
-        except Exception as exc:
-            workshop["sources"] = previous_sources
-            workshop["segments"] = previous_segments
-            workshop["retired_sources"] = previous_retired
-            self.gpx_workshop_undo_stack = previous_undo_stack
-            self.gpx_workshop_redo_stack = previous_redo_stack
-            self.gpx_workshop_selected_source_id = source_id
-            self.refresh_gpx_duplicate_flags(workshop)
-            self.refresh_gpx_source_tree()
-            try:
-                self.gpx_source_tree.selection_set(source_id)
-                self.gpx_source_tree.focus(source_id)
-            except Exception:
-                pass
-            self.on_gpx_source_selected()
-            messagebox.showerror(
-                "Retrait impossible",
-                "La branche n’a pas été retirée : la sauvegarde a échoué.\n\n"
-                f"{exc}"
-            )
-            self.log(f"❌ Retrait de branche annulé : {exc}")
-            return
-
+        self.save_gpx_workshop_state()
         self.refresh_gpx_source_tree()
         self.refresh_gpx_segment_tree()
         self.request_gpx_redraw()
@@ -18916,7 +17924,7 @@ namespace GestionBissesFolderPicker
         if not sources:
             messagebox.showwarning(
                 "Aucune branche",
-                "Ajoutez d'abord un ou plusieurs GPX dans « Fichiers GPX », puis rafraîchissez les branches."
+                "Importez d'abord un ou plusieurs GPX sources."
             )
             return
 
@@ -18925,23 +17933,15 @@ namespace GestionBissesFolderPicker
                 "Recréer les segments ?",
                 (
                     "Des segments existent déjà dans l’atelier.\n\n"
-                    "Les recréer depuis les branches actives effacera les coupes et fusions actuelles.\n\n"
+                    "Les recréer depuis les branches importées effacera les coupes et fusions actuelles.\n\n"
                     "Continuer ?"
                 )
             ):
                 return
 
         segments = []
-        self.begin_gpx_long_operation(
-            "Reconstruction des segments depuis les branches…",
-            total=max(1, len(sources))
-        )
 
-        for source_index, source in enumerate(sources, start=1):
-            self.update_gpx_long_operation(
-                source_index, len(sources),
-                f"Reconstruction des segments · {source_index}/{len(sources)} · {source.get('source_filename', '')}"
-            )
+        for source in sources:
             for part_order, points in enumerate(source.get("parts", [])):
                 if len(points) < 2:
                     continue
@@ -18966,10 +17966,7 @@ namespace GestionBissesFolderPicker
 
         self.snapshot_gpx_segments("Préparation des segments depuis les branches")
         workshop["segments"] = segments
-        try:
-            self.save_gpx_workshop_state()
-        finally:
-            self.end_gpx_long_operation()
+        self.save_gpx_workshop_state()
         self.refresh_gpx_segment_tree()
         self.request_gpx_redraw(reason="préparation segments")
         self.fit_gpx_workshop_map_to_content()
@@ -19847,11 +18844,7 @@ namespace GestionBissesFolderPicker
     # ============================================================
 
     def set_gpx_geometry_navigation_locked(self, locked):
-        state = (
-            "disabled"
-            if locked or getattr(self, "gpx_source_refresh_running", False)
-            else "normal"
-        )
+        state = "disabled" if locked else "normal"
         for button in (
             getattr(self, "header_open_folder_button", None),
             getattr(self, "header_workspace_button", None),
@@ -20079,93 +19072,17 @@ namespace GestionBissesFolderPicker
 
 
 
-    def next_gpx_manual_source_identity(self):
-        os.makedirs(self.gpx_folder, exist_ok=True)
+    def next_gpx_manual_source_label(self):
         existing = {
             str(source.get("source_filename", "")).strip().casefold()
             for source in self.get_gpx_workshop_state().get("sources", [])
         }
-        existing.update(
-            str(record.get("source_filename", "")).strip().casefold()
-            for record in self.get_gpx_workshop_state().get("retired_sources", [])
-        )
         number = 1
         while True:
             label = f"Création manuelle {number:02d}"
-            filename = f"Creation_manuelle_{number:02d}.gpx"
-            target_path = os.path.join(self.gpx_folder, filename)
-            if (
-                filename.casefold() not in existing
-                and label.casefold() not in existing
-                and not os.path.exists(target_path)
-            ):
-                return label, filename, target_path
+            if label.casefold() not in existing:
+                return label
             number += 1
-
-    def write_manual_gpx_source_file(self, target_path, label, parts):
-        """Écrit puis relit un GPX temporaire avant remplacement atomique."""
-        os.makedirs(os.path.dirname(target_path), exist_ok=True)
-        temp_path = os.path.join(
-            os.path.dirname(target_path),
-            f".{os.path.basename(target_path)}.abisses_tmp_{uuid.uuid4().hex}"
-        )
-
-        def xml_escape(value):
-            return (
-                str(value or "")
-                .replace("&", "&amp;")
-                .replace("<", "&lt;")
-                .replace(">", "&gt;")
-                .replace('"', "&quot;")
-            )
-
-        lines = [
-            '<?xml version="1.0" encoding="UTF-8"?>',
-            '<gpx version="1.1" creator="Abisses v65" xmlns="http://www.topografix.com/GPX/1/1">',
-            f"  <trk><name>{xml_escape(label)}</name>"
-        ]
-        for part in parts or []:
-            points = [point for point in (part or []) if point and len(point) >= 2]
-            if len(points) < 2:
-                continue
-            lines.append("    <trkseg>")
-            for point in points:
-                lat = float(point[0])
-                lon = float(point[1])
-                ele = point[2] if len(point) >= 3 else None
-                if ele is None:
-                    lines.append(f'      <trkpt lat="{lat:.10f}" lon="{lon:.10f}"/>')
-                else:
-                    lines.append(
-                        f'      <trkpt lat="{lat:.10f}" lon="{lon:.10f}"><ele>{float(ele):.3f}</ele></trkpt>'
-                    )
-            lines.append("    </trkseg>")
-        lines.extend(["  </trk>", "</gpx>", ""])
-
-        expected_fp = self.gpx_geometry_fingerprint(parts)
-        try:
-            with open(temp_path, "w", encoding="utf-8", newline="\n") as handle:
-                handle.write("\n".join(lines))
-                handle.flush()
-                try:
-                    os.fsync(handle.fileno())
-                except OSError:
-                    pass
-
-            # Validation réelle via le même parseur que les imports.
-            payload = self.parse_gpx_source_payload(temp_path)
-            if payload.get("geometry_fingerprint") != expected_fp:
-                raise ValueError(
-                    "Le GPX relu ne correspond pas à la géométrie dessinée."
-                )
-            os.replace(temp_path, target_path)
-            return payload
-        finally:
-            if os.path.exists(temp_path):
-                try:
-                    os.remove(temp_path)
-                except OSError:
-                    pass
 
     def gpx_creation_insert_index(self, ordered_sources):
         anchor = self.find_gpx_segment(
@@ -20205,36 +19122,23 @@ namespace GestionBissesFolderPicker
         insert_index = self.gpx_creation_insert_index(ordered_sources)
         source_id = uuid.uuid4().hex
         segment_id = uuid.uuid4().hex
-        label, filename, target_path = self.next_gpx_manual_source_identity()
+        label = self.next_gpx_manual_source_label()
         timestamp = datetime.now().isoformat(timespec="seconds")
-        rel = self.relative_to_base(target_path)
-        source_parts = [
-            copy.deepcopy(part.get("points", []))
-            for part in parts
-        ]
 
         new_source = {
             "id": source_id,
             "label": label,
-            "source_filename": filename,
-            "source_relative_path": rel,
-            "source_key": self.normalize_gpx_source_key(rel),
+            "source_filename": label,
+            "source_relative_path": None,
             "imported_at": timestamp,
-            "origin": "manual",
             "created_manually": True,
-            "parts": source_parts,
-            "geometry_fingerprint": self.gpx_geometry_fingerprint(source_parts),
-            "file_sha256": None,
-            "file_state": "active",
-            "duplicate_potential": False,
-            "duplicate_of": [],
+            "parts": [
+                copy.deepcopy(part.get("points", []))
+                for part in parts
+            ],
             "branch_order": insert_index + 1,
             "visible": True
         }
-
-        # Le fichier est écrit seulement dans finish_gpx_segment_creation(),
-        # juste avant la transaction catalogue.
-        new_source["pending_target_path"] = target_path
 
         ordered_sources.insert(insert_index, new_source)
 
@@ -20264,7 +19168,7 @@ namespace GestionBissesFolderPicker
         for part_order, part in enumerate(parts):
             segment_parts.append({
                 "source_id": source_id,
-                "source_filename": filename,
+                "source_filename": label,
                 "branch_order": insert_index + 1,
                 "part_order": part_order,
                 "start_fraction": 0.0,
@@ -20283,6 +19187,7 @@ namespace GestionBissesFolderPicker
         })
 
         return ordered_sources, new_segments, segment_id, ""
+
 
     def finish_gpx_segment_creation(self):
         if (
@@ -20342,64 +19247,21 @@ namespace GestionBissesFolderPicker
         previous_undo_stack = list(self.gpx_workshop_undo_stack)
         previous_redo_stack = list(self.gpx_workshop_redo_stack)
 
-        created_source = next(
-            (
-                source for source in sources
-                if source.get("created_manually")
-                and source.get("pending_target_path")
-            ),
-            None
+        self.snapshot_gpx_segments(
+            "Création manuelle d’un segment",
+            include_sources=True
         )
-        target_path = created_source.get("pending_target_path") if created_source else None
-        created_file = False
+
+        workshop["sources"] = sources
+        workshop["segments"] = segments
 
         try:
-            if not created_source or not target_path:
-                raise ValueError("Source GPX manuelle introuvable avant enregistrement.")
-
-            source_parts = created_source.get("parts", [])
-            self.begin_gpx_long_operation(
-                f"Écriture de la branche · {created_source.get('source_filename', '')}",
-                total=3
-            )
-            self.update_gpx_long_operation(1, 3, "Écriture du GPX temporaire…")
-            payload = self.write_manual_gpx_source_file(
-                target_path, created_source.get("label", "Création manuelle"), source_parts
-            )
-            created_file = True
-            self.update_gpx_long_operation(2, 3, "Validation du GPX créé…")
-            created_source["file_sha256"] = self.gpx_file_sha256(target_path)
-            created_source["geometry_fingerprint"] = payload.get(
-                "geometry_fingerprint"
-            ) or created_source.get("geometry_fingerprint")
-            created_source.pop("pending_target_path", None)
-
-            self.snapshot_gpx_segments(
-                "Création manuelle d’un segment",
-                include_sources=True
-            )
-
-            workshop["sources"] = sources
-            workshop["segments"] = segments
-            workshop["sources_initialized"] = True
-            workshop["sources_initialized_at"] = workshop.get(
-                "sources_initialized_at"
-            ) or datetime.now().isoformat(timespec="seconds")
-            self.refresh_gpx_duplicate_flags(workshop)
             self.save_gpx_workshop_state()
-            self.update_gpx_long_operation(3, 3, "Branche et segment enregistrés.")
         except Exception as exc:
             workshop["sources"] = previous_sources
             workshop["segments"] = previous_segments
             self.gpx_workshop_undo_stack = previous_undo_stack
             self.gpx_workshop_redo_stack = previous_redo_stack
-            if created_file and target_path and os.path.exists(target_path):
-                try:
-                    os.remove(target_path)
-                except OSError as cleanup_exc:
-                    self.log(
-                        f"⚠️ Nettoyage du GPX créé impossible après échec : {cleanup_exc}"
-                    )
 
             messagebox.showerror(
                 "Enregistrement impossible",
@@ -20410,10 +19272,8 @@ namespace GestionBissesFolderPicker
                 "Échec d’enregistrement · le dessin est conservé."
             )
             self.log(f"❌ Création du segment impossible : {exc}")
-            self.end_gpx_long_operation()
             return
 
-        self.end_gpx_long_operation()
         snap_count = self.gpx_geometry_creation_snap_count
 
         self.reset_gpx_geometry_edit_session(redraw=False)
@@ -20484,7 +19344,7 @@ namespace GestionBissesFolderPicker
     def save_gpx_workshop_from_ui(self):
         if self.gpx_geometry_edit_active:
             action = (
-                "Terminez la création avec « ✓ Enregistrer » ou annulez-la."
+                "Terminez la création et choisissez le point amont A/B."
                 if self.gpx_geometry_edit_kind == "create"
                 else "Utilisez « ✓ Enregistrer » dans la barre de correction pour valider le tracé."
             )
@@ -22062,8 +20922,7 @@ namespace GestionBissesFolderPicker
             "display_mode": segment.get("display_mode", "single"),
             "bicolor_categories": copy.deepcopy(segment.get("bicolor_categories", [])),
             "parts": [left_part],
-            "created_at": datetime.now().isoformat(timespec="seconds"),
-            "cut_from": segment.get("id")
+            "created_at": datetime.now().isoformat(timespec="seconds")
         }
 
         right_segment = {
@@ -22073,8 +20932,7 @@ namespace GestionBissesFolderPicker
             "display_mode": segment.get("display_mode", "single"),
             "bicolor_categories": copy.deepcopy(segment.get("bicolor_categories", [])),
             "parts": [right_part],
-            "created_at": datetime.now().isoformat(timespec="seconds"),
-            "cut_from": segment.get("id")
+            "created_at": datetime.now().isoformat(timespec="seconds")
         }
 
         self.snapshot_gpx_segments("Découpe d’un segment")
@@ -24200,6 +23058,11 @@ namespace GestionBissesFolderPicker
             except Exception:
                 photo_order = 0
 
+            try:
+                platform_order = int(entry.get("platform_order") or 0)
+            except Exception:
+                platform_order = 0
+
             photos.append({
                 "catalog_index": idx,
                 "filename": filename,
@@ -24220,16 +23083,28 @@ namespace GestionBissesFolderPicker
                 "sort_datetime": sort_datetime,
                 "photo_order": photo_order,
                 "photo_order_mode": entry.get("photo_order_mode", ""),
-                "platform_selected": bool(entry.get("platform_selected", False))
+                "platform_selected": bool(entry.get("platform_selected", False)),
+                "platform_order": platform_order
             })
 
-        # L’ordre du corpus est enregistré dans photo_order à l’étape 2.
-        # L’atelier Photos et la sélection plateforme respectent toujours cet
-        # ordre unique ; aucune seconde numérotation n’est définie ici.
+        # v51b :
+        # Après le renommage intelligent, l'ordre final est enregistré dans
+        # photo_order. L'atelier Photos doit respecter cet ordre, sinon il donne
+        # l'impression de "renommer" ou renuméroter à nouveau les images en les
+        # remettant dans l'ordre chronologique.
         if any(photo.get("photo_order", 0) > 0 for photo in photos):
             photos.sort(
                 key=lambda photo: (
                     photo.get("photo_order", 0) if photo.get("photo_order", 0) > 0 else 10**9,
+                    photo.get("filename", "").lower()
+                )
+            )
+        elif photos and all(photo.get("platform_order", 0) > 0 for photo in photos):
+            # Compatibilité pour un catalogue déjà ordonné avant l'introduction
+            # explicite de photo_order.
+            photos.sort(
+                key=lambda photo: (
+                    photo.get("platform_order", 0),
                     photo.get("filename", "").lower()
                 )
             )
@@ -24322,7 +23197,7 @@ namespace GestionBissesFolderPicker
             tk.Button(
                 actions,
                 text="🔢 Ordre des photos",
-                command=self.show_photo_order_interface,
+                command=self.show_rename_interface,
                 bg="#8e44ad",
                 fg="white"
             ).pack(fill="x", pady=4)
@@ -24458,7 +23333,7 @@ namespace GestionBissesFolderPicker
         tk.Button(
             actions,
             text="🔢 Ordre des photos",
-            command=close_then(self.show_photo_order_interface),
+            command=close_then(self.show_rename_interface),
             bg="#8e44ad",
             fg="white",
             state=gps_state
@@ -24533,7 +23408,7 @@ namespace GestionBissesFolderPicker
             row_a,
             text="🔢 Ordre des photos",
             command=lambda: self.leave_photo_context(
-                self.show_photo_order_interface
+                self.show_rename_interface
             )
         ).pack(side="left", padx=4)
 
@@ -25060,21 +23935,31 @@ namespace GestionBissesFolderPicker
 
         platform_frame = tk.LabelFrame(edit, text="Plateforme", bg="#f4f4f4", padx=6, pady=6)
         platform_frame.grid(row=4, column=0, sticky="ew", pady=(0, 8))
+        platform_frame.grid_columnconfigure(1, weight=1)
 
         tk.Checkbutton(
             platform_frame,
-            text="⭐ Choisie pour la plateforme",
+            text="⭐ Choisie",
             variable=self.platform_selected_var,
             bg="#f4f4f4"
-        ).grid(row=0, column=0, sticky="w")
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
+
+        tk.Label(platform_frame, text="Ordre :", bg="#f4f4f4").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        tk.Spinbox(
+            platform_frame,
+            from_=0,
+            to=999,
+            textvariable=self.platform_order_var,
+            width=6
+        ).grid(row=1, column=1, sticky="w", padx=(6, 0), pady=(4, 0))
 
         tk.Label(
             platform_frame,
-            text="L’ordre de l’étape 2 est conservé automatiquement.",
+            text="0 = non défini.",
             bg="#f4f4f4",
             fg="#555555",
             justify="left"
-        ).grid(row=1, column=0, sticky="w", pady=(3, 0))
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(3, 0))
 
         buttons = tk.Frame(parent, bg="#f4f4f4")
         buttons.grid(row=3, column=0, sticky="ew", pady=(8, 0))
@@ -25082,7 +23967,7 @@ namespace GestionBissesFolderPicker
 
         tk.Button(
             buttons,
-            text="💾 Sauvegarder titre / description / sélection plateforme",
+            text="💾 Sauvegarder titre / description / plateforme",
             command=self.save_current_photo_metadata,
             bg="#27ae60",
             fg="white",
@@ -25131,11 +24016,18 @@ namespace GestionBissesFolderPicker
             selected = bool(
                 self.platform_selected_var.get()
             )
+            try:
+                order = int(
+                    self.platform_order_var.get()
+                )
+            except Exception:
+                order = 0
 
             return {
                 "title": title,
                 "description": description,
                 "platform_selected": selected,
+                "platform_order": order,
             }
         except Exception:
             return None
@@ -26144,6 +25036,18 @@ namespace GestionBissesFolderPicker
             )
         )
 
+        try:
+            self.platform_order_var.set(
+                int(
+                    photo.get(
+                        "platform_order"
+                    )
+                    or 0
+                )
+            )
+        except Exception:
+            self.platform_order_var.set(0)
+
         self.photo_status_var.set("")
         self.set_current_photo_metadata_baseline()
 
@@ -26860,6 +25764,12 @@ namespace GestionBissesFolderPicker
                         False
                     )
                 ),
+                "platform_order": int(
+                    self.current_photo.get(
+                        "platform_order"
+                    )
+                    or 0
+                ),
             }
         )
 
@@ -26922,6 +25832,15 @@ namespace GestionBissesFolderPicker
             )
             != requested[
                 "platform_selected"
+            ]
+            or int(
+                entry.get(
+                    "platform_order"
+                )
+                or 0
+            )
+            != requested[
+                "platform_order"
             ]
         )
 
@@ -27036,6 +25955,11 @@ namespace GestionBissesFolderPicker
             ] = requested[
                 "platform_selected"
             ]
+            entry[
+                "platform_order"
+            ] = requested[
+                "platform_order"
+            ]
 
             self.save_catalog(
                 interactive=not silent
@@ -27057,6 +25981,11 @@ namespace GestionBissesFolderPicker
                 "platform_selected"
             ] = requested[
                 "platform_selected"
+            ]
+            self.current_photo[
+                "platform_order"
+            ] = requested[
+                "platform_order"
             ]
 
             if text_changed:
@@ -27114,6 +26043,11 @@ namespace GestionBissesFolderPicker
                     "platform_selected"
                 ] = requested[
                     "platform_selected"
+                ]
+                photo[
+                    "platform_order"
+                ] = requested[
+                    "platform_order"
                 ]
 
                 if text_changed:
@@ -27188,7 +26122,7 @@ namespace GestionBissesFolderPicker
                         )
                 else:
                     self.photo_status_var.set(
-                        "✅ Sélection plateforme sauvegardée."
+                        "✅ Sélection / ordre plateforme sauvegardés."
                     )
 
             self.log(
@@ -27527,8 +26461,6 @@ def run_packaged_self_test():
                 "viewer_rendering": "viewport-only",
                 "gpx_direction_ui": "removed",
                 "gpx_redraw_scheduler": "coalesced",
-                "gpx_source_lifecycle": "folder-refresh-v65",
-                "gpx_duplicate_detection": "geometry-fingerprint",
                 "self_test": "OK",
             },
             ensure_ascii=False,
