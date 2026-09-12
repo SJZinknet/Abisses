@@ -15,6 +15,8 @@ import threading
 import time
 import csv
 import heapq
+import webbrowser
+import http.server
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk, colorchooser, simpledialog
 from PIL import Image, ImageTk, ImageOps, ImageDraw, ImageFont
@@ -37,6 +39,16 @@ from abisses_update_ui import AbissesUpdateController
 pillow_heif.register_heif_opener()
 
 APP_VERSION = get_current_version()
+
+
+# v65 — moteur de rendu local utilisé uniquement dans le dossier temporaire de prévisualisation.
+BISSES_RENDER_INDEX_HTML = '<!doctype html>\n<html lang="fr">\n<head>\n  <meta charset="utf-8">\n  <meta name="viewport" content="width=device-width, initial-scale=1">\n  <title>Bisses du Valais</title>\n  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css">\n  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet.markercluster@1.5.3/dist/MarkerCluster.css">\n  <link rel="stylesheet" href="assets/css/styles.css">\n</head>\n\n<body>\n  <div id="app-shell">\n    <main id="map-region" aria-label="Carte des bisses du Valais">\n      <div id="map"></div>\n\n      <header class="topbar">\n        <div class="brand">\n          <div class="eyebrow">Inventaire cartographique</div>\n          <h1>Bisses du Valais</h1>\n          <div class="build-version">bisses-ui-clusters-2026-08-11-v6.3</div>\n        </div>\n\n        <div class="toolbar">\n          <button id="btn-valais" type="button">Vue Valais</button>\n          <button id="btn-list" type="button">Liste</button>\n          <button id="btn-basemap" type="button">Satellite</button>\n        </div>\n      </header>\n\n      <div id="legend" class="legend"></div>\n      <div id="scale-pill" class="scale-pill">Fond carte</div>\n      <div id="status-pill" class="status-pill">Chargement…</div>\n    </main>\n\n    <aside id="side-panel" class="side-panel" aria-label="Informations">\n      <button id="btn-close-panel" class="close-button" type="button" aria-label="Fermer">×</button>\n      <div class="panel-kicker" id="panel-kicker">Fiche bisse</div>\n      <h2 id="panel-title">Bisses du Valais</h2>\n      <div id="panel-content">\n        <p class="muted">Sélectionnez un bisse pour afficher sa fiche.</p>\n      </div>\n    </aside>\n  </div>\n\n  <script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js"></script>\n  <script src="https://cdn.jsdelivr.net/npm/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>\n  <script src="https://cdn.jsdelivr.net/npm/leaflet-tilelayer-swiss@2.4.0/dist/Leaflet.TileLayer.Swiss.umd.js"></script>\n  <script src="https://cdn.jsdelivr.net/npm/leaflet-polylineoffset@1.1.1/leaflet.polylineoffset.js"></script>\n  <script src="assets/js/app.js"></script>\n</body>\n</html>\n'
+
+BISSES_RENDER_STYLES_CSS = 'html,\nbody {\n  width: 100%;\n  height: 100%;\n  margin: 0;\n  padding: 0;\n}\n\nbody {\n  overflow: hidden;\n  font-family: Candara, "Segoe UI", system-ui, sans-serif;\n  color: #1f2d24;\n  background: #dfe5da;\n}\n\n#map {\n  position: fixed;\n  inset: 0;\n  z-index: 1;\n  width: 100vw;\n  height: 100vh;\n  height: 100dvh;\n  background: #dfe5da;\n}\n\n/* Fond Swisstopo : la CN 1:1 million reste non blanchie.\n   Les fonds plus détaillés sont légèrement blanchis pour laisser respirer les tracés. */\n.leaflet-tile-pane {\n  filter: none;\n}\n\n#map.basemap-muted .leaflet-tile-pane {\n  filter: brightness(1.10) saturate(0.82) contrast(0.90);\n}\n\n/* Sécurité : les pastilles disparaissent dès que la carte passe en mode traces. */\n#map.segments-mode .bisse-marker,\n#map.segments-mode .bisse-cluster {\n  display: none;\n}\n\n/* Supprime les cadres de focus parasites autour des objets Leaflet\n   dans les navigateurs qui donnent le focus aux SVG/paths après clic.\n   Les boutons HTML de l’interface conservent leur focus normal. */\n.leaflet-container,\n.leaflet-container *,\n.leaflet-interactive,\n.leaflet-marker-icon,\n.leaflet-marker-shadow,\n.leaflet-pane,\n.leaflet-overlay-pane svg,\n.leaflet-overlay-pane path {\n  -webkit-tap-highlight-color: transparent;\n}\n\n.leaflet-container:focus,\n.leaflet-container *:focus,\n.leaflet-interactive:focus,\n.leaflet-marker-icon:focus,\n.leaflet-marker-shadow:focus,\n.leaflet-overlay-pane svg:focus,\n.leaflet-overlay-pane path:focus {\n  outline: none !important;\n  box-shadow: none !important;\n}\n\nbutton {\n  font: inherit;\n}\n\n.topbar {\n  position: fixed;\n  z-index: 700;\n  top: 16px;\n  left: 16px;\n  right: 16px;\n  display: flex;\n  justify-content: space-between;\n  align-items: flex-start;\n  gap: 16px;\n  pointer-events: none;\n}\n\n.brand,\n.toolbar,\n.panel,\n.legend,\n.status-pill,\n.scale-pill {\n  pointer-events: auto;\n}\n\n.brand {\n  max-width: min(430px, calc(100vw - 32px));\n  padding: 14px 18px;\n  border-radius: 22px;\n  color: #fff;\n  background:\n    radial-gradient(circle at 15% 20%, rgba(255,255,255,.16), transparent 34%),\n    linear-gradient(135deg, rgba(31,47,37,.96), rgba(77,99,70,.93));\n  box-shadow: 0 16px 42px rgba(20, 30, 22, .22);\n  backdrop-filter: blur(8px);\n}\n\n.eyebrow,\n.panel-kicker {\n  margin: 0 0 5px;\n  text-transform: uppercase;\n  letter-spacing: .14em;\n  font-size: .72rem;\n  font-weight: 700;\n  opacity: .72;\n}\n\n.build-version {\n  margin-top: 6px;\n  font-size: .72rem;\n  opacity: .55;\n}\n\nh1,\nh2,\nh3 {\n  margin: 0;\n  line-height: 1.08;\n}\n\nh1 {\n  font-size: clamp(1.7rem, 3vw, 2.55rem);\n}\n\nh2 {\n  font-size: 1.45rem;\n}\n\nh3 {\n  font-size: 1.13rem;\n}\n\n.toolbar {\n  display: flex;\n  gap: 8px;\n  flex-wrap: wrap;\n  justify-content: flex-end;\n}\n\n.toolbar button,\n.close-button {\n  border: 1px solid rgba(66, 58, 43, .18);\n  background: rgba(255, 250, 241, .96);\n  color: #1f2d24;\n  box-shadow: 0 10px 28px rgba(20, 30, 22, .14);\n  cursor: pointer;\n}\n\n.toolbar button {\n  min-height: 40px;\n  padding: 9px 14px;\n  border-radius: 999px;\n}\n\n.toolbar button:hover,\n.close-button:hover {\n  background: #fff;\n}\n\n.panel {\n  position: fixed;\n  z-index: 650;\n  border: 1px solid rgba(66, 58, 43, .18);\n  border-radius: 24px;\n  background: rgba(255, 250, 241, .96);\n  box-shadow: 0 18px 52px rgba(20, 30, 22, .22);\n  backdrop-filter: blur(10px);\n  overflow: auto;\n}\n\n.panel-main {\n  left: 16px;\n  bottom: 16px;\n  width: min(390px, calc(100vw - 32px));\n  max-height: calc(100dvh - 155px);\n  padding: 20px;\n  transform: translateX(0);\n  transition: transform .22s ease, opacity .22s ease;\n}\n\n.panel-main:not(.is-open) {\n  transform: translateX(calc(-100% - 28px));\n  opacity: .1;\n  pointer-events: none;\n}\n\n.panel-context {\n  right: 16px;\n  bottom: 16px;\n  width: min(340px, calc(100vw - 32px));\n  max-height: min(56dvh, 520px);\n  padding: 18px;\n  transform: translateY(0);\n  transition: transform .18s ease, opacity .18s ease;\n}\n\n.panel-context:not(.is-open) {\n  transform: translateY(18px);\n  opacity: 0;\n  pointer-events: none;\n}\n\n.panel-list {\n  right: 16px;\n  top: 82px;\n  width: min(360px, calc(100vw - 32px));\n  max-height: calc(100dvh - 106px);\n  padding: 18px;\n  transform: translateX(0);\n  transition: transform .2s ease, opacity .2s ease;\n}\n\n.panel-list:not(.is-open) {\n  transform: translateX(calc(100% + 28px));\n  opacity: 0;\n  pointer-events: none;\n}\n\n.close-button {\n  position: absolute;\n  top: 10px;\n  right: 10px;\n  width: 32px;\n  height: 32px;\n  border-radius: 999px;\n  font-size: 1.25rem;\n  line-height: 1;\n}\n\n.muted {\n  color: #657064;\n}\n\n.lead {\n  margin: 12px 0 14px;\n  line-height: 1.5;\n}\n\n.fact-grid {\n  display: grid;\n  grid-template-columns: 1fr 1fr;\n  gap: 8px 12px;\n  margin-top: 14px;\n}\n\n.fact {\n  padding-top: 9px;\n  border-top: 1px solid rgba(66, 58, 43, .17);\n}\n\n.fact dt {\n  color: #657064;\n  font-size: .72rem;\n  text-transform: uppercase;\n  letter-spacing: .08em;\n}\n\n.fact dd {\n  margin: 3px 0 0;\n  font-weight: 700;\n}\n\n.tags {\n  display: flex;\n  flex-wrap: wrap;\n  gap: 7px;\n  margin-top: 14px;\n}\n\n.tag {\n  display: inline-flex;\n  border: 1px solid rgba(66, 58, 43, .17);\n  border-radius: 999px;\n  padding: 5px 9px;\n  background: #fff;\n  font-size: .86rem;\n}\n\n.gallery {\n  display: grid;\n  grid-template-columns: 1fr 1fr;\n  gap: 9px;\n  margin-top: 14px;\n}\n\n.photo-card {\n  border: 1px solid rgba(66, 58, 43, .17);\n  border-radius: 15px;\n  overflow: hidden;\n  background: #fff;\n  cursor: pointer;\n  text-align: left;\n  padding: 0;\n}\n\n.photo-card img {\n  width: 100%;\n  aspect-ratio: 4 / 3;\n  object-fit: cover;\n  display: block;\n}\n\n.photo-card div {\n  padding: 8px;\n}\n\n.photo-card strong {\n  display: block;\n  font-size: .9rem;\n}\n\n.photo-card span {\n  display: block;\n  margin-top: 3px;\n  color: #657064;\n  font-size: .78rem;\n  line-height: 1.25;\n}\n\n#bisse-list {\n  display: grid;\n  gap: 9px;\n  margin-top: 12px;\n}\n\n.bisse-button {\n  width: 100%;\n  border: 1px solid rgba(66, 58, 43, .17);\n  border-radius: 16px;\n  background: #fff;\n  color: #1f2d24;\n  padding: 12px;\n  text-align: left;\n  cursor: pointer;\n}\n\n.bisse-button:hover {\n  border-color: rgba(63, 98, 69, .55);\n}\n\n.bisse-button strong {\n  display: block;\n}\n\n.bisse-button span {\n  display: block;\n  margin-top: 3px;\n  color: #657064;\n  font-size: .86rem;\n}\n\n.legend {\n  position: fixed;\n  z-index: 620;\n  left: 50%;\n  bottom: 18px;\n  transform: translateX(-50%);\n  display: flex;\n  flex-wrap: wrap;\n  justify-content: center;\n  gap: 7px;\n  max-width: min(760px, calc(100vw - 40px));\n  padding: 8px;\n  border: 1px solid rgba(66, 58, 43, .18);\n  border-radius: 999px;\n  background: rgba(255, 250, 241, .94);\n  box-shadow: 0 12px 34px rgba(20, 30, 22, .18);\n  backdrop-filter: blur(8px);\n}\n\n.legend:empty,\n.legend.is-hidden {\n  display: none;\n}\n\n.legend-item {\n  display: inline-flex;\n  align-items: center;\n  gap: 6px;\n  min-height: 27px;\n  padding: 4px 9px;\n  border: 1px solid rgba(66, 58, 43, .17);\n  border-radius: 999px;\n  background: #fff;\n  font-size: .86rem;\n}\n\n.legend-swatch {\n  width: 12px;\n  height: 12px;\n  border-radius: 50%;\n}\n\n.status-pill,\n.scale-pill {\n  position: fixed;\n  z-index: 620;\n  max-width: min(430px, calc(100vw - 32px));\n  padding: 8px 11px;\n  border-radius: 999px;\n  color: #fff;\n  font-size: .84rem;\n  box-shadow: 0 10px 30px rgba(20, 30, 22, .22);\n}\n\n.status-pill {\n  left: 16px;\n  bottom: 16px;\n  background: rgba(31, 45, 36, .88);\n}\n\n.scale-pill {\n  right: 16px;\n  bottom: 16px;\n  background: rgba(31, 45, 36, .78);\n}\n\n.status-pill.is-hidden,\n.scale-pill.is-hidden {\n  display: none;\n}\n\n.bisse-marker {\n  width: 30px;\n  height: 30px;\n  border: 3px solid #fff;\n  border-radius: 50%;\n  background: #1e88e5;\n  box-shadow: 0 4px 15px rgba(0,0,0,.35);\n}\n\n.bisse-cluster {\n  width: 30px;\n  height: 30px;\n  border: 3px solid #fff;\n  border-radius: 50%;\n  display: grid;\n  place-items: center;\n  background: #1e88e5;\n  color: #fff;\n  font-weight: 700;\n  font-size: .9rem;\n  line-height: 1;\n  box-shadow: 0 4px 15px rgba(0,0,0,.35);\n}\n\n.marker-cluster,\n.marker-cluster-small,\n.marker-cluster-medium,\n.marker-cluster-large {\n  background: transparent;\n  border: 0;\n}\n\n.marker-cluster div,\n.marker-cluster-small div,\n.marker-cluster-medium div,\n.marker-cluster-large div {\n  background: transparent;\n  margin: 0;\n}\n\n.photo-marker {\n  width: 18px;\n  height: 18px;\n  border: 2px solid #fff;\n  border-radius: 50%;\n  background:\n    radial-gradient(circle at center, #fff 0 2px, transparent 3px),\n    #1f2d24;\n  box-shadow: 0 4px 12px rgba(0,0,0,.3);\n}\n\n.leaflet-tooltip.bisse-tooltip,\n.leaflet-tooltip.segment-tooltip {\n  border: 0;\n  border-radius: 999px;\n  padding: 6px 9px;\n  background: rgba(31, 45, 36, .94);\n  color: #fff;\n  box-shadow: 0 8px 22px rgba(0,0,0,.20);\n  font-family: Candara, "Segoe UI", system-ui, sans-serif;\n  font-size: .88rem;\n}\n\n.context-row {\n  padding: 9px 0;\n  border-top: 1px solid rgba(66, 58, 43, .17);\n}\n\n.context-row strong {\n  display: block;\n  color: #657064;\n  font-size: .72rem;\n  text-transform: uppercase;\n  letter-spacing: .08em;\n}\n\n.context-row span {\n  display: block;\n  margin-top: 3px;\n}\n\n.context-photo {\n  width: 100%;\n  border-radius: 16px;\n  margin-bottom: 12px;\n  display: block;\n}\n\n.error-box {\n  padding: 12px;\n  border: 1px solid rgba(150, 62, 48, .35);\n  border-radius: 16px;\n  color: #76382f;\n  background: rgba(150, 62, 48, .08);\n}\n\n\n\n/* Réforme UI : panneau latéral non flottant.\n   La fiche ne recouvre plus la carte : elle réduit la largeur utile de la carte. */\n#app-shell {\n  position: fixed;\n  inset: 0;\n  overflow: hidden;\n}\n\n#map-region {\n  position: fixed;\n  inset: 0;\n  transition: right .24s ease;\n}\n\n#map {\n  position: absolute;\n  inset: 0;\n  width: auto;\n  height: auto;\n}\n\nbody.side-panel-open #map-region {\n  right: 430px;\n}\n\nbody.side-panel-open .topbar {\n  right: 446px;\n}\n\n.side-panel {\n  position: fixed;\n  z-index: 760;\n  top: 0;\n  right: 0;\n  bottom: 0;\n  width: 430px;\n  max-width: min(430px, 42vw);\n  box-sizing: border-box;\n  padding: 24px 24px 28px;\n  border-left: 1px solid rgba(66, 58, 43, .18);\n  background: rgba(255, 250, 241, .98);\n  box-shadow: -18px 0 52px rgba(20, 30, 22, .18);\n  overflow: auto;\n  transform: translateX(100%);\n  transition: transform .24s ease;\n}\n\nbody.side-panel-open .side-panel {\n  transform: translateX(0);\n}\n\n.side-panel .close-button {\n  top: 14px;\n  right: 14px;\n}\n\n\n.bisse-action-chip {\n  position: relative;\n  display: inline-flex;\n  align-items: center;\n  gap: 6px;\n  max-width: min(320px, calc(100vw - 96px));\n  padding: 6px 8px;\n  border: 1px solid rgba(66, 58, 43, .18);\n  border-radius: 18px;\n  background: rgba(255, 250, 241, .96);\n  color: #1f2d24;\n  box-shadow: 0 10px 24px rgba(20, 30, 22, .16);\n  backdrop-filter: blur(8px);\n  transform: translate(-50%, 0);\n  pointer-events: auto;\n  white-space: nowrap;\n}\n\n.bisse-action-title {\n  min-width: 0;\n  max-width: 170px;\n  overflow: hidden;\n  text-overflow: ellipsis;\n  font-weight: 700;\n  font-size: .85rem;\n}\n\n.bisse-action-button {\n  border: 1px solid rgba(66, 58, 43, .18);\n  border-radius: 999px;\n  padding: 4px 8px;\n  background: #fff;\n  color: #1f2d24;\n  cursor: pointer;\n  font-size: .8rem;\n  line-height: 1.1;\n}\n\n.bisse-action-button:hover {\n  background: rgba(31, 45, 36, .07);\n}\n\n.bisse-action-button.is-active {\n  background: #1f2d24;\n  color: #fff;\n}\n\n@media (max-width: 760px) {\n  .bisse-action-chip {\n    max-width: calc(100vw - 56px);\n    border-radius: 16px;\n    white-space: normal;\n  }\n\n  .bisse-action-title {\n    max-width: 150px;\n  }\n}\n\n.leaflet-popup-content-wrapper {\n  border-radius: 16px;\n  background: rgba(255, 250, 241, .98);\n  box-shadow: 0 14px 42px rgba(20, 30, 22, .24);\n}\n\n.leaflet-popup-content {\n  margin: 12px 14px;\n  font-family: Candara, "Segoe UI", system-ui, sans-serif;\n  color: #1f2d24;\n}\n\n.map-popup {\n  box-sizing: border-box;\n}\n\n.map-popup h3 {\n  margin: 0 0 7px;\n  font-size: 1rem;\n}\n\n.map-popup p {\n  margin: 4px 0;\n  line-height: 1.35;\n}\n\n.map-popup .popup-muted {\n  color: #657064;\n  font-size: .88rem;\n}\n\n.photo-popup {\n  width: 320px;\n  max-width: calc(100vw - 76px);\n}\n\n.photo-popup-media {\n  display: flex;\n  justify-content: center;\n  align-items: center;\n  width: 100%;\n  max-height: min(58vh, 430px);\n  margin-bottom: 10px;\n  border-radius: 14px;\n  overflow: hidden;\n  background: rgba(31, 45, 36, .07);\n}\n\n.photo-popup-media img {\n  display: block;\n  max-width: 100%;\n  max-height: min(58vh, 430px);\n  width: auto;\n  height: auto;\n  object-fit: contain;\n}\n\n.photo-popup h3 {\n  margin-bottom: 5px;\n}\n\n.photo-popup p {\n  max-height: 130px;\n  overflow: auto;\n}\n\n@media (max-width: 900px) {\n  body.side-panel-open #map-region {\n    right: 0;\n  }\n\n  body.side-panel-open .topbar {\n    right: 16px;\n  }\n\n  .side-panel {\n    top: auto;\n    left: 0;\n    width: 100vw;\n    max-width: none;\n    height: min(58dvh, 560px);\n    border-left: 0;\n    border-top: 1px solid rgba(66, 58, 43, .18);\n    border-radius: 24px 24px 0 0;\n    transform: translateY(100%);\n  }\n\n  body.side-panel-open .side-panel {\n    transform: translateY(0);\n  }\n}\n\n@media (max-width: 760px) {\n  .topbar {\n    display: block;\n  }\n\n  .brand {\n    width: fit-content;\n    margin-bottom: 8px;\n  }\n\n  .toolbar {\n    justify-content: flex-start;\n  }\n\n  .panel-main {\n    width: calc(100vw - 32px);\n    max-height: 48dvh;\n  }\n\n  .panel-context {\n    left: 16px;\n    right: 16px;\n    width: auto;\n  }\n\n  .legend {\n    display: none;\n  }\n\n  .fact-grid,\n  .gallery {\n    grid-template-columns: 1fr;\n  }\n}\n'
+
+BISSES_RENDER_APP_JS = '/* global L */\n"use strict";\n\nconsole.log("Bisses build bisses-ui-clusters-2026-08-11-v6.3");\n\nconst VALAIS_CENTER = [46.22, 7.55];\nconst VALAIS_ZOOM = 17;\nconst MIN_ZOOM = 16;\nconst MAX_ZOOM = 26;\n\nconst SHOW_SYNTHETIC_TRACES_AT_ZOOM = 19;\nconst SHOW_DETAILED_SEGMENTS_AT_ZOOM = 20.5;\nconst SHOW_BICOLOR_SPLIT_AT_ZOOM = 23.5;\nconst SHOW_EXACT_SEGMENT_DETAIL_AT_ZOOM = 25;\n\n// Option A : généralisation purement visuelle des plages de couleur.\n// Les données GeoJSON sources ne sont jamais modifiées.\nconst ENABLE_SEGMENT_GENERALIZATION = true;\nconst SAME_NEIGHBORS_MAX_PX = 18;\nconst DIFFERENT_NEIGHBORS_MAX_PX = 9;\n\nconst MAP_SCALE_STEPS = [\n  { min: 16, max: 16.5, label: "CN 1:1 million", layer: "ch.swisstopo.pixelkarte-farbe-pk1000.noscale", format: "jpeg", maxNativeZoom: 26, muted: false },\n  { min: 17, max: 18, label: "CN 1:500k", layer: "ch.swisstopo.pixelkarte-farbe-pk500.noscale", format: "jpeg", maxNativeZoom: 26, muted: true },\n  { min: 18.5, max: 18.5, label: "CN 1:200k", layer: "ch.swisstopo.pixelkarte-farbe-pk200.noscale", format: "jpeg", maxNativeZoom: 26, muted: true },\n  { min: 19, max: 20, label: "CN 1:100k", layer: "ch.swisstopo.pixelkarte-farbe-pk100.noscale", format: "jpeg", maxNativeZoom: 26, muted: true },\n  { min: 20.5, max: 21.5, label: "CN 1:50k", layer: "ch.swisstopo.pixelkarte-farbe-pk50.noscale", format: "jpeg", maxNativeZoom: 26, muted: true },\n  { min: 22, max: 23, label: "CN 1:25k", layer: "ch.swisstopo.pixelkarte-farbe-pk25.noscale", format: "jpeg", maxNativeZoom: 26, muted: true },\n  { min: 23.5, max: 26, label: "CN 1:10k", layer: "ch.swisstopo.landeskarte-farbe-10", format: "png", maxNativeZoom: 26, muted: true }\n];\n\nconst SATELLITE_STEP = {\n  label: "Satellite",\n  layer: "ch.swisstopo.swissimage",\n  format: "jpeg",\n  maxNativeZoom: 26,\n  muted: false\n};\n\nconst WATER_LABELS = {\n  in_water: "en eau",\n  dry: "sec",\n  intermittent: "intermittent",\n  unknown: "inconnu"\n};\n\nconst FALLBACK_CATEGORIES = {\n  open: { id: "open", name: "À ciel ouvert", color: "#1e88e5" },\n  canalized: { id: "canalized", name: "Canalisé", color: "#111111" },\n  abandoned: { id: "abandoned", name: "Abandonné", color: "#ef6c00" },\n  mixed: { id: "mixed", name: "Mixte", color: "#777777" },\n  unknown: { id: "unknown", name: "Non classé", color: "#777777" }\n};\n\n// Décision métier : un segment bicolore est toujours canalisé + abandonné.\n// En mode détaillé simplifié, avant le rendu bicolore complet, il est rendu en noir.\nconst BICOLOR_SIMPLIFIED_COLOR = "#111111";\n\n// v6.3 : la trace colorée stable reste arrondie, puis chaque jonction reçoit\n// une petite pastille de raccord recouvrant entièrement les deux caps. Cette\n// pastille est partagée en deux par une coupe droite, normale à la tangente\n// commune de la bisse. Les angles restent ainsi souples, mais la frontière\n// interne entre couleurs est nette et jointive.\nconst SEGMENT_LINE_CAP = "round";\nconst TRANSITION_TANGENT_SAMPLE_PX = 10;\nconst TRANSITION_PATCH_ARC_STEPS = 24;\nconst TRANSITION_PATCH_OVERLAP_PX = 0.35;\nconst TRANSITION_PATCH_OVERSCAN_PX = 0.35;\n\n// Les cibles invisibles de clic restent arrondies pour garder une zone de clic confortable.\nconst HIT_LINE_CAP = "round";\n\nfunction clusterRadiusForZoom(zoom) {\n  // Rayon en pixels : compromis entre v1 et v2.\n  // z16.5 reste assez tolérant pour éviter les chevauchements visuels,\n  // mais moins rassembleur que v2.\n  if (zoom >= 18.5) return 15;\n  if (zoom >= 18) return 24;\n  if (zoom >= 17.5) return 35;\n  if (zoom >= 17) return 47;\n  if (zoom >= 16.5) return 66;\n  return 80;\n}\n\nfunction createBisseMarkerLayer() {\n  if (!L.markerClusterGroup) {\n    console.warn("Leaflet.markercluster n\'est pas chargé : fallback vers pastilles simples.");\n    return L.layerGroup();\n  }\n\n  return L.markerClusterGroup({\n    showCoverageOnHover: false,\n    zoomToBoundsOnClick: false,\n    spiderfyOnMaxZoom: false,\n    spiderfyOnEveryZoom: false,\n    removeOutsideVisibleBounds: true,\n    disableClusteringAtZoom: SHOW_SYNTHETIC_TRACES_AT_ZOOM,\n    maxClusterRadius: () => clusterRadiusForZoom(roundedZoom()),\n    iconCreateFunction: (cluster) => L.divIcon({\n      className: "",\n      html: `<div class="bisse-cluster">${cluster.getChildCount()}</div>`,\n      iconSize: [30, 30],\n      iconAnchor: [15, 15]\n    })\n  });\n}\n\nconst state = {\n  index: [],\n  cache: new Map(),\n  selectedId: null,\n  selectedData: null,\n  photoMarkersVisible: false,\n  bisseActionMarker: null,\n  base: "carto",\n  currentStepKey: "",\n  currentSegmentsKey: "",\n  currentVisibleSegmentCount: 0,\n  segmentRefreshToken: 0,\n  listHtml: "",\n  legendHtml: "",\n  baseLayer: null,\n  bisseMarkers: createBisseMarkerLayer(),\n  segmentOutlineLayer: null,\n  segmentColorLayer: null,\n  photoLayer: L.layerGroup()\n};\n\nconst $ = (id) => document.getElementById(id);\n\nfunction elementWithinLeaflet(el) {\n  let node = el;\n\n  while (node) {\n    if (node.classList && node.classList.contains("leaflet-container")) {\n      return true;\n    }\n    node = node.parentElement || node.parentNode;\n  }\n\n  return false;\n}\n\nfunction blurIfPossible(el) {\n  if (el && typeof el.blur === "function") {\n    el.blur();\n  }\n}\n\nfunction clearLeafletFocus() {\n  window.setTimeout(() => {\n    const active = document.activeElement;\n\n    if (elementWithinLeaflet(active)) {\n      blurIfPossible(active);\n    }\n\n    document\n      .querySelectorAll(".leaflet-interactive, .leaflet-marker-icon, .leaflet-marker-shadow, .leaflet-overlay-pane svg, .leaflet-overlay-pane path")\n      .forEach((el) => blurIfPossible(el));\n  }, 0);\n}\n\nfunction escapeHtml(value) {\n  return String(value ?? "")\n    .replaceAll("&", "&amp;")\n    .replaceAll("<", "&lt;")\n    .replaceAll(">", "&gt;")\n    .replaceAll(\'"\', "&quot;")\n    .replaceAll("\'", "&#039;");\n}\n\nfunction isNum(value) {\n  return typeof value === "number" && Number.isFinite(value);\n}\n\nfunction showStatus(text) {\n  const pill = $("status-pill");\n  pill.textContent = text;\n  pill.classList.remove("is-hidden");\n}\n\nfunction hideStatus() {\n  $("status-pill").classList.add("is-hidden");\n}\n\nfunction showScale(text) {\n  const pill = $("scale-pill");\n  pill.textContent = text;\n  pill.classList.remove("is-hidden");\n}\n\nasync function loadJson(path) {\n  const response = await fetch(path);\n  if (!response.ok) throw new Error(`Impossible de charger ${path}`);\n  return response.json();\n}\n\nif (!L.CRS || !L.CRS.EPSG2056 || !L.tileLayer || !L.tileLayer.swiss) {\n  throw new Error("Leaflet.TileLayer.Swiss n\'est pas chargé correctement.");\n}\n\nconst map = L.map("map", {\n  crs: L.CRS.EPSG2056,\n  zoomControl: false,\n  scrollWheelZoom: true,\n  minZoom: MIN_ZOOM,\n  maxZoom: MAX_ZOOM,\n  zoomSnap: 0.5,\n  zoomDelta: 0.5\n});\n\nL.control.zoom({ position: "bottomright" }).addTo(map);\n\nmap.createPane("segmentOutlinePane");\nmap.getPane("segmentOutlinePane").style.zIndex = 405;\n\nmap.createPane("segmentColorPane");\nmap.getPane("segmentColorPane").style.zIndex = 410;\n\nmap.createPane("segmentHitPane");\nmap.getPane("segmentHitPane").style.zIndex = 425;\n\nmap.createPane("photoPane");\nmap.getPane("photoPane").style.zIndex = 430;\n\nstate.bisseMarkers.addTo(map);\nstate.photoLayer.addTo(map);\n\nif (L.markerClusterGroup && state.bisseMarkers.on) {\n  state.bisseMarkers.on("clusterclick", (event) => {\n    clearLeafletFocus();\n\n    if (event.originalEvent) {\n      L.DomEvent.stop(event.originalEvent);\n    }\n\n    const nextZoom = Math.min(SHOW_SYNTHETIC_TRACES_AT_ZOOM, roundedZoom() + 0.5);\n    map.setView(event.latlng, nextZoom, { animate: true });\n  });\n}\n\nfunction roundedZoom() {\n  return Math.round(map.getZoom() * 2) / 2;\n}\n\nfunction segmentRenderMode() {\n  const zoom = roundedZoom();\n\n  if (zoom < SHOW_SYNTHETIC_TRACES_AT_ZOOM) {\n    return "markers";\n  }\n\n  if (zoom < SHOW_DETAILED_SEGMENTS_AT_ZOOM) {\n    return "synthetic";\n  }\n\n  return "detailed";\n}\n\nfunction segmentStyleForZoom() {\n  const zoom = roundedZoom();\n\n  if (zoom < SHOW_DETAILED_SEGMENTS_AT_ZOOM) {\n    return { key: "synthetic", outlineWeight: 9, colorWeight: 6, opacity: 0.96, clickWeight: 16 };\n  }\n\n  if (zoom <= 22.5) {\n    return { key: "detail-light", outlineWeight: 11, colorWeight: 7, opacity: 0.98, clickWeight: 18 };\n  }\n\n  if (zoom <= 24.5) {\n    return { key: "detail-medium", outlineWeight: 12, colorWeight: 8, opacity: 0.99, clickWeight: 19 };\n  }\n\n  return { key: "detail-final", outlineWeight: 13, colorWeight: 9, opacity: 0.99, clickWeight: 20 };\n}\n\nfunction bicolorStyleForZoom() {\n  const base = segmentStyleForZoom();\n  const zoom = roundedZoom();\n\n  if (zoom < SHOW_BICOLOR_SPLIT_AT_ZOOM) {\n    return {\n      ...base,\n      mode: "simplified"\n    };\n  }\n\n  return {\n    ...base,\n    mode: "split",\n    outlineWeight: 13,\n    flankWeight: 5.8,\n    offset: 2.35,\n    opacity: 0.99,\n    clickWeight: 20\n  };\n}\n\nfunction stepForZoom(zoom) {\n  const clampedZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, zoom));\n  return MAP_SCALE_STEPS.find((step) => clampedZoom >= step.min && clampedZoom <= step.max) || MAP_SCALE_STEPS[0];\n}\n\nfunction makeSwissLayer(step) {\n  return L.tileLayer.swiss({\n    layer: step.layer,\n    format: step.format || "jpeg",\n    maxNativeZoom: step.maxNativeZoom || MAX_ZOOM,\n    pluginAttribution: false\n  });\n}\n\nfunction refreshBasemapFilter(step) {\n  const mapEl = $("map");\n  if (step.muted) {\n    mapEl.classList.add("basemap-muted");\n  } else {\n    mapEl.classList.remove("basemap-muted");\n  }\n}\n\nfunction setBaseLayer(step) {\n  const key = `${state.base}:${step.layer}:${step.format}`;\n\n  refreshBasemapFilter(step);\n\n  if (state.currentStepKey === key && state.baseLayer) {\n    updateScalePill();\n    return;\n  }\n\n  state.currentStepKey = key;\n\n  if (state.baseLayer) {\n    map.removeLayer(state.baseLayer);\n  }\n\n  state.baseLayer = makeSwissLayer(step);\n  state.baseLayer.addTo(map);\n  state.baseLayer.bringToBack();\n\n  updateScalePill();\n}\n\nfunction refreshBaseLayer() {\n  if (state.base === "satellite") {\n    setBaseLayer(SATELLITE_STEP);\n  } else {\n    setBaseLayer(stepForZoom(roundedZoom()));\n  }\n}\n\nfunction toggleBase() {\n  state.base = state.base === "carto" ? "satellite" : "carto";\n  $("btn-basemap").textContent = state.base === "carto" ? "Satellite" : "Carte";\n  state.currentStepKey = "";\n  refreshBaseLayer();\n}\n\nfunction updateScalePill(count = null, unit = "segments") {\n  const zoom = roundedZoom();\n  const step = state.base === "satellite" ? SATELLITE_STEP : stepForZoom(zoom);\n  const extra = count === null ? "" : ` · ${count} ${unit}`;\n  showScale(`${step.label} · z${zoom}${extra}`);\n}\n\nfunction invalidateMapSoon() {\n  map.invalidateSize({ pan: false });\n  window.setTimeout(() => map.invalidateSize({ pan: false }), 260);\n}\n\nfunction openPanel() {\n  document.body.classList.add("side-panel-open");\n  $("side-panel").classList.add("is-open");\n  invalidateMapSoon();\n}\n\nfunction closePanel() {\n  document.body.classList.remove("side-panel-open");\n  $("side-panel").classList.remove("is-open");\n  invalidateMapSoon();\n}\n\nfunction openContext() {\n  // Ancien panneau contextuel supprimé : les détails courts passent par des popups Leaflet.\n}\n\nfunction closeContext() {\n  map.closePopup();\n}\n\nfunction openList() {\n  $("panel-kicker").textContent = "Vue alternative";\n  $("panel-title").textContent = "Liste des bisses";\n  $("panel-content").innerHTML = state.listHtml || `<p class="muted">Aucun bisse chargé.</p>`;\n  bindListButtons();\n  openPanel();\n}\n\nfunction closeList() {\n  closePanel();\n}\n\nfunction cataloguePath(item) {\n  return item.catalogue || `data/bisses/${item.id}/catalogue.json`;\n}\n\nfunction segmentsPath(item) {\n  return item.segments || `data/bisses/${item.id}/segments.geojson`;\n}\n\nasync function loadBisse(item) {\n  if (state.cache.has(item.id)) return state.cache.get(item.id);\n\n  const [catalogue, geojson] = await Promise.all([\n    loadJson(cataloguePath(item)),\n    loadJson(segmentsPath(item))\n  ]);\n\n  const data = { item, catalogue, geojson };\n  state.cache.set(item.id, data);\n  return data;\n}\n\nfunction normalizeStructureType(value) {\n  const raw = String(value || "")\n    .trim()\n    .toLowerCase()\n    .normalize("NFD")\n    .replace(/[\\u0300-\\u036f]/g, "")\n    .replaceAll("-", "_")\n    .replaceAll(" ", "_");\n\n  if (["open", "ciel_ouvert", "a_ciel_ouvert", "à_ciel_ouvert"].includes(raw)) return "open";\n  if (["canalized", "canalise", "canalise_couvert", "canalized_covered"].includes(raw)) return "canalized";\n  if (["abandoned", "abandonne", "abandoned_dry"].includes(raw)) return "abandoned";\n  if (["mixed", "mixte"].includes(raw)) return "mixed";\n  if (["unknown", "non_classe", "non_classee"].includes(raw)) return "unknown";\n\n  return raw || "unknown";\n}\n\nfunction isBicolorFeature(feature) {\n  return String(feature?.properties?.display_mode || "").toLowerCase() === "bicolor";\n}\n\nfunction normalizedStructureTypes(feature) {\n  const p = feature.properties || {};\n  const arr = Array.isArray(p.structure_types) && p.structure_types.length\n    ? p.structure_types\n    : [p.structure_type];\n\n  return arr.map(normalizeStructureType).filter(Boolean);\n}\n\nfunction selectedPhotos(catalogue) {\n  return (catalogue.photos || [])\n    .filter((p) => p.filename_web)\n    .sort((a, b) => Number(a.platform_order || 999999) - Number(b.platform_order || 999999));\n}\n\nfunction categories(catalogue) {\n  const result = {};\n\n  for (const cat of catalogue.segment_categories || []) {\n    const id = normalizeStructureType(cat.id);\n    result[id] = {\n      ...cat,\n      id,\n      name: cat.name || cat.label || FALLBACK_CATEGORIES[id]?.name || id,\n      color: cat.color || FALLBACK_CATEGORIES[id]?.color || "#777777"\n    };\n  }\n\n  return result;\n}\n\nfunction categoryForType(type, cats) {\n  const norm = normalizeStructureType(type);\n  return cats[norm] || FALLBACK_CATEGORIES[norm] || { id: norm, name: norm, color: "#777777" };\n}\n\nfunction categoryFor(feature, cats) {\n  const type = normalizeStructureType(feature?.properties?.structure_type);\n  return categoryForType(type, cats);\n}\n\nfunction bicolorColors(feature, cats) {\n  const p = feature.properties || {};\n  const explicit = Array.isArray(p.bicolor_colors) ? p.bicolor_colors.filter(Boolean) : [];\n\n  if (explicit.length >= 2) {\n    return [explicit[0], explicit[1]];\n  }\n\n  const types = normalizedStructureTypes(feature);\n  const c1 = categoryForType(types[0], cats).color || "#777777";\n  const c2 = categoryForType(types[1], cats).color || "#333333";\n  return [c1, c2];\n}\n\nfunction segmentDisplayName(feature, cats) {\n  if (isBicolorFeature(feature)) {\n    const names = normalizedStructureTypes(feature)\n      .map((t) => categoryForType(t, cats).name)\n      .filter(Boolean);\n    return names.length ? names.join(" + ") : "Segment mixte";\n  }\n\n  return categoryFor(feature, cats).name || "Segment";\n}\n\nfunction featureCoords(feature) {\n  const g = feature.geometry || {};\n  if (g.type === "LineString") return g.coordinates || [];\n  if (g.type === "MultiLineString") return (g.coordinates || []).flat();\n  return [];\n}\n\nfunction latlngPartsFromGeometry(geometry) {\n  if (!geometry) return [];\n\n  if (geometry.type === "LineString") {\n    return [(geometry.coordinates || []).map((c) => [c[1], c[0]])];\n  }\n\n  if (geometry.type === "MultiLineString") {\n    return (geometry.coordinates || []).map((line) => line.map((c) => [c[1], c[0]]));\n  }\n\n  return [];\n}\n\nfunction approximateLineLength(coords) {\n  let length = 0;\n\n  for (let i = 1; i < coords.length; i += 1) {\n    const a = coords[i - 1];\n    const b = coords[i];\n    if (!Array.isArray(a) || !Array.isArray(b) || a.length < 2 || b.length < 2) continue;\n\n    const latMean = ((a[1] + b[1]) / 2) * Math.PI / 180;\n    const dx = (b[0] - a[0]) * Math.cos(latMean);\n    const dy = b[1] - a[1];\n    length += Math.sqrt((dx * dx) + (dy * dy));\n  }\n\n  return length;\n}\n\nfunction approximateFeatureLength(feature) {\n  const g = feature.geometry || {};\n  if (g.type === "LineString") return approximateLineLength(g.coordinates || []);\n  if (g.type === "MultiLineString") {\n    return (g.coordinates || []).reduce((sum, line) => sum + approximateLineLength(line), 0);\n  }\n  return 0;\n}\n\nfunction dominantCategoryForData(data) {\n  const cats = categories(data.catalogue);\n  const totals = { open: 0, canalized: 0, abandoned: 0, mixed: 0, unknown: 0 };\n\n  for (const feature of data.geojson.features || []) {\n    const len = approximateFeatureLength(feature) || 1;\n\n    if (isBicolorFeature(feature)) {\n      const types = normalizedStructureTypes(feature);\n      if (!types.length) {\n        totals.mixed += len;\n      } else {\n        const share = len / types.length;\n        for (const type of types) {\n          const norm = normalizeStructureType(type);\n          totals[norm] = (totals[norm] || 0) + share;\n        }\n      }\n    } else {\n      const type = normalizeStructureType(feature?.properties?.structure_type);\n      totals[type] = (totals[type] || 0) + len;\n    }\n  }\n\n  const priority = ["open", "canalized", "abandoned", "mixed", "unknown"];\n  let bestType = "unknown";\n  let bestValue = -1;\n\n  for (const type of priority) {\n    const value = totals[type] || 0;\n    if (value > bestValue) {\n      bestType = type;\n      bestValue = value;\n    }\n  }\n\n  return categoryForType(bestType, cats);\n}\n\nfunction geoBounds(geojson) {\n  const b = L.latLngBounds();\n\n  for (const feature of geojson.features || []) {\n    for (const c of featureCoords(feature)) {\n      if (Array.isArray(c) && c.length >= 2) {\n        b.extend([c[1], c[0]]);\n      }\n    }\n  }\n\n  return b;\n}\n\nfunction boundsWithPhotos(bounds, photos) {\n  for (const p of photos || []) {\n    if (isNum(p.lat) && isNum(p.lon)) {\n      bounds.extend([p.lat, p.lon]);\n    }\n  }\n\n  return bounds;\n}\n\nfunction mappablePhotos(catalogue) {\n  return selectedPhotos(catalogue).filter((p) => isNum(p.lat) && isNum(p.lon));\n}\n\nfunction interpolateLinePoint(coords, fraction = 0.5) {\n  if (!coords.length) return null;\n  if (coords.length === 1) return L.latLng(coords[0][1], coords[0][0]);\n\n  const total = approximateLineLength(coords);\n  if (!total) {\n    const first = coords[0];\n    return L.latLng(first[1], first[0]);\n  }\n\n  const target = total * fraction;\n  let passed = 0;\n\n  for (let i = 1; i < coords.length; i += 1) {\n    const a = coords[i - 1];\n    const b = coords[i];\n    const length = approximateLineLength([a, b]);\n\n    if (!length) continue;\n\n    if (passed + length >= target) {\n      const ratio = (target - passed) / length;\n      const lon = a[0] + ((b[0] - a[0]) * ratio);\n      const lat = a[1] + ((b[1] - a[1]) * ratio);\n      return L.latLng(lat, lon);\n    }\n\n    passed += length;\n  }\n\n  const last = coords[coords.length - 1];\n  return L.latLng(last[1], last[0]);\n}\n\nfunction representativePointForBisse(geojson) {\n  let bestLine = null;\n  let bestLength = -1;\n\n  for (const feature of geojson.features || []) {\n    const geometry = feature.geometry || {};\n    const lines = geometry.type === "LineString"\n      ? [geometry.coordinates || []]\n      : (geometry.type === "MultiLineString" ? (geometry.coordinates || []) : []);\n\n    for (const line of lines) {\n      const length = approximateLineLength(line);\n      if (length > bestLength) {\n        bestLength = length;\n        bestLine = line;\n      }\n    }\n  }\n\n  const point = bestLine ? interpolateLinePoint(bestLine, 0.52) : null;\n  if (point) return point;\n\n  const b = geoBounds(geojson);\n  return b.isValid() ? b.getCenter() : null;\n}\n\nfunction bisseActionChipPoint(geojson) {\n  const b = geoBounds(geojson);\n  if (b.isValid()) {\n    const size = map.getSize();\n    const nw = map.latLngToContainerPoint(b.getNorthWest());\n    const ne = map.latLngToContainerPoint(b.getNorthEast());\n\n    const x = Math.max(52, Math.min(size.x - 52, (nw.x + ne.x) / 2));\n    const y = Math.max(76, Math.min(size.y - 80, nw.y - 6));\n\n    return map.containerPointToLatLng(L.point(x, y));\n  }\n\n  return representativePointForBisse(geojson);\n}\n\nfunction selectedBisseTitle(data) {\n  const info = data.catalogue.bisse_info || {};\n  return info.title || data.item.title || "Bisse";\n}\n\nfunction removeBisseActionChip() {\n  if (state.bisseActionMarker) {\n    map.removeLayer(state.bisseActionMarker);\n    state.bisseActionMarker = null;\n  }\n}\n\nfunction bisseActionChipHtml(data) {\n  const title = selectedBisseTitle(data);\n  const count = mappablePhotos(data.catalogue).length;\n  const photoButton = count ? `\n    <button class="bisse-action-button ${state.photoMarkersVisible ? "is-active" : ""}" type="button" data-action="toggle-photos">\n      ${state.photoMarkersVisible ? "Masquer photos" : `Photos · ${count}`}\n    </button>\n  ` : "";\n\n  return `\n    <div class="bisse-action-chip">\n      <span class="bisse-action-title">${escapeHtml(title)}</span>\n      ${photoButton}\n    </div>\n  `;\n}\n\nfunction bindBisseActionChipEvents() {\n  if (!state.bisseActionMarker) return;\n\n  const el = state.bisseActionMarker.getElement();\n  if (!el) return;\n\n  L.DomEvent.disableClickPropagation(el);\n  L.DomEvent.disableScrollPropagation(el);\n\n  const button = el.querySelector(\'[data-action="toggle-photos"]\');\n  if (!button) return;\n\n  button.addEventListener("click", (event) => {\n    event.preventDefault();\n    event.stopPropagation();\n    clearLeafletFocus();\n    toggleSelectedPhotos();\n  });\n}\n\nfunction showBisseActionChip(data) {\n  removeBisseActionChip();\n\n  const point = bisseActionChipPoint(data.geojson);\n  if (!point) return;\n\n  state.bisseActionMarker = L.marker(point, {\n    interactive: true,\n    keyboard: false,\n    zIndexOffset: 1200,\n    icon: L.divIcon({\n      className: "",\n      html: bisseActionChipHtml(data),\n      iconSize: [1, 1],\n      iconAnchor: [0, 0]\n    })\n  }).addTo(map);\n\n  window.setTimeout(bindBisseActionChipEvents, 0);\n}\n\nfunction refreshBisseActionChip() {\n  if (state.selectedData) {\n    showBisseActionChip(state.selectedData);\n  }\n}\n\nfunction setSelectedPhotosVisible(visible) {\n  if (!state.selectedData) return;\n\n  state.photoMarkersVisible = Boolean(visible) && roundedZoom() >= SHOW_SYNTHETIC_TRACES_AT_ZOOM;\n  state.photoLayer.clearLayers();\n  map.closePopup();\n\n  if (state.photoMarkersVisible) {\n    renderPhotos(state.selectedData);\n  }\n\n  refreshBisseActionChip();\n}\n\nfunction toggleSelectedPhotos() {\n  setSelectedPhotosVisible(!state.photoMarkersVisible);\n}\n\nfunction clearSelectedBisseMapControls() {\n  state.selectedData = null;\n  state.photoMarkersVisible = false;\n  state.photoLayer.clearLayers();\n  removeBisseActionChip();\n}\n\nfunction fitBisseData(data) {\n  const b = boundsWithPhotos(geoBounds(data.geojson), selectedPhotos(data.catalogue));\n  if (!b.isValid()) return;\n\n  map.invalidateSize({ pan: false });\n  map.fitBounds(b, {\n    paddingTopLeft: [80, 90],\n    paddingBottomRight: [80, 90],\n    maxZoom: MAX_ZOOM\n  });\n}\n\nfunction fitBisseDataAfterPanel(data) {\n  // Le panneau droit redimensionne la zone de carte avec une transition CSS.\n  // On attend donc la fin du mouvement avant de cadrer le bisse entier.\n  window.setTimeout(() => fitBisseData(data), 300);\n  window.setTimeout(() => fitBisseData(data), 560);\n}\n\nfunction refreshMarkerVisibility() {\n  const tracesMode = roundedZoom() >= SHOW_SYNTHETIC_TRACES_AT_ZOOM;\n  const mapEl = $("map");\n\n  if (tracesMode) {\n    mapEl.classList.add("segments-mode");\n    if (map.hasLayer(state.bisseMarkers)) {\n      map.removeLayer(state.bisseMarkers);\n    }\n  } else {\n    mapEl.classList.remove("segments-mode");\n    if (state.photoMarkersVisible) {\n      state.photoMarkersVisible = false;\n      state.photoLayer.clearLayers();\n      refreshBisseActionChip();\n    } else {\n      state.photoLayer.clearLayers();\n    }\n    if (!map.hasLayer(state.bisseMarkers)) {\n      state.bisseMarkers.addTo(map);\n    }\n  }\n\n  refreshLegendVisibility();\n}\n\nfunction removeVisibleSegments() {\n  if (state.segmentOutlineLayer) {\n    map.removeLayer(state.segmentOutlineLayer);\n    state.segmentOutlineLayer = null;\n  }\n\n  if (state.segmentColorLayer) {\n    map.removeLayer(state.segmentColorLayer);\n    state.segmentColorLayer = null;\n  }\n}\n\nfunction buildSyntheticFeatureCollection(dataList) {\n  const features = [];\n\n  for (const data of dataList) {\n    const dominant = dominantCategoryForData(data);\n    const info = data.catalogue.bisse_info || {};\n    const bisseTitle = info.title || data.item.title || "Bisse";\n\n    for (const feature of data.geojson.features || []) {\n      const cloned = JSON.parse(JSON.stringify(feature));\n      cloned.properties = cloned.properties || {};\n      cloned.properties.__display_mode = "synthetic";\n      cloned.properties.__bisse_id = data.item.id;\n      cloned.properties.__bisse_title = bisseTitle;\n      cloned.properties.__category_name = dominant.name || "Tracé synthétique";\n      cloned.properties.__category_color = dominant.color || "#1e88e5";\n      features.push(cloned);\n    }\n  }\n\n  return { type: "FeatureCollection", features };\n}\n\nfunction buildDetailedFeatureCollection(dataList) {\n  const features = [];\n\n  for (const data of dataList) {\n    const cats = categories(data.catalogue);\n    const dominant = dominantCategoryForData(data);\n    const info = data.catalogue.bisse_info || {};\n    const bisseTitle = info.title || data.item.title || "Bisse";\n\n    for (const feature of data.geojson.features || []) {\n      const cloned = JSON.parse(JSON.stringify(feature));\n      cloned.properties = cloned.properties || {};\n      cloned.properties.structure_type = normalizeStructureType(cloned.properties.structure_type);\n      cloned.properties.__bisse_id = data.item.id;\n      cloned.properties.__bisse_title = bisseTitle;\n      cloned.properties.__category_name = segmentDisplayName(cloned, cats);\n\n      if (isBicolorFeature(cloned)) {\n        const bstyle = bicolorStyleForZoom();\n\n        if (bstyle.mode === "split") {\n          cloned.properties.__display_mode = "bicolor";\n          cloned.properties.__bicolor_colors = bicolorColors(cloned, cats);\n        } else {\n          cloned.properties.__display_mode = "single";\n          cloned.properties.__category_color = BICOLOR_SIMPLIFIED_COLOR;\n        }\n      } else {\n        const cat = categoryFor(cloned, cats);\n        cloned.properties.__display_mode = "single";\n        cloned.properties.__category_color = cat.color;\n      }\n\n      features.push(cloned);\n    }\n  }\n\n  return { type: "FeatureCollection", features };\n}\n\nfunction coordinateKey(coord) {\n  if (!Array.isArray(coord) || coord.length < 2) return "";\n  return `${Number(coord[0]).toFixed(7)}:${Number(coord[1]).toFixed(7)}`;\n}\n\nfunction displayStyleForFeature(feature) {\n  const properties = feature.properties || {};\n  const name = properties.__category_name || "Segment";\n\n  if (properties.__display_mode === "bicolor") {\n    const colors = Array.isArray(properties.__bicolor_colors)\n      ? properties.__bicolor_colors.slice(0, 2)\n      : ["#ef6c00", "#111111"];\n\n    return {\n      key: `bicolor:${colors.join("|")}:${name}`,\n      mode: "bicolor",\n      colors,\n      color: null,\n      name,\n      protected: true\n    };\n  }\n\n  const color = properties.__category_color || "#777777";\n  return {\n    key: `single:${color}:${name}`,\n    mode: "single",\n    colors: null,\n    color,\n    name,\n    protected: false\n  };\n}\n\nfunction applyDisplayStyle(properties, style) {\n  properties.__display_mode = style.mode;\n  properties.__category_name = style.name;\n\n  if (style.mode === "bicolor") {\n    properties.__bicolor_colors = style.colors.slice();\n    delete properties.__category_color;\n  } else {\n    properties.__category_color = style.color;\n    delete properties.__bicolor_colors;\n  }\n}\n\nfunction displayRecordOrder(feature, featureIndex, partIndex) {\n  const raw = Number(feature?.properties?.order);\n  const order = Number.isFinite(raw) ? raw : featureIndex;\n  return (order * 1000) + partIndex;\n}\n\nfunction makeDisplayPartRecord(feature, coordinates, featureIndex, partIndex) {\n  if (!Array.isArray(coordinates) || coordinates.length < 2) return null;\n\n  const clonedCoordinates = coordinates.map((coord) => coord.slice());\n  const properties = { ...(feature.properties || {}) };\n\n  return {\n    feature,\n    properties,\n    coordinates: clonedCoordinates,\n    startKey: coordinateKey(clonedCoordinates[0]),\n    endKey: coordinateKey(clonedCoordinates[clonedCoordinates.length - 1]),\n    style: displayStyleForFeature(feature),\n    order: displayRecordOrder(feature, featureIndex, partIndex),\n    sourceCount: 1,\n    generalized: false\n  };\n}\n\nfunction displayPartRecords(featureCollection) {\n  const byBisse = new Map();\n\n  (featureCollection.features || []).forEach((feature, featureIndex) => {\n    const geometry = feature.geometry || {};\n    const parts = geometry.type === "LineString"\n      ? [geometry.coordinates || []]\n      : (geometry.type === "MultiLineString" ? (geometry.coordinates || []) : []);\n    const bisseId = feature.properties?.__bisse_id || `__feature_${featureIndex}`;\n\n    if (!byBisse.has(bisseId)) byBisse.set(bisseId, []);\n\n    parts.forEach((coordinates, partIndex) => {\n      const record = makeDisplayPartRecord(feature, coordinates, featureIndex, partIndex);\n      if (record) byBisse.get(bisseId).push(record);\n    });\n  });\n\n  for (const records of byBisse.values()) {\n    records.sort((a, b) => a.order - b.order);\n  }\n\n  return byBisse;\n}\n\nfunction reverseDisplayRecord(record) {\n  const coordinates = record.coordinates.slice().reverse();\n  return {\n    ...record,\n    coordinates,\n    startKey: coordinateKey(coordinates[0]),\n    endKey: coordinateKey(coordinates[coordinates.length - 1])\n  };\n}\n\nfunction buildConnectedDisplayChains(featureCollection) {\n  const chains = [];\n  const byBisse = displayPartRecords(featureCollection);\n\n  for (const [bisseId, sourceRecords] of byBisse.entries()) {\n    const remaining = sourceRecords.slice();\n\n    while (remaining.length) {\n      const chain = [remaining.shift()];\n      let changed = true;\n\n      while (changed) {\n        changed = false;\n        const chainStart = chain[0].startKey;\n        const chainEnd = chain[chain.length - 1].endKey;\n\n        for (let index = 0; index < remaining.length; index += 1) {\n          const candidate = remaining[index];\n\n          if (chainEnd === candidate.startKey) {\n            chain.push(candidate);\n          } else if (chainEnd === candidate.endKey) {\n            chain.push(reverseDisplayRecord(candidate));\n          } else if (chainStart === candidate.endKey) {\n            chain.unshift(candidate);\n          } else if (chainStart === candidate.startKey) {\n            chain.unshift(reverseDisplayRecord(candidate));\n          } else {\n            continue;\n          }\n\n          remaining.splice(index, 1);\n          changed = true;\n          break;\n        }\n      }\n\n      chains.push({ bisseId, records: chain });\n    }\n  }\n\n  return chains;\n}\n\nfunction mergeRunCoordinates(left, right) {\n  if (coordinateKey(left[left.length - 1]) === coordinateKey(right[0])) {\n    return left.concat(right.slice(1));\n  }\n  return left.concat(right);\n}\n\nfunction mergeTwoDisplayRuns(left, right) {\n  return {\n    ...left,\n    coordinates: mergeRunCoordinates(left.coordinates, right.coordinates),\n    sourceCount: left.sourceCount + right.sourceCount,\n    generalized: left.generalized || right.generalized\n  };\n}\n\nfunction mergeAdjacentDisplayRuns(runs) {\n  const merged = [];\n\n  for (const run of runs) {\n    const previous = merged[merged.length - 1];\n\n    if (previous && previous.style.key === run.style.key) {\n      merged[merged.length - 1] = mergeTwoDisplayRuns(previous, run);\n    } else {\n      merged.push({\n        ...run,\n        coordinates: run.coordinates.map((coord) => coord.slice()),\n        style: { ...run.style, colors: run.style.colors ? run.style.colors.slice() : null }\n      });\n    }\n  }\n\n  return merged;\n}\n\nfunction buildDisplayColorRuns(records) {\n  const runs = records.map((record) => ({\n    properties: { ...record.properties },\n    coordinates: record.coordinates.map((coord) => coord.slice()),\n    style: { ...record.style, colors: record.style.colors ? record.style.colors.slice() : null },\n    sourceCount: record.sourceCount,\n    generalized: record.generalized\n  }));\n\n  return mergeAdjacentDisplayRuns(runs);\n}\n\nfunction snapAdjacentDisplayRunBoundaries(runs) {\n  for (let index = 0; index < runs.length - 1; index += 1) {\n    const leftCoordinates = runs[index].coordinates || [];\n    const rightCoordinates = runs[index + 1].coordinates || [];\n    if (!leftCoordinates.length || !rightCoordinates.length) continue;\n\n    const leftEnd = leftCoordinates[leftCoordinates.length - 1];\n    const rightStart = rightCoordinates[0];\n    if (coordinateKey(leftEnd) !== coordinateKey(rightStart)) continue;\n\n    // Les chaînes tolèrent volontairement de minuscules différences de\n    // coordonnées (clé arrondie à 7 décimales). À très fort zoom, ces écarts\n    // suffisent toutefois à décentrer les deux caps de plusieurs pixels.\n    // Le rendu utilise donc leur milieu exact, sans modifier le GeoJSON source.\n    const shared = leftEnd.slice();\n    shared[0] = (Number(leftEnd[0]) + Number(rightStart[0])) / 2;\n    shared[1] = (Number(leftEnd[1]) + Number(rightStart[1])) / 2;\n\n    if (leftEnd.length > 2 && rightStart.length > 2) {\n      const leftElevation = Number(leftEnd[2]);\n      const rightElevation = Number(rightStart[2]);\n      if (Number.isFinite(leftElevation) && Number.isFinite(rightElevation)) {\n        shared[2] = (leftElevation + rightElevation) / 2;\n      }\n    }\n\n    leftCoordinates[leftCoordinates.length - 1] = shared.slice();\n    rightCoordinates[0] = shared.slice();\n  }\n\n  return runs;\n}\n\nfunction displayRunPixelLength(run) {\n  let length = 0;\n  const coordinates = run.coordinates || [];\n\n  for (let index = 1; index < coordinates.length; index += 1) {\n    const a = coordinates[index - 1];\n    const b = coordinates[index];\n    const pointA = map.latLngToLayerPoint([a[1], a[0]]);\n    const pointB = map.latLngToLayerPoint([b[1], b[0]]);\n    length += pointA.distanceTo(pointB);\n  }\n\n  return length;\n}\n\nfunction availableGeneralizationNeighbor(runs, index) {\n  if (index < 0 || index >= runs.length) return null;\n  return runs[index].style.protected ? null : runs[index];\n}\n\nfunction generalizationThreshold(runs, index) {\n  const run = runs[index];\n  if (!run || run.style.protected) return 0;\n\n  const left = availableGeneralizationNeighbor(runs, index - 1);\n  const right = availableGeneralizationNeighbor(runs, index + 1);\n  if (!left && !right) return 0;\n\n  if (left && right && left.style.key === right.style.key) {\n    return SAME_NEIGHBORS_MAX_PX;\n  }\n\n  return DIFFERENT_NEIGHBORS_MAX_PX;\n}\n\nfunction generalizationTargetIndex(runs, index) {\n  const left = availableGeneralizationNeighbor(runs, index - 1);\n  const right = availableGeneralizationNeighbor(runs, index + 1);\n\n  if (left && right && left.style.key === right.style.key) return index - 1;\n  if (left && !right) return index - 1;\n  if (!left && right) return index + 1;\n  if (!left && !right) return -1;\n\n  const leftLength = displayRunPixelLength(left);\n  const rightLength = displayRunPixelLength(right);\n  return leftLength >= rightLength ? index - 1 : index + 1;\n}\n\nfunction copyRunDisplayStyle(run, target) {\n  return {\n    ...run,\n    style: {\n      ...target.style,\n      colors: target.style.colors ? target.style.colors.slice() : null\n    },\n    generalized: true\n  };\n}\n\nfunction generalizeDisplayRuns(sourceRuns, zoom) {\n  let runs = mergeAdjacentDisplayRuns(sourceRuns);\n\n  if (!ENABLE_SEGMENT_GENERALIZATION || zoom >= SHOW_EXACT_SEGMENT_DETAIL_AT_ZOOM) {\n    return runs;\n  }\n\n  let guard = 0;\n\n  while (guard < 1000) {\n    guard += 1;\n    let candidateIndex = -1;\n    let candidateRatio = Number.POSITIVE_INFINITY;\n\n    for (let index = 0; index < runs.length; index += 1) {\n      const threshold = generalizationThreshold(runs, index);\n      if (!threshold) continue;\n\n      const length = displayRunPixelLength(runs[index]);\n      if (length > threshold) continue;\n\n      const ratio = length / threshold;\n      if (ratio < candidateRatio) {\n        candidateRatio = ratio;\n        candidateIndex = index;\n      }\n    }\n\n    if (candidateIndex < 0) break;\n\n    const targetIndex = generalizationTargetIndex(runs, candidateIndex);\n    if (targetIndex < 0) break;\n\n    runs[candidateIndex] = copyRunDisplayStyle(runs[candidateIndex], runs[targetIndex]);\n    runs = mergeAdjacentDisplayRuns(runs);\n  }\n\n  return runs;\n}\n\nfunction displayRunFeature(run, chainId, runIndex) {\n  const properties = {\n    ...run.properties,\n    __display_chain_id: chainId,\n    __display_run_index: runIndex,\n    __source_feature_count: run.sourceCount,\n    __generalized: Boolean(run.generalized)\n  };\n\n  applyDisplayStyle(properties, run.style);\n\n  return {\n    type: "Feature",\n    properties,\n    geometry: {\n      type: "LineString",\n      coordinates: run.coordinates.map((coord) => coord.slice())\n    }\n  };\n}\n\nfunction buildGeneralizedDisplayFeatureCollection(featureCollection, allowAbsorption) {\n  const features = [];\n  const zoom = allowAbsorption ? roundedZoom() : SHOW_EXACT_SEGMENT_DETAIL_AT_ZOOM;\n  const chains = buildConnectedDisplayChains(featureCollection);\n\n  chains.forEach((chain, chainIndex) => {\n    const chainId = `${chain.bisseId}:${chainIndex}`;\n    const colorRuns = buildDisplayColorRuns(chain.records);\n    const displayRuns = snapAdjacentDisplayRunBoundaries(\n      generalizeDisplayRuns(colorRuns, zoom)\n    );\n\n    displayRuns.forEach((run, runIndex) => {\n      features.push(displayRunFeature(run, chainId, runIndex));\n    });\n  });\n\n  return { type: "FeatureCollection", features };\n}\n\nfunction pointVector(from, to) {\n  return { x: to.x - from.x, y: to.y - from.y };\n}\n\nfunction vectorLength(vector) {\n  return Math.hypot(vector.x, vector.y);\n}\n\nfunction normalizedVector(vector) {\n  const length = vectorLength(vector);\n  if (length < 1e-6) return null;\n  return { x: vector.x / length, y: vector.y / length };\n}\n\nfunction sampledPointAwayFromEndpoint(latlngs, fromStart, targetDistance) {\n  if (!Array.isArray(latlngs) || latlngs.length < 2) return null;\n\n  let index = fromStart ? 0 : latlngs.length - 1;\n  const step = fromStart ? 1 : -1;\n  let current = map.latLngToLayerPoint(latlngs[index]);\n  let remaining = targetDistance;\n\n  while (index + step >= 0 && index + step < latlngs.length) {\n    const next = map.latLngToLayerPoint(latlngs[index + step]);\n    const segment = pointVector(current, next);\n    const length = vectorLength(segment);\n\n    if (length >= 1e-6) {\n      if (length >= remaining) {\n        const ratio = remaining / length;\n        return L.point(\n          current.x + (segment.x * ratio),\n          current.y + (segment.y * ratio)\n        );\n      }\n      remaining -= length;\n    }\n\n    index += step;\n    current = next;\n  }\n\n  return current;\n}\n\nfunction sharedTransitionTangent(leftLatLngs, rightLatLngs) {\n  if (leftLatLngs.length < 2 || rightLatLngs.length < 2) return null;\n\n  const boundary = map.latLngToLayerPoint(leftLatLngs[leftLatLngs.length - 1]);\n  const before = sampledPointAwayFromEndpoint(\n    leftLatLngs,\n    false,\n    TRANSITION_TANGENT_SAMPLE_PX\n  );\n  const after = sampledPointAwayFromEndpoint(\n    rightLatLngs,\n    true,\n    TRANSITION_TANGENT_SAMPLE_PX\n  );\n  if (!before || !after) return null;\n\n  const incoming = normalizedVector(pointVector(before, boundary));\n  const outgoing = normalizedVector(pointVector(boundary, after));\n  if (!incoming && !outgoing) return null;\n  if (!incoming) return outgoing;\n  if (!outgoing) return incoming;\n\n  // La bisse change de direction au point de transition : la somme des deux\n  // directions donne la tangente de la bisse au niveau de l\'angle (bissectrice).\n  const bisector = normalizedVector({\n    x: incoming.x + outgoing.x,\n    y: incoming.y + outgoing.y\n  });\n\n  // Repli sûr pour un demi-tour presque parfait, où la bissectrice est indéfinie.\n  return bisector || incoming;\n}\n\nfunction buildTransitionPatchRecords(featureCollection) {\n  const byChain = new Map();\n  const records = [];\n\n  for (const feature of featureCollection.features || []) {\n    const geometry = feature.geometry || {};\n    const coordinates = geometry.type === "LineString" ? (geometry.coordinates || []) : [];\n    if (coordinates.length < 2) continue;\n\n    const latlngs = coordinates.map((coord) => L.latLng(coord[1], coord[0]));\n    const record = {\n      feature,\n      latlngs,\n      startKey: coordinateKey(coordinates[0]),\n      endKey: coordinateKey(coordinates[coordinates.length - 1])\n    };\n\n    const chainId = feature.properties.__display_chain_id\n      || `${feature.properties.__bisse_id || "bisse"}:${byChain.size}`;\n    if (!byChain.has(chainId)) byChain.set(chainId, []);\n    byChain.get(chainId).push(record);\n  }\n\n  for (const chainRecords of byChain.values()) {\n    chainRecords.sort((a, b) => (\n      Number(a.feature.properties.__display_run_index || 0)\n      - Number(b.feature.properties.__display_run_index || 0)\n    ));\n\n    for (let index = 0; index < chainRecords.length - 1; index += 1) {\n      const previous = chainRecords[index];\n      const next = chainRecords[index + 1];\n      if (previous.endKey !== next.startKey) continue;\n\n      const tangent = sharedTransitionTangent(previous.latlngs, next.latlngs);\n      if (!tangent) continue;\n\n      records.push({\n        center: map.latLngToLayerPoint(previous.latlngs[previous.latlngs.length - 1]),\n        tangent,\n        previousFeature: previous.feature,\n        nextFeature: next.feature\n      });\n    }\n  }\n\n  return records;\n}\n\nfunction bindSegmentInteraction(layer, feature) {\n  const title = feature.properties.__bisse_title || "Bisse";\n  const baseType = feature.properties.__category_name || "Segment";\n  const type = feature.properties.__generalized\n    ? `${baseType} (vue simplifiée)`\n    : baseType;\n\n  layer.bindTooltip(`${escapeHtml(title)} — ${escapeHtml(type)}`, {\n    className: "segment-tooltip",\n    sticky: true\n  });\n\n  // Clic sur n’importe quelle trace visible = même action qu’une pastille :\n  // ouvrir la fiche du bisse dans le panneau droit et recadrer le bisse entier.\n  layer.on("click", () => {\n    clearLeafletFocus();\n\n    const id = feature.properties.__bisse_id;\n    if (id) {\n      map.closePopup();\n      selectBisse(id, { fit: true });\n    }\n  });\n}\n\nfunction addHaloForPart(layerGroup, latlngs, style) {\n  if (!latlngs.length) return;\n\n  L.polyline(latlngs, {\n    pane: "segmentOutlinePane",\n    color: "#ffffff",\n    weight: style.outlineWeight,\n    opacity: style.opacity,\n    lineCap: SEGMENT_LINE_CAP,\n    lineJoin: "round",\n    interactive: false\n  }).addTo(layerGroup);\n}\n\nfunction addClickTarget(layerGroup, latlngs, feature, style) {\n  if (!latlngs.length) return;\n\n  const target = L.polyline(latlngs, {\n    pane: "segmentHitPane",\n    color: "#000000",\n    weight: style.clickWeight,\n    opacity: 0,\n    lineCap: HIT_LINE_CAP,\n    lineJoin: "round",\n    interactive: true\n  }).addTo(layerGroup);\n\n  bindSegmentInteraction(target, feature);\n}\n\nfunction continuousHaloCoordinateParts(features) {\n  const parts = [];\n  let current = [];\n\n  const ordered = features.slice().sort((a, b) => (\n    Number(a.properties.__display_run_index || 0) - Number(b.properties.__display_run_index || 0)\n  ));\n\n  for (const feature of ordered) {\n    const geometry = feature.geometry || {};\n    const geometryParts = geometry.type === "LineString"\n      ? [geometry.coordinates || []]\n      : (geometry.type === "MultiLineString" ? (geometry.coordinates || []) : []);\n\n    for (const coordinates of geometryParts) {\n      if (!coordinates.length) continue;\n\n      if (!current.length) {\n        current = coordinates.map((coord) => coord.slice());\n        continue;\n      }\n\n      const currentEnd = coordinateKey(current[current.length - 1]);\n      const partStart = coordinateKey(coordinates[0]);\n      const partEnd = coordinateKey(coordinates[coordinates.length - 1]);\n\n      if (currentEnd === partStart) {\n        current = current.concat(coordinates.slice(1).map((coord) => coord.slice()));\n      } else if (currentEnd === partEnd) {\n        current = current.concat(coordinates.slice().reverse().slice(1).map((coord) => coord.slice()));\n      } else {\n        parts.push(current);\n        current = coordinates.map((coord) => coord.slice());\n      }\n    }\n  }\n\n  if (current.length) parts.push(current);\n  return parts;\n}\n\nfunction addContinuousSegmentHalos(outlineGroup, featureCollection) {\n  const byChain = new Map();\n\n  for (const feature of featureCollection.features || []) {\n    const chainId = feature.properties.__display_chain_id\n      || `${feature.properties.__bisse_id || "bisse"}:${byChain.size}`;\n    if (!byChain.has(chainId)) byChain.set(chainId, []);\n    byChain.get(chainId).push(feature);\n  }\n\n  for (const features of byChain.values()) {\n    const baseStyle = segmentStyleForZoom();\n    const hasBicolor = features.some((feature) => feature.properties.__display_mode === "bicolor");\n    const style = hasBicolor\n      ? { ...baseStyle, outlineWeight: Math.max(baseStyle.outlineWeight, bicolorStyleForZoom().outlineWeight) }\n      : baseStyle;\n\n    for (const coordinates of continuousHaloCoordinateParts(features)) {\n      const latlngs = coordinates.map((coord) => [coord[1], coord[0]]);\n      addHaloForPart(outlineGroup, latlngs, style);\n    }\n  }\n}\n\nfunction addSingleSegment(layerGroup, feature) {\n  const parts = latlngPartsFromGeometry(feature.geometry);\n  const style = segmentStyleForZoom();\n  const color = feature.properties.__category_color || "#777777";\n\n  for (const latlngs of parts) {\n    const line = L.polyline(latlngs, {\n      pane: "segmentColorPane",\n      color,\n      weight: style.colorWeight,\n      opacity: style.opacity,\n      lineCap: SEGMENT_LINE_CAP,\n      lineJoin: "round",\n      interactive: true\n    }).addTo(layerGroup);\n\n    bindSegmentInteraction(line, feature);\n    addClickTarget(layerGroup, latlngs, feature, style);\n  }\n}\n\nfunction addBicolorSegment(layerGroup, feature) {\n  const parts = latlngPartsFromGeometry(feature.geometry);\n  const style = bicolorStyleForZoom();\n  const colors = Array.isArray(feature.properties.__bicolor_colors)\n    ? feature.properties.__bicolor_colors\n    : ["#ef6c00", "#111111"];\n\n  const colorA = colors[0] || "#ef6c00";\n  const colorB = colors[1] || "#111111";\n\n  for (const latlngs of parts) {\n    const left = L.polyline(latlngs, {\n      pane: "segmentColorPane",\n      color: colorA,\n      weight: style.flankWeight,\n      opacity: style.opacity,\n      lineCap: SEGMENT_LINE_CAP,\n      lineJoin: "round",\n      offset: -style.offset,\n      interactive: true\n    }).addTo(layerGroup);\n\n    const right = L.polyline(latlngs, {\n      pane: "segmentColorPane",\n      color: colorB,\n      weight: style.flankWeight,\n      opacity: style.opacity,\n      lineCap: SEGMENT_LINE_CAP,\n      lineJoin: "round",\n      offset: style.offset,\n      interactive: true\n    }).addTo(layerGroup);\n\n    bindSegmentInteraction(left, feature);\n    bindSegmentInteraction(right, feature);\n    addClickTarget(layerGroup, latlngs, feature, style);\n  }\n}\n\nfunction circlePolygon(radius) {\n  const points = [];\n  for (let index = 0; index < TRANSITION_PATCH_ARC_STEPS; index += 1) {\n    const angle = (index / TRANSITION_PATCH_ARC_STEPS) * Math.PI * 2;\n    points.push({ x: Math.cos(angle) * radius, y: Math.sin(angle) * radius });\n  }\n  return points;\n}\n\nfunction clipPolygonOnAxis(points, axis, limit, keepLess) {\n  if (!points.length) return [];\n  const clipped = [];\n\n  function signedDistance(point) {\n    return keepLess ? point[axis] - limit : limit - point[axis];\n  }\n\n  for (let index = 0; index < points.length; index += 1) {\n    const current = points[index];\n    const previous = points[(index + points.length - 1) % points.length];\n    const currentDistance = signedDistance(current);\n    const previousDistance = signedDistance(previous);\n    const currentInside = currentDistance <= 0;\n    const previousInside = previousDistance <= 0;\n\n    if (currentInside !== previousInside) {\n      const ratio = previousDistance / (previousDistance - currentDistance);\n      clipped.push({\n        x: previous.x + ((current.x - previous.x) * ratio),\n        y: previous.y + ((current.y - previous.y) * ratio)\n      });\n    }\n\n    if (currentInside) clipped.push(current);\n  }\n\n  return clipped;\n}\n\nfunction patchStyleForFeature(feature) {\n  if (feature.properties.__display_mode === "bicolor") {\n    const colors = Array.isArray(feature.properties.__bicolor_colors)\n      ? feature.properties.__bicolor_colors.slice(0, 2)\n      : ["#ef6c00", "#111111"];\n    return {\n      mode: "bicolor",\n      colors: [colors[0] || "#ef6c00", colors[1] || "#111111"]\n    };\n  }\n\n  return {\n    mode: "single",\n    colors: [feature.properties.__category_color || "#777777"]\n  };\n}\n\nfunction transitionPatchRadius(record) {\n  const baseStyle = segmentStyleForZoom();\n  const hasBicolor = (\n    record.previousFeature.properties.__display_mode === "bicolor"\n    || record.nextFeature.properties.__display_mode === "bicolor"\n  );\n  if (!hasBicolor) {\n    return (baseStyle.colorWeight / 2) + TRANSITION_PATCH_OVERSCAN_PX;\n  }\n\n  const splitStyle = bicolorStyleForZoom();\n  return Math.max(\n    baseStyle.colorWeight / 2,\n    (splitStyle.flankWeight / 2) + splitStyle.offset\n  ) + TRANSITION_PATCH_OVERSCAN_PX;\n}\n\nfunction localPatchPointToLatLng(record, point) {\n  const normal = { x: -record.tangent.y, y: record.tangent.x };\n  return map.layerPointToLatLng(L.point(\n    record.center.x + (record.tangent.x * point.x) + (normal.x * point.y),\n    record.center.y + (record.tangent.y * point.x) + (normal.y * point.y)\n  ));\n}\n\nfunction addTransitionPatchPolygon(layerGroup, record, localPoints, color, opacity) {\n  if (localPoints.length < 3) return;\n  L.polygon(localPoints.map((point) => localPatchPointToLatLng(record, point)), {\n    pane: "segmentColorPane",\n    stroke: false,\n    fill: true,\n    fillColor: color,\n    fillOpacity: opacity,\n    interactive: false,\n    smoothFactor: 0\n  }).addTo(layerGroup);\n}\n\nfunction addStyledTransitionHalf(layerGroup, record, localPoints, feature, opacity) {\n  const style = patchStyleForFeature(feature);\n\n  if (style.mode === "single") {\n    addTransitionPatchPolygon(layerGroup, record, localPoints, style.colors[0], opacity);\n    return;\n  }\n\n  // PolylineOffset place l\'offset négatif du côté -normale : on reproduit\n  // donc exactement la répartition longitudinale des deux couleurs.\n  const colorAHalf = clipPolygonOnAxis(\n    localPoints,\n    "y",\n    TRANSITION_PATCH_OVERLAP_PX,\n    true\n  );\n  const colorBHalf = clipPolygonOnAxis(\n    localPoints,\n    "y",\n    -TRANSITION_PATCH_OVERLAP_PX,\n    false\n  );\n  addTransitionPatchPolygon(layerGroup, record, colorAHalf, style.colors[0], opacity);\n  addTransitionPatchPolygon(layerGroup, record, colorBHalf, style.colors[1], opacity);\n}\n\nfunction addStraightTransitionPatch(layerGroup, record) {\n  const baseStyle = segmentStyleForZoom();\n  const radius = transitionPatchRadius(record);\n  const disc = circlePolygon(radius);\n\n  // Efface d\'abord les caps colorés superposés avec la même base blanche que\n  // le halo ; les couleurs semi-opaques gardent ainsi exactement leur teinte.\n  // Le disque blanc et les deux demi-disques utilisent le même polygone :\n  // aucune couture ne peut apparaître sur leur bord extérieur.\n  addTransitionPatchPolygon(layerGroup, record, disc, "#ffffff", 1);\n\n  const previousHalf = clipPolygonOnAxis(\n    disc,\n    "x",\n    TRANSITION_PATCH_OVERLAP_PX,\n    true\n  );\n  const nextHalf = clipPolygonOnAxis(\n    disc,\n    "x",\n    -TRANSITION_PATCH_OVERLAP_PX,\n    false\n  );\n\n  addStyledTransitionHalf(\n    layerGroup,\n    record,\n    previousHalf,\n    record.previousFeature,\n    baseStyle.opacity\n  );\n  addStyledTransitionHalf(\n    layerGroup,\n    record,\n    nextHalf,\n    record.nextFeature,\n    baseStyle.opacity\n  );\n}\n\nfunction drawVisibleSegments(featureCollection) {\n  const outlineGroup = L.layerGroup();\n  const colorGroup = L.layerGroup();\n  const transitions = buildTransitionPatchRecords(featureCollection);\n\n  addContinuousSegmentHalos(outlineGroup, featureCollection);\n\n  for (const feature of featureCollection.features || []) {\n    if (feature.properties.__display_mode === "bicolor") {\n      addBicolorSegment(colorGroup, feature);\n    } else {\n      addSingleSegment(colorGroup, feature);\n    }\n  }\n\n  for (const transition of transitions) {\n    addStraightTransitionPatch(colorGroup, transition);\n  }\n\n  state.segmentOutlineLayer = outlineGroup.addTo(map);\n  state.segmentColorLayer = colorGroup.addTo(map);\n}\n\nasync function refreshVisibleSegments() {\n  refreshMarkerVisibility();\n\n  const token = state.segmentRefreshToken + 1;\n  state.segmentRefreshToken = token;\n\n  const mode = segmentRenderMode();\n  const style = segmentStyleForZoom();\n  const bstyle = bicolorStyleForZoom();\n  const zoom = roundedZoom();\n  const key = `${mode}:${style.key}:${bstyle.mode}:${zoom}:${ENABLE_SEGMENT_GENERALIZATION}:${state.index.length}:${state.cache.size}`;\n\n  if (mode === "markers") {\n    state.currentSegmentsKey = key;\n    state.currentVisibleSegmentCount = 0;\n    removeVisibleSegments();\n    updateScalePill(0);\n    return;\n  }\n\n  if (state.currentSegmentsKey === key && state.segmentColorLayer) {\n    updateScalePill(state.currentVisibleSegmentCount, mode === "synthetic" ? "tracés" : "segments");\n    return;\n  }\n\n  state.currentSegmentsKey = key;\n  removeVisibleSegments();\n\n  const dataList = [];\n\n  for (const item of state.index) {\n    try {\n      dataList.push(await loadBisse(item));\n    } catch (error) {\n      console.warn("Bisse non chargé pour la vue segments", item, error);\n    }\n\n    if (token !== state.segmentRefreshToken) {\n      return;\n    }\n  }\n\n  if (token !== state.segmentRefreshToken || segmentRenderMode() !== mode) {\n    return;\n  }\n\n  const sourceGeojson = mode === "synthetic"\n    ? buildSyntheticFeatureCollection(dataList)\n    : buildDetailedFeatureCollection(dataList);\n\n  const visibleGeojson = buildGeneralizedDisplayFeatureCollection(\n    sourceGeojson,\n    mode === "detailed"\n  );\n\n  if (token !== state.segmentRefreshToken || segmentRenderMode() !== mode) {\n    return;\n  }\n\n  drawVisibleSegments(visibleGeojson);\n  state.currentVisibleSegmentCount = visibleGeojson.features.length;\n\n  const unit = mode === "synthetic" ? "tracés" : "segments";\n  updateScalePill(visibleGeojson.features.length, unit);\n}\n\nfunction markerIcon() {\n  return L.divIcon({\n    className: "",\n    html: `<div class="bisse-marker"></div>`,\n    iconSize: [30, 30],\n    iconAnchor: [15, 15]\n  });\n}\n\nfunction photoIcon() {\n  return L.divIcon({\n    className: "",\n    html: `<div class="photo-marker"></div>`,\n    iconSize: [18, 18],\n    iconAnchor: [9, 9]\n  });\n}\n\nfunction photoPopupWidth() {\n  const viewportWidth = typeof window === "undefined" ? 1200 : window.innerWidth;\n  return Math.max(240, Math.min(320, viewportWidth - 76));\n}\n\nfunction photoPopupOptions() {\n  const width = photoPopupWidth();\n\n  return {\n    minWidth: width,\n    maxWidth: width,\n    autoPan: true,\n    closeButton: true,\n    className: "photo-leaflet-popup"\n  };\n}\n\nfunction photoPopupContent(photo) {\n  return `\n    <div class="map-popup photo-popup">\n      ${photo.filename_web ? `\n        <div class="photo-popup-media">\n          <img src="${escapeHtml(photo.filename_web)}" alt="">\n        </div>\n      ` : ""}\n      <h3>${escapeHtml(photo.title || "Photo")}</h3>\n      ${photo.description ? `<p class="popup-muted">${escapeHtml(photo.description)}</p>` : ""}\n    </div>\n  `;\n}\n\nfunction bindListButtons() {\n  document.querySelectorAll(".bisse-button").forEach((btn) => {\n    btn.addEventListener("click", () => {\n      selectBisse(btn.dataset.id);\n    });\n  });\n}\n\nfunction renderList() {\n  state.listHtml = state.index.map((item) => `\n    <button class="bisse-button" type="button" data-id="${escapeHtml(item.id)}">\n      <strong>${escapeHtml(item.title || item.id)}</strong>\n      <span>${escapeHtml([item.region, item.commune].filter(Boolean).join(" · "))}</span>\n    </button>\n  `).join("");\n}\n\nasync function renderMarkers() {\n  state.bisseMarkers.clearLayers();\n\n  for (const item of state.index) {\n    try {\n      const data = await loadBisse(item);\n      const b = geoBounds(data.geojson);\n      const center = item.center && item.center.length >= 2\n        ? L.latLng(item.center[0], item.center[1])\n        : (b.isValid() ? b.getCenter() : L.latLng(VALAIS_CENTER));\n\n      const marker = L.marker(center, {\n        icon: markerIcon(),\n        title: item.title || item.id\n      });\n\n      marker.bindTooltip(escapeHtml(item.title || item.id), {\n        className: "bisse-tooltip",\n        direction: "top",\n        offset: [0, -10]\n      });\n\n      marker.on("click", () => {\n        clearLeafletFocus();\n        selectBisse(item.id);\n      });\n      marker.addTo(state.bisseMarkers);\n    } catch (error) {\n      console.warn("Bisse non chargé", item, error);\n    }\n  }\n\n  refreshMarkerVisibility();\n}\n\nfunction clearSelectedPhotosAndLegend() {\n  state.photoLayer.clearLayers();\n  refreshLegendVisibility();\n}\n\nfunction shouldShowCategoryInLegend(cat) {\n  const id = normalizeStructureType(cat.id || cat.name || cat.label);\n  const label = String(cat.name || cat.label || cat.id || "")\n    .trim()\n    .toLowerCase()\n    .normalize("NFD")\n    .replace(/[\\u0300-\\u036f]/g, "");\n\n  if (id === "unknown") return false;\n  if (label.includes("non classe")) return false;\n  if (label.includes("non class")) return false;\n\n  return true;\n}\n\nfunction collectLegendCategories() {\n  const byId = new Map();\n\n  for (const data of state.cache.values()) {\n    for (const cat of data.catalogue.segment_categories || []) {\n      const id = normalizeStructureType(cat.id || cat.name || cat.label);\n      if (!id || !shouldShowCategoryInLegend(cat)) continue;\n\n      byId.set(id, {\n        id,\n        name: cat.name || cat.label || FALLBACK_CATEGORIES[id]?.name || id,\n        color: cat.color || FALLBACK_CATEGORIES[id]?.color || "#777777"\n      });\n    }\n  }\n\n  // Fallback stable si certains catalogues ne sont pas encore chargés.\n  for (const id of ["open", "canalized", "abandoned"]) {\n    if (!byId.has(id)) {\n      byId.set(id, FALLBACK_CATEGORIES[id]);\n    }\n  }\n\n  const preferredOrder = ["open", "canalized", "abandoned"];\n  const ordered = preferredOrder\n    .map((id) => byId.get(id))\n    .filter(Boolean);\n\n  const extras = [...byId.values()]\n    .filter((cat) => !preferredOrder.includes(cat.id))\n    .sort((a, b) => String(a.name).localeCompare(String(b.name), "fr"));\n\n  return [...ordered, ...extras];\n}\n\nfunction refreshLegend() {\n  const cats = collectLegendCategories();\n\n  state.legendHtml = cats.map((cat) => `\n    <span class="legend-item">\n      <span class="legend-swatch" style="background:${escapeHtml(cat.color || "#777")}"></span>\n      ${escapeHtml(cat.name || cat.label || cat.id)}\n    </span>\n  `).join("");\n\n  $("legend").innerHTML = state.legendHtml;\n  refreshLegendVisibility();\n}\n\nfunction refreshLegendVisibility() {\n  const legend = $("legend");\n  const showLegend = roundedZoom() >= SHOW_SYNTHETIC_TRACES_AT_ZOOM && Boolean(state.legendHtml);\n\n  legend.classList.toggle("is-hidden", !showLegend);\n}\n\nfunction renderPhotos(data) {\n  const photos = selectedPhotos(data.catalogue);\n  state.photoLayer.clearLayers();\n\n  for (const photo of photos) {\n    if (!isNum(photo.lat) || !isNum(photo.lon)) continue;\n\n    const marker = L.marker([photo.lat, photo.lon], {\n      pane: "photoPane",\n      icon: photoIcon(),\n      title: photo.title || "Photo"\n    });\n\n    marker.bindTooltip(escapeHtml(photo.title || "Photo"), {\n      className: "bisse-tooltip",\n      direction: "top",\n      offset: [0, -8]\n    });\n\n    marker.bindPopup(photoPopupContent(photo), photoPopupOptions());\n\n    marker.on("click", () => {\n      clearLeafletFocus();\n    });\n\n    marker.addTo(state.photoLayer);\n  }\n}\n\nfunction boolLabel(value) {\n  if (value === true) return "oui";\n  if (value === false) return "non";\n  return "—";\n}\n\nfunction distanceLabel(value) {\n  return isNum(value) ? `${String(value).replace(".", ",")} km` : "—";\n}\n\nfunction altitudeLabel(min, max) {\n  if (isNum(min) && isNum(max)) return `${min}–${max} m`;\n  if (isNum(min)) return `${min} m`;\n  if (isNum(max)) return `${max} m`;\n  return "—";\n}\n\nfunction renderPanel(data) {\n  const info = data.catalogue.bisse_info || {};\n  const photos = selectedPhotos(data.catalogue);\n\n  $("panel-kicker").textContent = "Fiche bisse";\n  $("panel-title").textContent = info.title || data.item.title || "Bisse";\n\n  $("panel-content").innerHTML = `\n    <p class="lead">${escapeHtml(info.description || "Aucune description pour le moment.")}</p>\n\n    ${info.itinerary ? `\n      <div class="context-row">\n        <strong>Itinéraire</strong>\n        <span>${escapeHtml(info.itinerary)}</span>\n      </div>\n    ` : ""}\n\n    <dl class="fact-grid">\n      <div class="fact"><dt>Région</dt><dd>${escapeHtml(info.region || "—")}</dd></div>\n      <div class="fact"><dt>Commune</dt><dd>${escapeHtml(info.commune || "—")}</dd></div>\n      <div class="fact"><dt>Longueur</dt><dd>${escapeHtml(distanceLabel(info.length_km))}</dd></div>\n      <div class="fact"><dt>Altitude</dt><dd>${escapeHtml(altitudeLabel(info.altitude_min_m, info.altitude_max_m))}</dd></div>\n      <div class="fact"><dt>Cotation</dt><dd>${escapeHtml(info.difficulty || "—")}</dd></div>\n      <div class="fact"><dt>Sentier balisé</dt><dd>${escapeHtml(boolLabel(info.marked_trail))}</dd></div>\n      <div class="fact"><dt>État</dt><dd>${escapeHtml(info.state || "—")}</dd></div>\n    </dl>\n\n    ${(info.tags || []).length ? `\n      <div class="tags">\n        ${info.tags.map((tag) => `<span class="tag">${escapeHtml(tag)}</span>`).join("")}\n      </div>\n    ` : ""}\n\n    ${photos.length ? `\n      <h3 style="margin-top:18px;">Photos choisies</h3>\n      <div class="gallery">\n        ${photos.map((photo, i) => `\n          <button class="photo-card" type="button" data-photo="${i}">\n            <img src="${escapeHtml(photo.filename_web)}" alt="">\n            <div>\n              <strong>${escapeHtml(photo.title || "Photo")}</strong>\n              <span>${escapeHtml(photo.description || "")}</span>\n            </div>\n          </button>\n        `).join("")}\n      </div>\n    ` : `<p class="muted">Aucune photo choisie pour la plateforme.</p>`}\n  `;\n\n  document.querySelectorAll(".photo-card").forEach((btn) => {\n    btn.addEventListener("click", () => {\n      clearLeafletFocus();\n\n      const photo = photos[Number(btn.dataset.photo)];\n      if (!photo) return;\n\n      if (isNum(photo.lat) && isNum(photo.lon)) {\n        map.flyTo(\n          [photo.lat, photo.lon],\n          Math.min(MAX_ZOOM, Math.max(map.getZoom(), 23)),\n          { duration: 0.45 }\n        );\n      }\n\n      if (isNum(photo.lat) && isNum(photo.lon)) {\n        L.popup(photoPopupOptions())\n          .setLatLng([photo.lat, photo.lon])\n          .setContent(photoPopupContent(photo))\n          .openOn(map);\n      }\n    });\n  });\n\n  openPanel();\n}\n\nasync function selectBisse(id, options = {}) {\n  const item = state.index.find((x) => x.id === id);\n  if (!item) return;\n\n  state.selectedId = id;\n  state.selectedData = null;\n  state.photoMarkersVisible = false;\n  clearSelectedPhotosAndLegend();\n  removeBisseActionChip();\n  showStatus("Chargement du bisse…");\n\n  try {\n    const data = await loadBisse(item);\n    state.selectedData = data;\n    renderPanel(data);\n    refreshLegend();\n    state.photoLayer.clearLayers();\n    showBisseActionChip(data);\n\n    if (options.showPhotos === true) {\n      setSelectedPhotosVisible(true);\n    }\n\n    if (options.fit !== false) {\n      fitBisseDataAfterPanel(data);\n    }\n\n    hideStatus();\n    refreshVisibleSegments();\n  } catch (error) {\n    $("panel-title").textContent = "Erreur";\n    $("panel-content").innerHTML = `\n      <div class="error-box">\n        <strong>Chargement impossible</strong><br>\n        ${escapeHtml(error.message)}\n      </div>\n    `;\n    openPanel();\n    showStatus("Erreur de chargement");\n  }\n}\n\nfunction resetValais() {\n  state.selectedId = null;\n  clearSelectedBisseMapControls();\n  clearSelectedPhotosAndLegend();\n  closeContext();\n  closePanel();\n\n  map.setView(VALAIS_CENTER, VALAIS_ZOOM);\n  refreshVisibleSegments();\n}\n\nasync function init() {\n  try {\n    showStatus("Chargement des bisses…");\n\n    state.index = await loadJson("data/bisses_index.json");\n    renderList();\n    await renderMarkers();\n    refreshLegend();\n    resetValais();\n    await refreshVisibleSegments();\n\n    if (!state.index.length) {\n      $("panel-content").innerHTML = `\n        <div class="error-box">Aucun bisse trouvé dans data/bisses_index.json.</div>\n      `;\n      showStatus("Aucun bisse trouvé");\n    } else {\n      hideStatus();\n    }\n  } catch (error) {\n    $("panel-title").textContent = "Erreur";\n    $("panel-content").innerHTML = `\n      <div class="error-box">\n        <strong>Impossible d’initialiser la plateforme.</strong><br>\n        ${escapeHtml(error.message)}\n      </div>\n    `;\n    openPanel();\n    showStatus("Erreur d’initialisation");\n  }\n}\n\nmap.on("zoom", refreshMarkerVisibility);\n\nmap.on("zoomend", () => {\n  refreshBaseLayer();\n  refreshMarkerVisibility();\n  refreshVisibleSegments();\n});\n\n$("btn-basemap").addEventListener("click", toggleBase);\n$("btn-valais").addEventListener("click", resetValais);\n$("btn-list").addEventListener("click", openList);\n$("btn-close-panel").addEventListener("click", closePanel);\n\nmap.setView(VALAIS_CENTER, VALAIS_ZOOM);\nrefreshBaseLayer();\ninit();\n'
+
+BISSES_RENDER_README = "# Bisses\n\nPlateforme statique GitHub Pages pour l’inventaire cartographique des bisses du Valais.\n\nVersion générée par :\nbuild_bisses.py\nbisses-ui-clusters-2026-08-11-v6.3\n\nRendu des tronçons — coupes droites partagées :\n- halo blanc continu par chaîne connectée ;\n- regroupement des tronçons contigus de même style ;\n- absorption visuelle prudente des micro-plages selon leur longueur en pixels ;\n- tangente commune calculée à chaque transition, y compris dans les angles ;\n- coupes colorées droites, jointives et perpendiculaires à cette tangente ;\n- recalage visuel des extrémités quasi identiques sur un point commun ;\n- léger recouvrement sous-pixel pour supprimer les coutures d'anticrénelage ;\n- extrémités réelles du bisse conservées arrondies ;\n- détail original complet à partir de z25.\n\nGénérer le site :\npython build_bisses.py\n\nLe script génère :\n- index.html\n- .nojekyll\n- assets/css/styles.css\n- assets/js/app.js\n\nIl ne modifie pas :\n- data/\n- media/\n"
 
 
 class BisseManagerApp:
@@ -195,7 +207,7 @@ class BisseManagerApp:
         self.publication_status_var = tk.StringVar(value="")
         self.last_platform_export_root = ""
 
-        # Renommage
+        # Ordre des photos / renommage
         self.rename_tree = None
         self.rename_prefix_var = tk.StringVar(value="")
         self.rename_year_var = tk.StringVar(value=str(datetime.now().year))
@@ -223,6 +235,11 @@ class BisseManagerApp:
         self.rename_gpx_source_choice = None
         self.rename_gpx_guidance_info = None
         self.rename_manual_gpx_sources = []
+        # v65 : un guide topo choisi explicitement dans « Ordre des photos »
+        # prend priorité sur la détection automatique, sans modifier le moteur
+        # géométrique v53 (qui peut combiner plusieurs GPX en un seul réseau).
+        self.rename_gpx_manual_override = False
+        self.photo_order_topo_status_var = tk.StringVar(value="")
 
         # Atelier GPX restructuré
         self.gpx_editor_map = None
@@ -414,6 +431,19 @@ class BisseManagerApp:
         )
         self.progress.grid(row=4, column=0, sticky="ew", padx=16, pady=(0, 5))
 
+        # v65 — activité commune et chargements photo non bloquants.
+        self._activity_serial = 0
+        self._activity_state = None
+        self._activity_after_id = None
+        self._photo_workspace_loading = False
+        self._photo_workspace_load_generation = 0
+        self._photo_workspace_loading_activity_token = None
+        self._photo_workspace_open_activity_token = None
+        self._viewer_load_generation = 0
+        self._bisses_preview_server = None
+        self._bisses_preview_thread = None
+        self._bisses_preview_root = ""
+
         # Navigation photo globale au clavier. Les champs de texte gardent
         # naturellement l'usage de leurs flèches.
         self.root.bind("<Left>", self.handle_photo_navigation_key, add="+")
@@ -446,6 +476,7 @@ class BisseManagerApp:
 
         # La vérification reste asynchrone et ne retarde jamais l'ouverture.
         self.root.after(1800, self.update_controller.maybe_check_automatically)
+        self.root.protocol("WM_DELETE_WINDOW", self.close_application)
 
     def configure_main_window_geometry(self):
         """
@@ -592,6 +623,232 @@ class BisseManagerApp:
             self.log_visible_var.set(True)
 
 
+    def _write_json_atomic_v65(self, path, data, indent=4):
+        """Écriture JSON atomique ciblée pour les opérations ajoutées en v65."""
+        path = os.path.abspath(os.fspath(path))
+        directory = os.path.dirname(path)
+        os.makedirs(directory, exist_ok=True)
+        temp_path = os.path.join(
+            directory,
+            f".{os.path.basename(path)}.abisses_v65_tmp_{uuid.uuid4().hex}",
+        )
+        try:
+            with open(temp_path, "w", encoding="utf-8", newline="\n") as handle:
+                json.dump(data, handle, indent=indent, ensure_ascii=False)
+                handle.write("\n")
+                handle.flush()
+                try:
+                    os.fsync(handle.fileno())
+                except Exception:
+                    pass
+            os.replace(temp_path, path)
+        finally:
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
+
+    def begin_activity(self, message, mode="indeterminate", maximum=None, delay_ms=250):
+        """Démarre un indicateur commun, différé pour éviter le scintillement."""
+        self._activity_serial += 1
+        token = self._activity_serial
+        try:
+            previous_status = str(self.status_header.cget("text") or "")
+            previous_fg = str(self.status_header.cget("fg") or "")
+        except Exception:
+            previous_status = ""
+            previous_fg = ""
+
+        # Une nouvelle activité remplace proprement l'ancienne. Si l'ancienne
+        # était l'ouverture asynchrone de Photos, son résultat devient caduc.
+        previous = self._activity_state
+        if previous:
+            previous_token = previous.get("token")
+            if previous_token == getattr(self, "_photo_workspace_loading_activity_token", None):
+                self._photo_workspace_load_generation += 1
+                self._photo_workspace_loading = False
+                self._photo_workspace_loading_activity_token = None
+            if previous_token == getattr(self, "_photo_workspace_open_activity_token", None):
+                self._photo_workspace_open_activity_token = None
+            try:
+                self.progress.stop()
+            except Exception:
+                pass
+        if self._activity_after_id:
+            try:
+                self.root.after_cancel(self._activity_after_id)
+            except Exception:
+                pass
+            self._activity_after_id = None
+
+        self._activity_state = {
+            "token": token,
+            "message": str(message or "Traitement en cours…"),
+            "mode": mode,
+            "maximum": max(1, int(maximum or 1)),
+            "value": 0,
+            "shown": False,
+            "previous_status": previous_status,
+            "previous_fg": previous_fg,
+        }
+
+        def show():
+            state = self._activity_state
+            if not state or state.get("token") != token:
+                return
+            state["shown"] = True
+            try:
+                self.status_header.config(text=state["message"], fg="#2c3e50")
+                if state["mode"] == "determinate":
+                    self.progress.stop()
+                    self.progress.configure(
+                        mode="determinate",
+                        maximum=state["maximum"],
+                    )
+                    self.progress["value"] = state["value"]
+                else:
+                    self.progress.configure(mode="indeterminate")
+                    self.progress.start(12)
+            except Exception:
+                pass
+
+        if delay_ms and delay_ms > 0:
+            try:
+                self._activity_after_id = self.root.after(delay_ms, show)
+            except Exception:
+                show()
+        else:
+            show()
+        return token
+
+    def update_activity(self, token, message=None, value=None, maximum=None):
+        state = self._activity_state
+        if not state or state.get("token") != token:
+            return
+        if message is not None:
+            state["message"] = str(message)
+        if maximum is not None:
+            try:
+                state["maximum"] = max(1, int(maximum))
+                state["mode"] = "determinate"
+            except Exception:
+                pass
+        if value is not None:
+            try:
+                state["value"] = float(value)
+                state["mode"] = "determinate"
+            except Exception:
+                pass
+        if not state.get("shown"):
+            return
+        try:
+            if message is not None:
+                self.status_header.config(text=state["message"], fg="#2c3e50")
+            if state["mode"] == "determinate":
+                self.progress.stop()
+                self.progress.configure(mode="determinate", maximum=state["maximum"])
+                self.progress["value"] = min(state["value"], state["maximum"])
+            self.root.update_idletasks()
+        except Exception:
+            pass
+
+    def end_activity(self, token, restore_status=True):
+        state = self._activity_state
+        if not state or state.get("token") != token:
+            return
+        if self._activity_after_id:
+            try:
+                self.root.after_cancel(self._activity_after_id)
+            except Exception:
+                pass
+            self._activity_after_id = None
+        try:
+            self.progress.stop()
+            self.progress.configure(mode="determinate", maximum=100)
+            self.progress["value"] = 0
+        except Exception:
+            pass
+        if restore_status:
+            try:
+                self.status_header.config(
+                    text=state.get("previous_status", ""),
+                    fg=state.get("previous_fg") or "gray",
+                )
+            except Exception:
+                pass
+        self._activity_state = None
+
+    def run_background_activity(
+        self,
+        message,
+        worker,
+        on_success,
+        on_error=None,
+        *,
+        delay_ms=250,
+        keep_activity=False,
+    ):
+        """Exécute du disque/CPU hors Tk et rapatrie résultats/progression sur le fil UI."""
+        token = self.begin_activity(message, delay_ms=delay_ms)
+        result_queue = queue.Queue()
+
+        def report(progress_message=None, value=None, maximum=None):
+            result_queue.put(("progress", progress_message, value, maximum))
+
+        def target():
+            try:
+                result = worker(report)
+                result_queue.put(("done", result))
+            except Exception as exc:
+                result_queue.put(("error", exc))
+
+        threading.Thread(target=target, daemon=True).start()
+
+        def poll():
+            state = self._activity_state
+            if not state or state.get("token") != token:
+                return
+            try:
+                while True:
+                    item = result_queue.get_nowait()
+                    kind = item[0]
+                    if kind == "progress":
+                        _, progress_message, value, maximum = item
+                        self.update_activity(token, progress_message, value, maximum)
+                    elif kind == "done":
+                        if not keep_activity:
+                            self.end_activity(token, restore_status=False)
+                        on_success(item[1], token)
+                        return
+                    elif kind == "error":
+                        self.end_activity(token, restore_status=True)
+                        if callable(on_error):
+                            on_error(item[1], token)
+                        else:
+                            messagebox.showerror("Erreur", str(item[1]))
+                        return
+            except queue.Empty:
+                pass
+            try:
+                self.root.after(75, poll)
+            except Exception:
+                pass
+
+        self.root.after(75, poll)
+        return token
+
+    def close_application(self):
+        """Ferme notamment le serveur et le dossier temporaire de prévisualisation."""
+        try:
+            self.stop_local_preview_server(cleanup=True)
+        except Exception:
+            pass
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
     def hide_text_tooltip(self, _event=None):
         if getattr(self, "tooltip_window", None) is not None:
             try:
@@ -664,6 +921,22 @@ class BisseManagerApp:
         self.show_text_tooltip(text, event.x_root, event.y_root)
 
     def clear_main_frame(self):
+        if getattr(self, "_photo_workspace_loading", False):
+            self._photo_workspace_load_generation += 1
+            self._photo_workspace_loading = False
+            token = getattr(self, "_photo_workspace_loading_activity_token", None)
+            self._photo_workspace_loading_activity_token = None
+            if token is not None:
+                self.end_activity(token, restore_status=False)
+
+        token = getattr(self, "_photo_workspace_open_activity_token", None)
+        if token is not None:
+            self._photo_workspace_open_activity_token = None
+            self.end_activity(token, restore_status=False)
+
+        # Tout résultat d'image appartenant à l'écran précédent devient caduc.
+        self._viewer_load_generation = getattr(self, "_viewer_load_generation", 0) + 1
+
         if self.photo_workspace_layout_after_id:
             try:
                 self.root.after_cancel(self.photo_workspace_layout_after_id)
@@ -7932,7 +8205,7 @@ namespace GestionBissesFolderPicker
 
 
     # ============================================================
-    # V51 — ORDRE INTELLIGENT DES PHOTOS POUR LE RENOMMAGE
+    # V51/V65 — ORDRE INTELLIGENT DES PHOTOS
     # ============================================================
 
     def get_entry_gps_latlon(self, entry):
@@ -8525,6 +8798,160 @@ namespace GestionBissesFolderPicker
             )
         )
 
+    def discover_photo_order_topo_sources_from_folder(self):
+        """Charge automatiquement les GPX présents dans ``Fichiers GPX``.
+
+        Cette découverte est volontairement indépendante de l'atelier Cartographie :
+        elle ne crée, ne retire et ne modifie aucune branche. Elle fournit seulement
+        une géométrie de référence à l'étape « Ordre des photos ».
+        """
+        folder = getattr(self, "gpx_folder", "") or (
+            os.path.join(self.base_folder, "Fichiers GPX") if self.base_folder else ""
+        )
+        if not folder or not os.path.isdir(folder):
+            return []
+
+        paths = sorted(
+            (os.path.join(folder, name) for name in os.listdir(folder)),
+            key=lambda path: os.path.basename(path).casefold()
+        )
+        candidates = []
+        for path in paths:
+            if not os.path.isfile(path) or not path.lower().endswith(".gpx"):
+                continue
+            try:
+                parts = self.load_rename_gpx_parts_from_file(path)
+            except Exception as exc:
+                self.log(
+                    f"⚠️ Guide topo ignoré ({os.path.basename(path)}) : {exc}"
+                )
+                continue
+            if not parts:
+                continue
+
+            source_name = os.path.basename(path)
+            candidates.append({
+                "key": f"folder:{os.path.abspath(path)}",
+                "label": os.path.splitext(source_name)[0],
+                "source_filename": source_name,
+                "normalized_name": self.normalize_rename_gpx_source_name(source_name),
+                "parts": parts,
+                "declared_count": 0,
+                "last_sync_source": False,
+                "live_topo": True,
+                "folder_auto": True,
+                "point_count": sum(len(part) for part in parts)
+            })
+
+        if candidates:
+            self.log(
+                "🧭 Guide topo automatique depuis Fichiers GPX : "
+                + ", ".join(candidate["source_filename"] for candidate in candidates)
+            )
+        return candidates
+
+    def select_photo_order_topo_sources(self):
+        """Choisit explicitement un ou plusieurs GPX servant de guide géométrique.
+
+        Ce choix ne sert qu'à l'ordre spatial des photos. Les horodatages des
+        GPX ne sont jamais utilisés ici et aucun fichier n'est importé, déplacé
+        ou modifié. Plusieurs fichiers peuvent former un seul réseau topo.
+        """
+        initialdir = (
+            self.gpx_folder
+            if self.gpx_folder and os.path.isdir(self.gpx_folder)
+            else self.base_folder
+        )
+        selected_paths = filedialog.askopenfilenames(
+            title="Choisir un ou plusieurs GPX topo pour l'ordre des photos",
+            filetypes=[("Fichiers GPX", "*.gpx"), ("Tous les fichiers", "*.*")],
+            initialdir=initialdir if initialdir and os.path.isdir(initialdir) else None
+        )
+        if not selected_paths:
+            return
+
+        candidates = []
+        errors = []
+        for path in selected_paths:
+            try:
+                parts = self.load_rename_gpx_parts_from_file(path)
+            except Exception as exc:
+                parts = []
+                errors.append(f"{os.path.basename(path)} : {exc}")
+            if not parts:
+                if not any(os.path.basename(path) in err for err in errors):
+                    errors.append(f"{os.path.basename(path)} : aucun tracé exploitable")
+                continue
+            source_name = os.path.basename(path)
+            candidates.append({
+                "key": f"manual:{os.path.abspath(path)}",
+                "label": os.path.splitext(source_name)[0],
+                "source_filename": source_name,
+                "normalized_name": self.normalize_rename_gpx_source_name(source_name),
+                "parts": parts,
+                "declared_count": 0,
+                "last_sync_source": False,
+                "live_topo": True,
+                "point_count": sum(len(part) for part in parts)
+            })
+
+        if not candidates:
+            message = "Aucun GPX sélectionné ne contient de tracé exploitable."
+            if errors:
+                message += "\n\n" + "\n".join(errors[:8])
+            messagebox.showwarning("Guide topo indisponible", message)
+            return
+
+        self.rename_manual_gpx_sources = candidates
+        self.rename_gpx_manual_override = True
+        self.rename_order_mode_var.set("gps")
+        self.rename_gpx_source_choice = "|".join(
+            candidate["key"] for candidate in candidates
+        )
+        self.rename_map_fit_done = False
+        self.log(
+            "🧭 Guide topo choisi pour l'ordre des photos : "
+            + ", ".join(candidate["source_filename"] for candidate in candidates)
+        )
+        self.preview_photo_order_plan()
+
+    def update_photo_order_topo_status(self):
+        """Rend visible le guide géométrique réellement utilisé par le tri GPS."""
+        var = getattr(self, "photo_order_topo_status_var", None)
+        if var is None:
+            return
+
+        if self.rename_order_mode_var.get() != "gps":
+            var.set("Guide topo : utilisé uniquement avec « Position GPS ».")
+            return
+
+        guidance = getattr(self, "rename_gpx_guidance_info", None) or {}
+        if guidance.get("used"):
+            names = list(guidance.get("source_filenames", []) or [])
+            if not names and guidance.get("source_filename"):
+                names = [guidance["source_filename"]]
+            source_text = ", ".join(names) if names else guidance.get("source_label", "GPX topo")
+            if guidance.get("source_origin") == "folder_auto":
+                source_text += " (automatique depuis Fichiers GPX)"
+            details = []
+            if guidance.get("network_span_m") is not None:
+                details.append(f"réseau {float(guidance['network_span_m']):.0f} m")
+            if guidance.get("p90_offset_m") is not None:
+                details.append(f"écart P90 {float(guidance['p90_offset_m']):.1f} m")
+            ambiguous_count = int(guidance.get("ambiguous_count") or 0)
+            if ambiguous_count:
+                details.append(f"⚠ {ambiguous_count} projection(s) ambiguë(s)")
+            suffix = " · " + " · ".join(details) if details else ""
+            var.set(
+                f"Guide topo : {source_text}{suffix}. "
+                "Chaque photo est projetée individuellement depuis sa coordonnée GPS, puis ordonnée par distance cumulée le long de la trace."
+            )
+        else:
+            var.set(
+                "Guide topo : aucun guide géométrique exploitable n'est utilisé ; "
+                "le tri GPS autonome sert de repli."
+            )
+
     def choose_rename_gpx_sources(self, items):
         """
         Réunit les GPX topo/live pertinents pour le tri spatial.
@@ -8533,37 +8960,23 @@ namespace GestionBissesFolderPicker
         synchronisation puis les traces explicitement rangées comme live/topo
         sont utilisées. Aucun horodatage n'est chargé ici.
         """
+        manual_sources = list(getattr(self, "rename_manual_gpx_sources", []) or [])
+        if getattr(self, "rename_gpx_manual_override", False) and manual_sources:
+            pool = sorted(
+                manual_sources,
+                key=lambda candidate: candidate.get("source_filename", "").casefold()
+            )
+            self.rename_gpx_source_choice = "|".join(candidate["key"] for candidate in pool)
+            return pool
+
         candidates = self.collect_rename_gpx_source_candidates(items)
         if not candidates:
-            candidates = list(getattr(self, "rename_manual_gpx_sources", []) or [])
+            # v65 : si le catalogue ne connaît pas encore la provenance des GPX,
+            # l'étape Ordre exploite directement les sources déjà rangées dans
+            # Fichiers GPX. Cela ne modifie jamais l'atelier Cartographie.
+            candidates = self.discover_photo_order_topo_sources_from_folder()
         if not candidates:
-            initialdir = (
-                self.gpx_folder
-                if self.gpx_folder and os.path.isdir(self.gpx_folder)
-                else self.base_folder
-            )
-            selected_paths = filedialog.askopenfilenames(
-                title="Choisir un ou plusieurs GPX topo pour le tri des photos",
-                filetypes=[("Fichiers GPX", "*.gpx"), ("Tous les fichiers", "*.*")],
-                initialdir=initialdir if initialdir and os.path.isdir(initialdir) else None
-            )
-            for path in selected_paths:
-                parts = self.load_rename_gpx_parts_from_file(path)
-                if not parts:
-                    continue
-                source_name = os.path.basename(path)
-                candidates.append({
-                    "key": f"manual:{os.path.abspath(path)}",
-                    "label": os.path.splitext(source_name)[0],
-                    "source_filename": source_name,
-                    "normalized_name": self.normalize_rename_gpx_source_name(source_name),
-                    "parts": parts,
-                    "declared_count": 0,
-                    "last_sync_source": False,
-                    "live_topo": True,
-                    "point_count": sum(len(part) for part in parts)
-                })
-            self.rename_manual_gpx_sources = list(candidates)
+            candidates = manual_sources
 
         if not candidates:
             self.rename_gpx_source_choice = "__gps_autonomous__"
@@ -8928,13 +9341,203 @@ namespace GestionBissesFolderPicker
                 compact.append(point)
         return compact
 
-    def sort_by_gps_guided_by_topo(self, items):
-        """
-        Trie les photos le long du réseau formé par les GPX topo/live sources.
+    def build_photo_order_reference_path(self, sources, join_limit_m=250.0):
+        """Construit une référence linéaire ordonnée depuis un ou plusieurs GPX.
 
-        Le réseau est géométrique et non orienté. Aucun horodatage des GPX ou
-        des photos n'est utilisé pour choisir la progression globale. La date
-        ne reste qu'un départage stable à l'intérieur d'un agrégat.
+        Contrairement au graphe topologique historique, cette référence conserve
+        l'ordre géométrique parcouru dans chaque trace. Des fragments distincts
+        peuvent être retournés et raccordés par leurs extrémités, mais jamais par
+        un raccourci transversal au milieu d'un lacet ou d'une branche proche.
+        """
+        raw_parts = []
+        seen = set()
+
+        for source in sources or []:
+            for raw_part in source.get("parts", []) or []:
+                part = [
+                    (float(point[0]), float(point[1]))
+                    for point in raw_part or []
+                    if point and len(point) >= 2
+                ]
+                compact = []
+                for point in part:
+                    if not compact or point != compact[-1]:
+                        compact.append(point)
+                if len(compact) < 2:
+                    continue
+
+                # Déduplication légère : deux traces identiques ou inversées ne
+                # doivent pas faire parcourir deux fois le même bisse.
+                key_forward = tuple((round(lat, 6), round(lon, 6)) for lat, lon in compact)
+                key_reverse = tuple(reversed(key_forward))
+                key = min(key_forward, key_reverse)
+                if key in seen:
+                    continue
+                seen.add(key)
+                raw_parts.append(compact)
+
+        if not raw_parts:
+            return None
+
+        mean_lat = sum(lat for part in raw_parts for lat, _lon in part) / sum(len(part) for part in raw_parts)
+        meters_per_lon = 111320.0 * max(0.01, math.cos(math.radians(mean_lat)))
+        meters_per_lat = 110540.0
+
+        def distance_m(a, b):
+            dx = (float(a[1]) - float(b[1])) * meters_per_lon
+            dy = (float(a[0]) - float(b[0])) * meters_per_lat
+            return math.hypot(dx, dy)
+
+        def part_length(part):
+            return sum(distance_m(a, b) for a, b in zip(part, part[1:]))
+
+        # La partie la plus longue est le meilleur noyau pour une trace topo
+        # principale. Les fragments complémentaires sont ensuite attachés aux
+        # extrémités, jamais au milieu de la ligne.
+        remaining = list(raw_parts)
+        seed_index = max(range(len(remaining)), key=lambda idx: part_length(remaining[idx]))
+        chain = list(remaining.pop(seed_index))
+        join_gaps = []
+        unused_parts = []
+
+        while remaining:
+            best = None
+            for idx, part in enumerate(remaining):
+                options = (
+                    (distance_m(chain[-1], part[0]), "append", False),
+                    (distance_m(chain[-1], part[-1]), "append", True),
+                    (distance_m(chain[0], part[-1]), "prepend", False),
+                    (distance_m(chain[0], part[0]), "prepend", True),
+                )
+                distance, side, reverse = min(options, key=lambda item: item[0])
+                candidate = (distance, idx, side, reverse)
+                if best is None or candidate < best:
+                    best = candidate
+
+            distance, idx, side, reverse = best
+            part = remaining.pop(idx)
+            if reverse:
+                part = list(reversed(part))
+
+            # Un fragment totalement éloigné n'est pas forcé dans la référence :
+            # cela évite qu'un GPX sans rapport pollue le tri automatique.
+            if distance > float(join_limit_m):
+                unused_parts.append(part)
+                continue
+
+            join_gaps.append(distance)
+            if side == "append":
+                if distance <= 1.5 and chain[-1] == part[0]:
+                    chain.extend(part[1:])
+                else:
+                    chain.extend(part)
+            else:
+                if distance <= 1.5 and part[-1] == chain[0]:
+                    chain = part[:-1] + chain
+                else:
+                    chain = part + chain
+
+        if len(chain) < 2:
+            return None
+
+        cumulative = [0.0]
+        for a, b in zip(chain, chain[1:]):
+            cumulative.append(cumulative[-1] + distance_m(a, b))
+
+        return {
+            "points": chain,
+            "cumulative_m": cumulative,
+            "length_m": cumulative[-1],
+            "join_gaps_m": join_gaps,
+            "unused_parts_count": len(unused_parts),
+            "mean_lat": mean_lat,
+            "meters_per_lon": meters_per_lon,
+            "meters_per_lat": meters_per_lat,
+        }
+
+    def project_photo_order_point_on_reference(self, lat, lon, reference, ambiguity_separation_m=30.0):
+        """Projette UNE photo sur la référence linéaire du bisse.
+
+        Le choix se fait à partir de la coordonnée GPS réelle de la photo, jamais
+        à partir du centre d'un groupe. On conserve aussi la meilleure projection
+        concurrente située nettement plus loin sur la référence : si elle est
+        presque aussi proche géométriquement, la position est signalée comme
+        ambiguë au lieu d'être présentée comme certaine.
+        """
+        points = reference.get("points", []) if isinstance(reference, dict) else []
+        cumulative = reference.get("cumulative_m", []) if isinstance(reference, dict) else []
+        if len(points) < 2 or len(cumulative) != len(points):
+            return None
+
+        meters_per_lon = float(reference.get("meters_per_lon") or 111320.0)
+        meters_per_lat = float(reference.get("meters_per_lat") or 110540.0)
+        px = float(lon) * meters_per_lon
+        py = float(lat) * meters_per_lat
+        candidates = []
+
+        for index, (a, b) in enumerate(zip(points, points[1:])):
+            ax = float(a[1]) * meters_per_lon
+            ay = float(a[0]) * meters_per_lat
+            bx = float(b[1]) * meters_per_lon
+            by = float(b[0]) * meters_per_lat
+            dx = bx - ax
+            dy = by - ay
+            length_sq = dx * dx + dy * dy
+            if length_sq <= 0:
+                continue
+
+            t = ((px - ax) * dx + (py - ay) * dy) / length_sq
+            t = max(0.0, min(1.0, t))
+            proj_x = ax + t * dx
+            proj_y = ay + t * dy
+            offset = math.hypot(px - proj_x, py - proj_y)
+            segment_length = math.sqrt(length_sq)
+            along = float(cumulative[index]) + t * segment_length
+            candidates.append({
+                "along_m": along,
+                "offset_m": offset,
+                "point": (
+                    float(a[0]) + t * (float(b[0]) - float(a[0])),
+                    float(a[1]) + t * (float(b[1]) - float(a[1])),
+                ),
+                "segment_index": index,
+                "t": t,
+            })
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda candidate: (candidate["offset_m"], candidate["along_m"]))
+        best = dict(candidates[0])
+
+        separation = max(10.0, float(ambiguity_separation_m))
+        alternate = None
+        for candidate in candidates[1:]:
+            if abs(candidate["along_m"] - best["along_m"]) < separation:
+                continue
+            alternate = candidate
+            break
+
+        best["ambiguous"] = False
+        best["alternate_offset_m"] = None
+        best["alternate_along_m"] = None
+        if alternate is not None:
+            best["alternate_offset_m"] = float(alternate["offset_m"])
+            best["alternate_along_m"] = float(alternate["along_m"])
+            # Une seconde branche à moins de 8 m supplémentaires est trop proche
+            # pour prétendre que la coordonnée GPS permet de trancher sûrement.
+            if alternate["offset_m"] <= best["offset_m"] + 8.0:
+                best["ambiguous"] = True
+
+        return best
+
+    def sort_by_gps_guided_by_topo(self, items):
+        """Trie les photos selon LEUR propre coordonnée projetée sur le GPX.
+
+        Chaque photo est projetée individuellement avant tout regroupement. La
+        proximité n'intervient qu'ensuite, et seulement pour des photos proches
+        à la fois sur le terrain et le long du GPX. Ainsi deux branches voisines
+        d'un lacet ne peuvent plus être fusionnées avant d'être localisées.
         """
         self.rename_gpx_guidance_info = None
         gps_items = [item for item in items if item.get("gps")]
@@ -8948,21 +9551,45 @@ namespace GestionBissesFolderPicker
         if not source:
             return self.sort_by_gps_autonomous(items)
 
-        graph = self.build_rename_topology_graph(source.get("parts", []))
-        if not graph:
-            self.log(f"⚠️ GPX topo inexploitable ({source['label']}) : repli sur le tri GPS autonome.")
+        reference = self.build_photo_order_reference_path(sources)
+        if not reference:
+            self.log(
+                f"⚠️ GPX topo inexploitable ({source['label']}) : "
+                "repli sur le tri GPS autonome."
+            )
             return self.sort_by_gps_autonomous(items)
 
-        clusters = self.cluster_rename_photos_by_gps(gps_items)
-        projections = [
-            self.project_rename_point_on_topology(cluster["lat"], cluster["lon"], graph)
-            for cluster in clusters
-        ]
-        if not projections or any(projection is None for projection in projections):
-            self.log(f"⚠️ Projection sur le GPX topo impossible ({source['label']}) : repli GPS autonome.")
-            return self.sort_by_gps_autonomous(items)
+        try:
+            proximity_m = max(0.0, float(self.rename_gps_group_radius_var.get()))
+        except Exception:
+            proximity_m = 12.0
+        ambiguity_separation_m = max(30.0, proximity_m * 3.0)
 
-        offsets = sorted(projection["offset_m"] for projection in projections)
+        projected = []
+        for item in gps_items:
+            lat, lon = item["gps"]
+            projection = self.project_photo_order_point_on_reference(
+                lat,
+                lon,
+                reference,
+                ambiguity_separation_m=ambiguity_separation_m,
+            )
+            if projection is None:
+                self.log(
+                    f"⚠️ Projection topo impossible pour "
+                    f"{os.path.basename(item.get('source_path') or '')} : repli GPS autonome."
+                )
+                return self.sort_by_gps_autonomous(items)
+
+            item["gps_topo_along_m"] = float(projection["along_m"])
+            item["gps_topo_offset_m"] = float(projection["offset_m"])
+            item["gps_topo_projected_point"] = projection["point"]
+            item["gps_topo_ambiguous"] = bool(projection.get("ambiguous"))
+            item["gps_topo_alternate_offset_m"] = projection.get("alternate_offset_m")
+            item["gps_topo_alternate_along_m"] = projection.get("alternate_along_m")
+            projected.append((item, projection))
+
+        offsets = sorted(projection["offset_m"] for _item, projection in projected)
         within_75m = sum(offset <= 75.0 for offset in offsets) / len(offsets)
         p90 = offsets[min(len(offsets) - 1, int((len(offsets) - 1) * 0.90))]
         if within_75m < 0.90 or p90 > 60.0:
@@ -8972,135 +9599,119 @@ namespace GestionBissesFolderPicker
             )
             return self.sort_by_gps_autonomous(items)
 
-        # Les deux extrémités sont celles qui sont les plus éloignées sur le
-        # réseau topo, et non celles qui sont les plus éloignées à vol d'oiseau.
-        endpoint_pair = None
-        endpoint_distance = -1.0
+        # L'ordre de base est strictement celui des coordonnées individuelles
+        # projetées sur la référence. Aucun centre de groupe n'intervient ici.
+        projected.sort(
+            key=lambda pair: (
+                pair[1]["along_m"],
+                pair[1]["offset_m"],
+                self.rename_photo_date_key(pair[0]),
+                os.path.basename(pair[0].get("source_path") or "").lower(),
+            )
+        )
 
-        for index, projection in enumerate(projections):
-            distances, _previous = self.dijkstra_from_rename_projection(graph, projection)
-            for other_index in range(index + 1, len(projections)):
-                distance = self.rename_projection_network_distance(
-                    distances,
-                    projection,
-                    projections[other_index]
+        # Proximité = stabilisation locale seulement APRÈS projection. Pour être
+        # dans le même lieu, il faut être proche dans le monde réel ET proche sur
+        # l'abscisse curviligne. Un lacet voisin ne passe donc jamais ce double test.
+        groups = []
+        for item, projection in projected:
+            if not groups:
+                groups.append([(item, projection)])
+                continue
+
+            previous_item, previous_projection = groups[-1][-1]
+            prev_gps = previous_item.get("gps")
+            cur_gps = item.get("gps")
+            geographic_distance = float("inf")
+            if prev_gps and cur_gps:
+                geographic_distance = self.haversine_distance_m(
+                    prev_gps[0], prev_gps[1], cur_gps[0], cur_gps[1]
                 )
-                if not math.isfinite(distance):
-                    self.log(
-                        f"⚠️ GPX topo discontinu entre les photos ({source['label']}) : "
-                        "repli GPS autonome."
-                    )
-                    return self.sort_by_gps_autonomous(items)
-                if distance > endpoint_distance:
-                    endpoint_distance = distance
-                    endpoint_pair = (index, other_index)
-
-        if endpoint_pair is None or endpoint_distance <= 0:
-            return self.sort_by_gps_autonomous(items)
-
-        earliest = min(
-            gps_items,
-            key=lambda item: (
-                self.rename_photo_date_key(item),
-                os.path.basename(item["source_path"]).lower()
+            along_distance = abs(
+                float(projection["along_m"]) - float(previous_projection["along_m"])
             )
-        )
-        chronological_cluster_index = next(
-            (
-                index
-                for index, cluster in enumerate(clusters)
-                if earliest in cluster["items"]
-            ),
-            0
-        )
 
-        # La v52d reste la référence pour le sens initial proposé. Le topo ne
-        # sert qu'à corriger la notion de distance et de continuité.
-        orientation_path = self.build_nearest_neighbor_rename_cluster_path(
-            clusters,
-            chronological_cluster_index
-        )
-        orientation_positions = {
-            cluster_index: position
-            for position, cluster_index in enumerate(orientation_path)
-        }
-        start_index = min(
-            endpoint_pair,
-            key=lambda index: orientation_positions.get(index, len(clusters))
-        )
-        end_index = endpoint_pair[1] if start_index == endpoint_pair[0] else endpoint_pair[0]
-
-        distances, previous = self.dijkstra_from_rename_projection(
-            graph,
-            projections[start_index],
-            with_previous=True
-        )
-        network_positions = [
-            self.rename_projection_network_distance(
-                distances,
-                projections[start_index],
-                projection
-            )
-            for projection in projections
-        ]
-
-        ordered_indices = sorted(
-            range(len(clusters)),
-            key=lambda index: (
-                network_positions[index],
-                orientation_positions.get(index, len(clusters)),
-                clusters[index]["lat"],
-                clusters[index]["lon"]
-            )
-        )
-        ordered_clusters = [clusters[index] for index in ordered_indices]
-
-        display_path = self.build_rename_topology_display_path(
-            graph,
-            projections[start_index],
-            projections[end_index],
-            distances,
-            previous
-        )
-
-        if self.rename_reverse_var.get():
-            ordered_clusters.reverse()
-            display_path.reverse()
+            if (
+                proximity_m > 0
+                and geographic_distance <= proximity_m
+                and along_distance <= proximity_m
+            ):
+                groups[-1].append((item, projection))
+            else:
+                groups.append([(item, projection)])
 
         ordered = []
-        for cluster in ordered_clusters:
-            for item in cluster["items"]:
+        for group in groups:
+            # Conserver la progression topo même à l'intérieur du groupe. La date
+            # ne sert qu'à départager une projection pratiquement identique.
+            group.sort(
+                key=lambda pair: (
+                    round(float(pair[1]["along_m"]), 3),
+                    self.rename_photo_date_key(pair[0]),
+                    os.path.basename(pair[0].get("source_path") or "").lower(),
+                )
+            )
+            for item, _projection in group:
                 item["gps_guided_by_topo"] = True
                 item["gps_topo_source"] = source["source_filename"]
                 item["gps_topo_sources"] = list(source.get("source_filenames", []))
                 ordered.append(item)
 
+        if self.rename_reverse_var.get():
+            ordered.reverse()
+            display_path = list(reversed(reference["points"]))
+        else:
+            display_path = list(reference["points"])
+
         ordered.extend(sorted(
             no_gps,
             key=lambda item: (
                 self.rename_photo_date_key(item),
-                os.path.basename(item["source_path"]).lower()
+                os.path.basename(item.get("source_path") or "").lower(),
             )
         ))
 
+        along_values = [projection["along_m"] for _item, projection in projected]
+        ambiguous_items = [
+            item for item, projection in projected
+            if projection.get("ambiguous")
+        ]
+        source_origin = (
+            "folder_auto"
+            if sources and all(candidate.get("folder_auto") for candidate in sources)
+            else "manual" if getattr(self, "rename_gpx_manual_override", False)
+            else "catalogue"
+        )
         self.rename_gpx_guidance_info = {
             "used": True,
+            "method": "linear_reference_individual",
             "source_label": source["label"],
             "source_filename": source["source_filename"],
             "source_filenames": list(source.get("source_filenames", [])),
             "display_path": display_path,
-            "clusters_count": len(clusters),
+            "photos_projected_count": len(projected),
+            "groups_count": len(groups),
+            "ambiguous_count": len(ambiguous_items),
+            "ambiguous_filenames": [
+                os.path.basename(item.get("source_path") or "")
+                for item in ambiguous_items[:20]
+            ],
             "p90_offset_m": p90,
             "max_offset_m": max(offsets),
-            "network_span_m": endpoint_distance,
-            "network_components": graph.get("component_count", 1),
-            "network_bridges": graph.get("bridge_count", 0)
+            "network_span_m": max(along_values) - min(along_values),
+            "reference_length_m": reference.get("length_m", 0.0),
+            "reference_join_gaps_m": list(reference.get("join_gaps_m", [])),
+            "reference_unused_parts": int(reference.get("unused_parts_count", 0)),
+            "source_origin": source_origin,
         }
+        ambiguity_text = (
+            f" · {len(ambiguous_items)} projection(s) ambiguë(s) à contrôler"
+            if ambiguous_items else ""
+        )
         self.log(
-            f"🧭 Ordre GPS guidé par {source['source_filename']} · "
-            f"{len(clusters)} groupe(s) · écart médian "
-            f"{offsets[len(offsets) // 2]:.1f} m · "
-            f"{graph.get('bridge_count', 0)} raccord(s) géométrique(s) court(s)."
+            f"🧭 Ordre GPS : {len(projected)} photo(s) projetée(s) individuellement sur "
+            f"{source['source_filename']} · référence {reference.get('length_m', 0.0):.0f} m · "
+            f"écart médian {offsets[len(offsets) // 2]:.1f} m{ambiguity_text}."
         )
         return ordered
 
@@ -9764,6 +10375,12 @@ namespace GestionBissesFolderPicker
             self.catalog_path = self.local_catalog_path
             self.log(f"⚠️ Projet Data indisponible, utilisation du catalogue local : {exc}")
 
+        # v65 : l'ouverture garantit prudemment le socle photo, sans interrompre le bisse si une photo échoue.
+        try:
+            self.ensure_photo_foundation_automatic()
+        except Exception as exc:
+            self.log(f"⚠️ Préparation automatique des photos incomplète : {exc}")
+
         try:
             self.add_folder_to_workspace(self.base_folder)
         except Exception as exc:
@@ -9800,6 +10417,7 @@ namespace GestionBissesFolderPicker
             is_geo=is_geolocated
         )
 
+
     def folder_has_images(self, folder):
         if not folder or not os.path.exists(folder):
             return False
@@ -9812,356 +10430,387 @@ namespace GestionBissesFolderPicker
         )
 
     def show_contextual_interface(self, has_raw, has_export, has_cat, is_geo):
-        """
-        Tableau de bord du dossier.
-
-        v41 prudente :
-        - le tableau de bord devient surtout un hub de synthèse et d'accès aux ateliers ;
-        - aucune fonction n'est supprimée ;
-        - les commandes techniques restent disponibles dans "Actions avancées / maintenance",
-          replié par défaut ;
-        - la logique GPX n'est pas changée ici, la détection automatique Fichiers GPX
-          reste prévue pour v42.
-        """
+        """Tableau de bord v65 : six étapes métier et trois accès rapides."""
         self.clear_main_frame()
-
-        outer = tk.Frame(self.main_frame)
-        outer.pack(fill="both", expand=True)
-        outer.grid_columnconfigure(0, weight=1)
-        outer.grid_rowconfigure(2, weight=1)
-
-        # ------------------------------------------------------------------
-        # Calculs d'état
-        # ------------------------------------------------------------------
-        photo_ok = 0
-        photo_discarded = 0
-        photo_geolocated = 0
-        photo_titles = 0
-        photo_descriptions = 0
-        platform_selected_count = 0
-        platform_missing_title = 0
-        platform_missing_description = 0
-
-        if has_cat:
-            try:
-                self.catalog_data = self.read_catalog()
-                for entry in self.catalog_data:
-                    status = entry.get("status")
-                    if status == "OK":
-                        photo_ok += 1
-                        if entry.get("gps_coordinates"):
-                            photo_geolocated += 1
-                        if (entry.get("title") or "").strip():
-                            photo_titles += 1
-                        if (entry.get("description") or "").strip():
-                            photo_descriptions += 1
-                        if entry.get("platform_selected"):
-                            platform_selected_count += 1
-                            if not (entry.get("title") or "").strip():
-                                platform_missing_title += 1
-                            if not (entry.get("description") or "").strip():
-                                platform_missing_description += 1
-                    elif status == "SUPPRIMEE":
-                        photo_discarded += 1
-            except Exception:
-                pass
-
-        trace_summary = "Atelier GPX disponible même sans catalogue photo."
-        workshop_sources = 0
-        workshop_segments = 0
-        categorized_segments = 0
-        exported_segments = 0
+        outer = self.make_scrollable_page(padx=4, pady=2)
 
         try:
-            self.read_catalog_container()
-            trace_summary = self.get_trace_summary_text()
-            workshop = self.get_gpx_workshop_state()
-            workshop_sources = len(workshop.get("sources", []))
-            workshop_segments = len(workshop.get("segments", []))
-            categorized_segments = sum(
-                1 for seg in workshop.get("segments", [])
-                if seg.get("category_id", "non_classe") != "non_classe"
-            )
-            traces = self.get_trace_sections()
-            exported_segments = len(traces.get("manual_segments", []))
-        except Exception as e:
-            trace_summary = f"Résumé des tracés indisponible : {e}"
-
-        bisse_info = {}
-        try:
-            bisse_info = self.read_catalog_container().get("bisse_info", {})
+            container = self.read_catalog_container()
         except Exception:
-            bisse_info = {}
+            container = self.empty_catalog_container()
 
-        platform_title = bisse_info.get("title") or os.path.basename(self.base_folder or "")
-        platform_slug = bisse_info.get("slug") or self.slugify(platform_title)
+        photos = [
+            entry for entry in container.get("photos", [])
+            if isinstance(entry, dict) and entry.get("status") == "OK"
+        ]
+        photo_count = len(photos)
+        geo_count = sum(
+            1 for entry in photos
+            if entry.get("gps_coordinates")
+        )
+        order_count = sum(
+            1 for entry in photos
+            if int(entry.get("photo_order") or 0) > 0
+        )
+        selected_count = sum(
+            1 for entry in photos
+            if entry.get("platform_selected")
+        )
+        renamed_count = sum(
+            1 for entry in photos
+            if entry.get("renamed") or entry.get("rename_date")
+        )
 
-        # ------------------------------------------------------------------
-        # En-tête synthétique
-        # ------------------------------------------------------------------
+        workshop = container.get("gpx_workshop", {}) or {}
+        cartography_started = bool(
+            workshop.get("sources")
+            or workshop.get("segments")
+            or (container.get("gpx_traces", {}) or {}).get("manual_segments")
+        )
+
+        info = container.get("bisse_info", {}) or {}
+        title = (
+            info.get("title")
+            or container.get("project", {}).get("title")
+            or os.path.basename(self.base_folder or "")
+            or "Bisse actif"
+        )
+        region = str(info.get("region") or "").strip()
+        commune = str(
+            info.get("communes")
+            or info.get("commune")
+            or ""
+        ).strip()
+
         header = tk.Frame(outer)
-        header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        header.pack(fill="x", pady=(0, 12))
         header.grid_columnconfigure(0, weight=1)
 
-        title_text = platform_title or "Bisse actif"
         tk.Label(
             header,
-            text=f"📁 {title_text}",
-            font=("Arial", 17, "bold"),
+            text=title,
+            font=("Arial", 20, "bold"),
             anchor="w"
         ).grid(row=0, column=0, sticky="ew")
+
+        subtitle = " · ".join(
+            value for value in (commune, region) if value
+        )
+        if subtitle:
+            tk.Label(
+                header,
+                text=subtitle,
+                fg="#666666",
+                anchor="w"
+            ).grid(row=1, column=0, sticky="ew")
 
         tk.Button(
             header,
             text="🏠 Mes bisses",
             command=self.show_workspace_home
-        ).grid(row=0, column=1, sticky="e", padx=(8, 0))
+        ).grid(
+            row=0,
+            column=1,
+            rowspan=2,
+            sticky="e"
+        )
 
-        tk.Label(
-            header,
-            text=f"Dossier : {self.base_folder or '—'}",
-            justify="left",
-            anchor="w",
-            fg="#666666",
-            wraplength=1300
-        ).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(3, 0))
+        content = tk.Frame(outer)
+        content.pack(fill="both", expand=True)
+        content.grid_columnconfigure(0, weight=3)
+        content.grid_columnconfigure(1, weight=1)
 
-        # ------------------------------------------------------------------
-        # Bandeau état court
-        # ------------------------------------------------------------------
-        status = tk.Frame(outer)
-        status.grid(row=1, column=0, sticky="ew", pady=(0, 8))
-        for col in range(4):
-            status.grid_columnconfigure(col, weight=1)
+        workflow = tk.LabelFrame(
+            content,
+            text="Parcours du bisse",
+            padx=12,
+            pady=10
+        )
+        workflow.grid(
+            row=0,
+            column=0,
+            sticky="nsew",
+            padx=(0, 6)
+        )
+        workflow.grid_columnconfigure(1, weight=1)
 
-        def status_card(col, title, lines, accent=None):
-            card = tk.LabelFrame(status, text=title, padx=8, pady=6)
-            card.grid(row=0, column=col, sticky="nsew", padx=(0 if col == 0 else 4, 0 if col == 3 else 4))
+        quick = tk.LabelFrame(
+            content,
+            text="Accès rapides",
+            padx=12,
+            pady=10
+        )
+        quick.grid(
+            row=0,
+            column=1,
+            sticky="nsew",
+            padx=(6, 0)
+        )
+        quick.grid_columnconfigure(0, weight=1)
+
+        def add_step(row, number, label, state, command, accent):
             tk.Label(
-                card,
-                text="\n".join(lines),
-                justify="left",
-                anchor="w",
-                fg=accent or "#333333",
-                wraplength=310
-            ).pack(fill="x")
+                workflow,
+                text=str(number),
+                width=3,
+                height=2,
+                bg=accent,
+                fg="white",
+                font=("Arial", 12, "bold")
+            ).grid(
+                row=row,
+                column=0,
+                sticky="nsw",
+                padx=(0, 10),
+                pady=5
+            )
 
-        status_card(
+            body = tk.Frame(workflow)
+            body.grid(
+                row=row,
+                column=1,
+                sticky="ew",
+                pady=5
+            )
+            body.grid_columnconfigure(0, weight=1)
+
+            tk.Label(
+                body,
+                text=label,
+                font=("Arial", 12, "bold"),
+                anchor="w"
+            ).grid(row=0, column=0, sticky="ew")
+
+            tk.Label(
+                body,
+                text=state,
+                fg="#666666",
+                anchor="w"
+            ).grid(row=1, column=0, sticky="ew")
+
+            tk.Button(
+                workflow,
+                text="Ouvrir",
+                command=command,
+                width=12
+            ).grid(
+                row=row,
+                column=2,
+                sticky="e",
+                padx=(12, 0),
+                pady=5
+            )
+
+        add_step(
             0,
-            "Dossier",
-            [
-                f"Photos source : {'oui' if has_raw else 'non'}",
-                f"Export JPG : {'oui' if has_export else 'non'}",
-                f"Catalogue : {'oui' if has_cat else 'non'}"
-            ]
-        )
-
-        status_card(
             1,
-            "Photos",
-            [
-                f"Actives : {photo_ok}" if has_cat else "Actives : —",
-                f"GPS : {photo_geolocated}/{photo_ok}" if has_cat else "GPS : —",
-                f"Titre/desc. : {photo_titles}/{photo_descriptions}" if has_cat else "Titre/desc. : —"
-            ]
-        )
-
-        status_card(
-            2,
-            "GPX",
-            [
-                f"Sources : {workshop_sources}",
-                f"Segments : {workshop_segments}",
-                f"Classés/exportés : {categorized_segments}/{exported_segments}"
-            ]
-        )
-
-        status_card(
-            3,
-            "Plateforme",
-            [
-                f"Photos choisies : {platform_selected_count}",
-                f"Sans titre : {platform_missing_title}",
-                f"Sans description : {platform_missing_description}"
-            ],
-            accent="#7d3c98" if platform_missing_title or platform_missing_description else None
-        )
-
-        # ------------------------------------------------------------------
-        # Cartes principales : accès aux ateliers / modules
-        # ------------------------------------------------------------------
-        modules = tk.Frame(outer)
-        modules.grid(row=2, column=0, sticky="nsew")
-        modules.grid_columnconfigure(0, weight=1)
-        modules.grid_columnconfigure(1, weight=1)
-        modules.grid_columnconfigure(2, weight=1)
-        modules.grid_rowconfigure(0, weight=1)
-
-        photos_frame = tk.LabelFrame(modules, text="📷 Photos", padx=10, pady=8)
-        photos_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
-
-        gpx_frame = tk.LabelFrame(modules, text="🧭 Tracés GPX", padx=10, pady=8)
-        gpx_frame.grid(row=0, column=1, sticky="nsew", padx=5)
-
-        info_frame = tk.LabelFrame(modules, text="📝 Fiche / publication", padx=10, pady=8)
-        info_frame.grid(row=0, column=2, sticky="nsew", padx=(5, 0))
-
-        # Photos : accès principal + amorçage si nécessaire.
-        tk.Label(
-            photos_frame,
-            text=(
-                f"{photo_ok} photo(s) active(s), {photo_geolocated} géolocalisée(s).\n"
-                "Travail courant : carte, visionneuse, titres, descriptions, sélection plateforme."
-                if has_cat else
-                "Aucun catalogue photo utilisable pour l’instant.\n"
-                "L’atelier Photos peut s’ouvrir en état vide, mais il faut créer ou compléter le catalogue pour travailler sur les images."
+            "Géolocalisation",
+            (
+                f"{geo_count}/{photo_count} photos localisées"
+                if photo_count else "Aucune photo"
             ),
-            justify="left",
-            anchor="w",
-            fg="#555555",
-            wraplength=410
-        ).pack(fill="x", pady=(0, 8))
+            self.show_photo_geolocation,
+            "#2e86c1"
+        )
+
+        add_step(
+            1,
+            2,
+            "Ordre des photos",
+            (
+                "Ordre défini"
+                if photo_count and order_count == photo_count
+                else (
+                    f"Ordre défini pour {order_count}/{photo_count} photos"
+                    if photo_count else "Aucune photo"
+                )
+            ),
+            self.show_photo_order_interface,
+            "#8e44ad"
+        )
+
+        add_step(
+            2,
+            3,
+            "Cartographie",
+            (
+                "Travail commencé"
+                if cartography_started
+                else "À commencer"
+            ),
+            self.show_trace_module,
+            "#d35400"
+        )
+
+        add_step(
+            3,
+            4,
+            "Photos",
+            (
+                f"{selected_count} photo(s) retenue(s)"
+                if selected_count
+                else "À travailler"
+            ),
+            self.show_bisse_photos_module,
+            "#117864"
+        )
+
+        add_step(
+            4,
+            5,
+            "Renommage",
+            (
+                "Prêt à renommer"
+                if photo_count and order_count == photo_count and not renamed_count
+                else (
+                    "Renommage effectué"
+                    if photo_count and renamed_count >= photo_count
+                    else (
+                        f"{renamed_count}/{photo_count} photo(s) renommée(s)"
+                        if renamed_count else "Définir d'abord l'ordre"
+                    )
+                )
+            ),
+            self.show_rename_interface,
+            "#7d3c98"
+        )
+
+        add_step(
+            5,
+            6,
+            "Rendu / Prévisualisation",
+            "Étape finale",
+            self.show_render_preview_module,
+            "#1f618d"
+        )
 
         tk.Button(
-            photos_frame,
-            text="⚙️ Préparation photos",
-            command=self.show_photo_preparation_dialog,
-            bg="#2c3e50" if has_raw and not has_cat else "#ecf0f1",
-            fg="white" if has_raw and not has_cat else "black",
-            height=2 if has_raw and not has_cat else 1
-        ).pack(fill="x", pady=(0, 6))
-
-        tk.Button(
-            photos_frame,
-            text="🗺️ Ouvrir l’atelier Photos",
-            command=self.show_map_interface,
+            quick,
+            text="📷 Photos",
+            command=self.show_bisse_photos_module,
             bg="#2980b9",
             fg="white",
             height=2
-        ).pack(fill="x", pady=4)
-
-        # GPX : on garde seulement la porte d'entrée principale ici.
-        tk.Label(
-            gpx_frame,
-            text=(
-                f"{workshop_sources} source(s), {workshop_segments} segment(s), "
-                f"{categorized_segments} segment(s) classé(s).\n"
-                "Travail courant : import brut, sens amont → aval, segmentation, catégories, export."
-            ),
-            justify="left",
-            anchor="w",
-            fg="#555555",
-            wraplength=410
-        ).pack(fill="x", pady=(0, 8))
+        ).grid(
+            row=0,
+            column=0,
+            sticky="ew",
+            pady=(0, 7)
+        )
 
         tk.Button(
-            gpx_frame,
-            text="🧭 Ouvrir l’atelier Tracés GPX",
-            command=self.show_gpx_workshop,
+            quick,
+            text="🗺️ Cartographie",
+            command=self.show_trace_module,
             bg="#d35400",
             fg="white",
             height=2
-        ).pack(fill="x", pady=4)
-
-        tk.Label(
-            gpx_frame,
-            text=trace_summary,
-            justify="left",
-            anchor="w",
-            fg="#666666",
-            wraplength=410
-        ).pack(fill="x", pady=(8, 0))
-
-        # Fiche / publication : portes d'entrée principales.
-        tk.Label(
-            info_frame,
-            text=(
-                f"Fiche : {platform_title or 'à compléter'}\n"
-                f"Slug : {platform_slug or '—'}\n"
-                f"Photos plateforme : {platform_selected_count}"
-            ),
-            justify="left",
-            anchor="w",
-            fg="#555555",
-            wraplength=410
-        ).pack(fill="x", pady=(0, 8))
+        ).grid(
+            row=1,
+            column=0,
+            sticky="ew",
+            pady=7
+        )
 
         tk.Button(
-            info_frame,
-            text="📝 Informations générales",
-            command=self.show_bisse_info_editor,
-            bg="#34495e",
-            fg="white",
-            height=2
-        ).pack(fill="x", pady=4)
-
-        tk.Button(
-            info_frame,
-            text="🌐 Publication / export",
-            command=self.show_publication_module,
+            quick,
+            text="👁 Rendu / Prévisualisation",
+            command=self.show_render_preview_module,
             bg="#1f618d",
             fg="white",
             height=2
-        ).pack(fill="x", pady=4)
-
-        # ------------------------------------------------------------------
-        # Maintenance : seule la maintenance transversale reste sur le dashboard.
-        # Les fonctions Photos et GPX ont été replacées dans leurs modules.
-        # ------------------------------------------------------------------
-        maintenance_shell = tk.Frame(outer)
-        maintenance_shell.grid(row=3, column=0, sticky="ew", pady=(8, 0))
-        maintenance_shell.grid_columnconfigure(0, weight=1)
-
-        maintenance_visible = tk.BooleanVar(value=False)
-        maintenance_content = tk.LabelFrame(
-            maintenance_shell,
-            text="Maintenance du dossier",
-            padx=10,
-            pady=8
+        ).grid(
+            row=2,
+            column=0,
+            sticky="ew",
+            pady=7
         )
 
-        maintenance_button = tk.Button(
-            maintenance_shell,
-            text="▶ Maintenance du dossier",
+        secondary = tk.LabelFrame(
+            quick,
+            text="Fiche",
+            padx=7,
+            pady=7
+        )
+        secondary.grid(
+            row=3,
+            column=0,
+            sticky="ew",
+            pady=(14, 4)
+        )
+        secondary.grid_columnconfigure(0, weight=1)
+
+        tk.Button(
+            secondary,
+            text="📝 Fiche du bisse",
+            command=self.show_bisse_info_editor
+        ).grid(
+            row=0,
+            column=0,
+            sticky="ew"
+        )
+
+        advanced_visible = tk.BooleanVar(value=False)
+        advanced_button = tk.Button(
+            quick,
+            text="▶ Outils avancés",
             anchor="w"
         )
-        maintenance_button.grid(row=0, column=0, sticky="ew")
+        advanced_button.grid(
+            row=4,
+            column=0,
+            sticky="ew",
+            pady=(10, 4)
+        )
 
-        def toggle_maintenance():
-            if maintenance_visible.get():
-                maintenance_content.grid_remove()
-                maintenance_button.config(text="▶ Maintenance du dossier")
-                maintenance_visible.set(False)
+        advanced = tk.Frame(quick)
+        advanced.grid_columnconfigure(0, weight=1)
+
+        def toggle_advanced():
+            if advanced_visible.get():
+                advanced.grid_remove()
+                advanced_button.config(text="▶ Outils avancés")
+                advanced_visible.set(False)
             else:
-                maintenance_content.grid(row=1, column=0, sticky="ew", pady=(6, 0))
-                maintenance_button.config(text="▼ Maintenance du dossier")
-                maintenance_visible.set(True)
+                advanced.grid(
+                    row=5,
+                    column=0,
+                    sticky="ew"
+                )
+                advanced_button.config(text="▼ Outils avancés")
+                advanced_visible.set(True)
 
-        maintenance_button.config(command=toggle_maintenance)
+        advanced_button.config(command=toggle_advanced)
 
         tk.Button(
-            maintenance_content,
+            advanced,
             text="✅ Vérifier la structure du dossier",
             command=self.check_local_folder_structure
-        ).pack(side="left", fill="x", expand=True, padx=(0, 6))
+        ).grid(row=0, column=0, sticky="ew", pady=3)
 
         tk.Button(
-            maintenance_content,
-            text="🛡️ Audit Data",
+            advanced,
+            text="🛡️ Audit des données",
             command=self.audit_data_integrity_dialog
-        ).pack(side="left", fill="x", expand=True, padx=(0, 6))
+        ).grid(row=1, column=0, sticky="ew", pady=3)
+
+        tk.Button(
+            advanced,
+            text="🔄 Relancer la préparation des photos",
+            command=lambda: (
+                self.ensure_photo_foundation_automatic(),
+                self.load_folder(self.base_folder)
+            )
+        ).grid(row=2, column=0, sticky="ew", pady=3)
 
         tk.Label(
-            maintenance_content,
-            text=(
-                "Les commandes Photos sont maintenant dans “Préparation photos”. "
-                "Les commandes GPX sont dans l’atelier GPX, onglet “Import / branches”."
-            ),
-            justify="left",
+            outer,
+            text=self.base_folder,
+            fg="#888888",
             anchor="w",
-            fg="#666666",
-            wraplength=900
-        ).pack(side="left", fill="x", expand=True, padx=(6, 0))
+            font=("Arial", 8)
+        ).pack(fill="x", pady=(10, 0))
+
 
     def check_local_folder_structure(self):
         """
@@ -11618,6 +12267,898 @@ namespace GestionBissesFolderPicker
 
         self.refresh_publication_tree()
 
+    # ============================================================
+    # V65 — SOCLE PHOTO AUTOMATIQUE PRUDENT
+    # ============================================================
+
+    def photo_files_for_automatic_preparation(self, photos_folder):
+        """Inventorie les JPG/JPEG/HEIC/HEIF du dossier photos actif."""
+        if not photos_folder or not os.path.isdir(photos_folder):
+            return []
+
+        valid_ext = (".jpg", ".jpeg", ".heic", ".heif")
+        files = []
+        try:
+            for filename in sorted(os.listdir(photos_folder), key=str.casefold):
+                path = os.path.join(photos_folder, filename)
+                if os.path.isfile(path) and filename.lower().endswith(valid_ext):
+                    files.append(os.path.abspath(path))
+        except Exception:
+            return []
+        return files
+
+    def photo_relpath_from_root(self, root_folder, path):
+        try:
+            return os.path.relpath(path, root_folder).replace("\\", "/")
+        except Exception:
+            return str(path).replace("\\", "/")
+
+    def normalize_photo_catalog_key(self, value):
+        value = str(value or "").replace("\\", "/").strip()
+        return value.casefold() if value else ""
+
+    def convert_heic_for_automatic_preparation(self, source_path, target_path):
+        """
+        Convertit un HEIC/HEIF seulement si son JPG de travail n'existe pas.
+
+        Un JPG existant n'est jamais reconverti automatiquement : il peut déjà
+        contenir des métadonnées ou des corrections faites dans Abisses.
+        """
+        if os.path.exists(target_path):
+            return False
+
+        os.makedirs(os.path.dirname(target_path), exist_ok=True)
+
+        image = Image.open(source_path)
+        exif_data = image.info.get("exif", b"")
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+
+        temp_path = target_path + f".tmp_{uuid.uuid4().hex[:8]}"
+        try:
+            if exif_data:
+                image.save(
+                    temp_path,
+                    "JPEG",
+                    quality=100,
+                    subsampling=0,
+                    exif=exif_data
+                )
+            else:
+                image.save(
+                    temp_path,
+                    "JPEG",
+                    quality=100,
+                    subsampling=0
+                )
+            os.replace(temp_path, target_path)
+        finally:
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
+
+        return True
+
+    def prepare_photo_foundation_for_folder(
+        self,
+        root_folder,
+        container,
+        photos_folder=None,
+        export_folder=None,
+        progress_callback=None,
+    ):
+        """
+        Réconcilie automatiquement les photos présentes avec les données internes.
+
+        Non destructif :
+        - aucune photo source n'est déplacée, renommée ou supprimée ;
+        - un JPG de travail existant n'est jamais reconverti ;
+        - les titres, descriptions, GPS, ordres et sélections existants gagnent ;
+        - les entrées dont le fichier manque restent conservées ;
+        - seules les informations manquantes sont complétées.
+        """
+        root_folder = os.path.abspath(root_folder)
+        photos_folder = os.path.abspath(
+            photos_folder
+            or (
+                os.path.join(root_folder, "Photos")
+                if os.path.isdir(os.path.join(root_folder, "Photos"))
+                else root_folder
+            )
+        )
+        export_folder = os.path.abspath(
+            export_folder or os.path.join(root_folder, "Export_JPG")
+        )
+
+        if not isinstance(container, dict):
+            raise ValueError("Conteneur de données photo invalide.")
+
+        container.setdefault("photos", [])
+        if not isinstance(container["photos"], list):
+            container["photos"] = []
+        entries = container["photos"]
+
+        before = json.dumps(container, ensure_ascii=False, sort_keys=True, default=str)
+
+        by_source = {}
+        by_image = {}
+        original_name_indices = {}
+
+        for idx, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                continue
+
+            source_key = self.normalize_photo_catalog_key(
+                entry.get("source_relative_path")
+            )
+            image_key = self.normalize_photo_catalog_key(
+                entry.get("image_relative_path")
+            )
+            original_key = str(entry.get("original_filename") or "").casefold()
+
+            if source_key:
+                by_source.setdefault(source_key, idx)
+            if image_key:
+                by_image.setdefault(image_key, idx)
+            if original_key:
+                original_name_indices.setdefault(original_key, []).append(idx)
+
+        # Protection contre deux HEIC/HEIF qui voudraient utiliser le même JPG.
+        claimed_working_paths = {}
+        for idx, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                continue
+            image_key = self.normalize_photo_catalog_key(
+                entry.get("image_relative_path")
+            )
+            source_key = self.normalize_photo_catalog_key(
+                entry.get("source_relative_path")
+            )
+            if image_key:
+                claimed_working_paths.setdefault(
+                    image_key,
+                    source_key or f"entry:{idx}"
+                )
+
+        source_files = self.photo_files_for_automatic_preparation(photos_folder)
+        total = max(1, len(source_files))
+
+        summary = {
+            "sources": len(source_files),
+            "new_entries": 0,
+            "converted": 0,
+            "metadata_completed": 0,
+            "gps_found": 0,
+            "errors": 0,
+            "catalogue_changed": False,
+        }
+
+        for pos, source_path in enumerate(source_files, start=1):
+            source_rel = self.photo_relpath_from_root(root_folder, source_path)
+            source_key = self.normalize_photo_catalog_key(source_rel)
+            source_name = os.path.basename(source_path)
+            ext = os.path.splitext(source_name)[1].lower()
+            is_heic = ext in (".heic", ".heif")
+            is_jpg = ext in (".jpg", ".jpeg")
+
+            entry_index = by_source.get(source_key)
+
+            # Après un renommage d'un JPG dans Photos/, image_relative_path est
+            # le meilleur identifiant et évite de créer un doublon.
+            if entry_index is None and is_jpg:
+                entry_index = by_image.get(source_key)
+
+            # Compatibilité anciens catalogues : repli sur original_filename
+            # uniquement si le nom est unique.
+            if entry_index is None:
+                candidates = original_name_indices.get(source_name.casefold(), [])
+                if len(candidates) == 1:
+                    entry_index = candidates[0]
+
+            if entry_index is None:
+                entry = {
+                    "filename": source_name,
+                    "original_filename": source_name,
+                    "source_relative_path": source_rel,
+                    "image_relative_path": source_rel,
+                    "status": "OK",
+                    "converted_from_heic": is_heic,
+                    "uses_original_jpg": is_jpg,
+                    "copied_from_jpg": False,
+                    "gps_sync": "NON_ENCORE_FAIT",
+                    "gps_source": None,
+                    "date_taken": None,
+                    "gps_coordinates": None,
+                    "title": "",
+                    "description": "",
+                    "platform_selected": False,
+                    "platform_order": 0,
+                    "platform_caption": "",
+                }
+                entries.append(entry)
+                entry_index = len(entries) - 1
+                by_source[source_key] = entry_index
+                original_name_indices.setdefault(
+                    source_name.casefold(), []
+                ).append(entry_index)
+                summary["new_entries"] += 1
+            else:
+                entry = entries[entry_index]
+                if not isinstance(entry, dict):
+                    entry = {}
+                    entries[entry_index] = entry
+
+            was_discarded = entry.get("status") == "SUPPRIMEE"
+
+            entry.setdefault("original_filename", source_name)
+            entry.setdefault("source_relative_path", source_rel)
+            entry.setdefault("platform_selected", False)
+            entry.setdefault("platform_order", 0)
+            entry.setdefault("platform_caption", "")
+            entry.setdefault("title", "")
+            entry.setdefault("description", "")
+            entry.setdefault("gps_sync", "NON_ENCORE_FAIT")
+            entry.setdefault("gps_source", None)
+            entry.setdefault("date_taken", None)
+            entry.setdefault("gps_coordinates", None)
+            entry.setdefault("copied_from_jpg", False)
+            entry.setdefault("converted_from_heic", is_heic)
+            entry.setdefault("uses_original_jpg", is_jpg)
+
+            # Si une image de travail déjà renommée existe, la conserver.
+            working_path = ""
+            existing_image_rel = str(entry.get("image_relative_path") or "")
+            if existing_image_rel:
+                existing_image_path = os.path.join(
+                    root_folder,
+                    existing_image_rel.replace("/", os.sep)
+                )
+                if (
+                    os.path.isfile(existing_image_path)
+                    and existing_image_path.lower().endswith((".jpg", ".jpeg"))
+                ):
+                    working_path = existing_image_path
+
+            try:
+                if is_heic:
+                    if not working_path:
+                        target_name = os.path.splitext(source_name)[0] + ".jpg"
+                        target_path = os.path.join(export_folder, target_name)
+                        target_rel = self.photo_relpath_from_root(
+                            root_folder, target_path
+                        )
+                        target_key = self.normalize_photo_catalog_key(target_rel)
+
+                        claimed_by = claimed_working_paths.get(target_key)
+                        if claimed_by and claimed_by != source_key:
+                            raise RuntimeError(
+                                "Collision de JPG de travail pour "
+                                f"{source_name} : {target_name}"
+                            )
+
+                        if self.convert_heic_for_automatic_preparation(
+                            source_path, target_path
+                        ):
+                            summary["converted"] += 1
+
+                        working_path = target_path
+                        claimed_working_paths[target_key] = source_key
+
+                elif is_jpg:
+                    # Les JPG/JPEG originaux sont utilisés directement.
+                    working_path = source_path
+
+                if not working_path or not os.path.isfile(working_path):
+                    raise FileNotFoundError(
+                        f"Image de travail introuvable pour {source_name}"
+                    )
+
+                working_rel = self.photo_relpath_from_root(
+                    root_folder, working_path
+                )
+
+                current_rel = str(entry.get("image_relative_path") or "")
+                current_abs = (
+                    os.path.join(
+                        root_folder,
+                        current_rel.replace("/", os.sep)
+                    )
+                    if current_rel else ""
+                )
+
+                # Ne remplace le chemin que s'il manque ou ne pointe pas vers
+                # un JPG/JPEG de travail valide. Un HEIC source existant ne doit
+                # donc pas empêcher l'inscription du JPG converti dans Export_JPG.
+                current_is_valid_working = (
+                    bool(current_rel)
+                    and os.path.isfile(current_abs)
+                    and current_abs.lower().endswith((".jpg", ".jpeg"))
+                )
+                if not current_is_valid_working:
+                    entry["image_relative_path"] = working_rel
+                    entry["filename"] = os.path.basename(working_path)
+                elif not entry.get("filename"):
+                    entry["filename"] = os.path.basename(working_path)
+
+                entry["converted_from_heic"] = bool(
+                    entry.get("converted_from_heic") or is_heic
+                )
+                entry["uses_original_jpg"] = bool(is_jpg)
+
+                metadata_changed = False
+
+                # Titres/descriptions : compléter seulement si vides.
+                text_meta = self.read_text_metadata_from_jpg(working_path)
+                if text_meta.get("ok"):
+                    meta_title = (text_meta.get("title") or "").strip()
+                    meta_description = (
+                        text_meta.get("description") or ""
+                    ).strip()
+
+                    if not (entry.get("title") or "").strip() and meta_title:
+                        entry["title"] = text_meta.get("title", "")
+                        metadata_changed = True
+                    if (
+                        not (entry.get("description") or "").strip()
+                        and meta_description
+                    ):
+                        entry["description"] = text_meta.get(
+                            "description", ""
+                        )
+                        metadata_changed = True
+
+                # Date : compléter même sans GPS.
+                if not entry.get("date_taken"):
+                    try:
+                        capture_dt = self.get_capture_datetime_for_sort(
+                            working_path, entry
+                        )
+                        if capture_dt != datetime.max:
+                            entry["date_taken"] = capture_dt.isoformat()
+                            metadata_changed = True
+                    except Exception:
+                        pass
+
+                # GPS EXIF : compléter seulement si le catalogue n'a pas déjà
+                # de coordonnées. Les corrections métier existantes gagnent.
+                if not entry.get("gps_coordinates"):
+                    gps_meta = self.read_gps_metadata_from_jpg(working_path)
+                    if gps_meta.get("ok"):
+                        entry["gps_coordinates"] = {
+                            "lat": gps_meta["lat"],
+                            "lon": gps_meta["lon"],
+                            "ele": gps_meta.get("ele"),
+                        }
+                        entry["gps_sync"] = "OK_METADATA"
+                        entry["gps_source"] = "JPG_EXIF"
+                        metadata_changed = True
+                        summary["gps_found"] += 1
+
+                if metadata_changed:
+                    summary["metadata_completed"] += 1
+
+                if (
+                    not was_discarded
+                    and entry.get("status") in (None, "", "ERREUR")
+                ):
+                    entry["status"] = "OK"
+                    entry.pop("error", None)
+
+            except Exception as exc:
+                summary["errors"] += 1
+                if not was_discarded:
+                    entry["status"] = "ERREUR"
+                    entry["error"] = str(exc)
+                self.log(
+                    f"⚠️ Préparation automatique photo : {source_name} · {exc}"
+                )
+
+            if callable(progress_callback):
+                try:
+                    progress_callback(pos, total, source_name)
+                except Exception:
+                    pass
+
+        after = json.dumps(
+            container,
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str
+        )
+        changed = before != after
+
+        if changed:
+            container.setdefault("project", {})
+            container["project"]["updated_at"] = datetime.now().isoformat(
+                timespec="seconds"
+            )
+
+        summary["catalogue_changed"] = changed
+        return container, summary, changed
+
+
+    def write_active_catalog_automatic(self):
+        """Sauvegarde silencieuse du socle photo automatique, sans écraser une autre source."""
+        self.ensure_safe_before_save(interactive=False)
+        self.reset_active_catalog_paths_to_local()
+        self._write_json_atomic_v65(self.catalog_path, self.catalog_container, indent=4)
+        try:
+            self.write_portable_data_copy_for_active_project()
+        except Exception as exc:
+            self.log(
+                "⚠️ Copie Data portable impossible après préparation automatique : "
+                f"{exc}"
+            )
+
+    def ensure_photo_foundation_automatic(self):
+        """Prépare prudemment le socle photo à l'ouverture, avec progression visible."""
+        source_count = len(self.photo_files_for_automatic_preparation(self.photos_folder))
+        token = self.begin_activity(
+            "Préparation des photos…",
+            mode="determinate",
+            maximum=max(1, source_count),
+            delay_ms=180,
+        )
+
+        def on_progress(position, total, filename):
+            label = os.path.basename(filename or "")
+            message = (
+                f"Préparation des photos… {position}/{total} · {label}"
+                if total else "Préparation des photos…"
+            )
+            self.update_activity(token, message, position, max(1, total))
+
+        try:
+            container = self.read_catalog_container()
+            prepared, summary, changed = self.prepare_photo_foundation_for_folder(
+                self.base_folder,
+                container,
+                photos_folder=self.photos_folder,
+                export_folder=self.export_folder,
+                progress_callback=on_progress,
+            )
+            self.catalog_container = prepared
+            self.catalog_data = prepared.get("photos", [])
+            if changed or not os.path.exists(self.catalog_path):
+                self.write_active_catalog_automatic()
+            if (
+                summary.get("new_entries")
+                or summary.get("converted")
+                or summary.get("metadata_completed")
+                or summary.get("errors")
+            ):
+                self.log(
+                    "📷 Préparation automatique : "
+                    f"{summary.get('sources', 0)} source(s), "
+                    f"{summary.get('new_entries', 0)} nouvelle(s), "
+                    f"{summary.get('converted', 0)} HEIC/HEIF convertie(s), "
+                    f"{summary.get('metadata_completed', 0)} métadonnée(s) complétée(s), "
+                    f"{summary.get('errors', 0)} erreur(s)."
+                )
+            return summary
+        finally:
+            self.end_activity(token, restore_status=True)
+
+    # V65 — portes d'entrée préparées pour le futur parcours utilisateur.
+    # Référence ciblée : v64, show_photo_geolocation / show_trace_module /
+    # show_bisse_photos_module. Les méthodes et moteurs v57 restent inchangés.
+    def show_photo_geolocation(self):
+        """Écran dédié utilisant exclusivement les opérations GPS de la v57."""
+        if not self.base_folder:
+            messagebox.showwarning("Aucun bisse", "Ouvrez d'abord un bisse.")
+            return
+
+        try:
+            self.catalog_data = self.read_catalog()
+        except Exception as exc:
+            messagebox.showerror("Photos indisponibles", str(exc))
+            return
+
+        active = [
+            entry for entry in self.catalog_data
+            if isinstance(entry, dict) and entry.get("status") == "OK"
+        ]
+        geo = [entry for entry in active if entry.get("gps_coordinates")]
+        selected_gpx = self.get_selected_gpx_files()
+        if len(selected_gpx) == 1:
+            gpx_label = f"Trace : {os.path.basename(selected_gpx[0])}"
+        elif selected_gpx:
+            gpx_label = (
+                f"{len(selected_gpx)} traces sélectionnées · première : "
+                f"{os.path.basename(selected_gpx[0])}"
+            )
+        else:
+            gpx_label = "Aucune trace sélectionnée"
+
+        self.clear_main_frame()
+        self.status_header.config(text="Géolocalisation", fg="#2e86c1")
+
+        outer = tk.Frame(self.main_frame, padx=18, pady=16)
+        outer.pack(fill="both", expand=True)
+        outer.grid_columnconfigure(0, weight=1)
+
+        top = tk.Frame(outer)
+        top.grid(row=0, column=0, sticky="ew", pady=(0, 14))
+        tk.Button(
+            top, text="↩️ Tableau de bord",
+            command=lambda: self.load_folder(self.base_folder)
+        ).pack(side="left")
+        tk.Label(
+            top, text="Géolocalisation", font=("Arial", 18, "bold")
+        ).pack(side="left", padx=14)
+
+        status = tk.LabelFrame(outer, text="Photos", padx=12, pady=10)
+        status.grid(row=1, column=0, sticky="ew", pady=(0, 12))
+        tk.Label(
+            status,
+            text=f"Photos actives : {len(active)} · Géolocalisées : {len(geo)}",
+            font=("Arial", 12, "bold"),
+            anchor="w"
+        ).pack(fill="x")
+        tk.Label(
+            status,
+            text=(
+                "Les coordonnées déjà présentes sont conservées lorsqu'aucun "
+                "point GPX n'est retenu par la synchronisation."
+            ),
+            fg="#666666",
+            justify="left",
+            anchor="w",
+            wraplength=760
+        ).pack(fill="x", pady=(4, 0))
+
+        sync = tk.LabelFrame(outer, text="Synchronisation", padx=12, pady=10)
+        sync.grid(row=2, column=0, sticky="ew")
+        sync.grid_columnconfigure(1, weight=1)
+
+        tk.Button(
+            sync,
+            text="🛰️ Choisir une ou plusieurs traces GPX",
+            command=self.select_gpx
+        ).grid(row=0, column=0, sticky="w", padx=(0, 10), pady=4)
+
+        self.lbl_gpx = tk.Label(
+            sync, text=gpx_label, fg="green" if selected_gpx else "#666666",
+            anchor="w", justify="left", wraplength=520
+        )
+        self.lbl_gpx.grid(row=0, column=1, sticky="ew")
+
+        self.btn_sync = tk.Button(
+            sync,
+            text="📍 Géolocaliser les photos",
+            command=self.run_sync,
+            bg="#27ae60",
+            fg="white",
+            height=2,
+            state="normal" if selected_gpx else "disabled"
+        )
+        self.btn_sync.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 4))
+
+        # select_gpx() teste la présence de ces attributs avant de les utiliser.
+        # La fermeture de cette page ne doit pas lui laisser des widgets détruits.
+        def release_gpx_controls(event):
+            for name in ("lbl_gpx", "btn_sync"):
+                if getattr(self, name, None) is event.widget:
+                    delattr(self, name)
+
+        for widget in (self.lbl_gpx, self.btn_sync):
+            widget.bind("<Destroy>", release_gpx_controls, add="+")
+
+        tk.Button(
+            outer,
+            text="✍️ Écrire les coordonnées actuelles dans les JPG",
+            command=self.write_catalog_gps_to_jpg_metadata
+        ).grid(row=3, column=0, sticky="ew", pady=(12, 0))
+
+    def show_trace_module(self):
+        """Porte d'entrée utilisateur « Cartographie », moteur GPX v57 inchangé."""
+        self.show_gpx_workshop()
+        try:
+            if self.gpx_workshop_active:
+                self.status_header.config(text="Cartographie", fg="#d35400")
+        except Exception:
+            pass
+
+
+    def show_bisse_photos_module(self):
+        """Porte d'entrée utilisateur « Photos » vers l'atelier existant."""
+        self.show_map_interface()
+
+
+    def capture_active_bisse_state(self):
+        return {
+            "base_folder": self.base_folder,
+            "photos_folder": self.photos_folder,
+            "manual_photos_folder": self.manual_photos_folder,
+            "export_folder": self.export_folder,
+            "gpx_folder": self.gpx_folder,
+            "catalog_path": self.catalog_path,
+            "local_catalog_path": getattr(self, "local_catalog_path", ""),
+            "current_project_id": getattr(self, "current_project_id", ""),
+            "current_project_dir": getattr(self, "current_project_dir", ""),
+            "current_project_catalog_path": getattr(self, "current_project_catalog_path", ""),
+            "catalog_data": self.catalog_data,
+            "catalog_container": self.catalog_container,
+        }
+
+    def restore_active_bisse_state(self, state):
+        for key, value in state.items():
+            setattr(self, key, value)
+
+    def configure_paths_for_readonly_export(self, folder):
+        """Configure temporairement un bisse existant sans créer/synchroniser ses données."""
+        folder = os.path.abspath(folder)
+        if not os.path.isdir(folder):
+            raise FileNotFoundError(f"Dossier bisse introuvable : {folder}")
+        local_catalog = os.path.join(folder, "catalogue.json")
+        if not os.path.isfile(local_catalog):
+            raise FileNotFoundError(
+                "Catalogue local manquant. Ouvrez d'abord ce bisse dans Abisses afin de terminer sa préparation : "
+                f"{folder}"
+            )
+        self.base_folder = folder
+        candidate_photos = os.path.join(folder, "Photos")
+        self.photos_folder = candidate_photos if os.path.isdir(candidate_photos) else folder
+        self.manual_photos_folder = ""
+        self.export_folder = os.path.join(folder, "Export_JPG")
+        self.gpx_folder = os.path.join(folder, "Fichiers GPX")
+        self.local_catalog_path = local_catalog
+        self.catalog_path = local_catalog
+        self.current_project_id = ""
+        self.current_project_dir = ""
+        self.current_project_catalog_path = ""
+        self.catalog_container = None
+        self.catalog_data = []
+
+    def write_bisses_renderer_to_folder(self, root):
+        """Écrit le moteur web dans un dossier temporaire sans toucher data/media existants."""
+        os.makedirs(root, exist_ok=True)
+        files = {
+            "index.html": BISSES_RENDER_INDEX_HTML,
+            ".nojekyll": "",
+            os.path.join("assets", "css", "styles.css"): BISSES_RENDER_STYLES_CSS,
+            os.path.join("assets", "js", "app.js"): BISSES_RENDER_APP_JS,
+            "README.md": BISSES_RENDER_README,
+        }
+        for relative, content in files.items():
+            path = os.path.join(root, relative)
+            os.makedirs(os.path.dirname(path) or root, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(content)
+        os.makedirs(os.path.join(root, "data", "bisses"), exist_ok=True)
+        os.makedirs(os.path.join(root, "media"), exist_ok=True)
+
+    def stop_local_preview_server(self, cleanup=False):
+        server = getattr(self, "_bisses_preview_server", None)
+        thread = getattr(self, "_bisses_preview_thread", None)
+        root = getattr(self, "_bisses_preview_root", "")
+        self._bisses_preview_server = None
+        self._bisses_preview_thread = None
+        self._bisses_preview_root = ""
+        if server is not None:
+            try:
+                server.shutdown()
+            except Exception:
+                pass
+            try:
+                server.server_close()
+            except Exception:
+                pass
+        if thread is not None:
+            try:
+                thread.join(timeout=1.0)
+            except Exception:
+                pass
+        if cleanup and root and os.path.isdir(root):
+            shutil.rmtree(root, ignore_errors=True)
+
+    def start_local_preview_server(self, preview_root):
+        """Sert uniquement le dossier temporaire sur 127.0.0.1."""
+        self.stop_local_preview_server(cleanup=True)
+        preview_root = os.path.abspath(preview_root)
+
+        class QuietPreviewHandler(http.server.SimpleHTTPRequestHandler):
+            def __init__(handler_self, *args, **kwargs):
+                super().__init__(*args, directory=preview_root, **kwargs)
+            def log_message(handler_self, _format, *_args):
+                return
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), QuietPreviewHandler)
+        server.daemon_threads = True
+        thread = threading.Thread(
+            target=server.serve_forever,
+            name="AbissesPreviewServer",
+            daemon=True,
+        )
+        thread.start()
+        self._bisses_preview_server = server
+        self._bisses_preview_thread = thread
+        self._bisses_preview_root = preview_root
+        _host, port = server.server_address[:2]
+        url = f"http://127.0.0.1:{port}/"
+        self.log(f"👁 Prévisualisation locale : {url}")
+        webbrowser.open_new_tab(url)
+        return url
+
+    def build_render_preview_for_folders(self, folders, progress_callback=None):
+        """Construit un export web temporaire, strictement read-only pour les sources."""
+        unique_folders = []
+        seen = set()
+        for folder in folders or []:
+            if not folder:
+                continue
+            folder = os.path.abspath(folder)
+            key = os.path.normcase(folder)
+            if key in seen or not os.path.isdir(folder):
+                continue
+            seen.add(key)
+            unique_folders.append(folder)
+        if not unique_folders:
+            raise ValueError("Aucun dossier bisse accessible à prévisualiser.")
+
+        preview_root = tempfile.mkdtemp(prefix="abisses_bisses_preview_")
+        self.write_bisses_renderer_to_folder(preview_root)
+        saved_state = self.capture_active_bisse_state()
+        index_entries = []
+        errors = []
+        total = len(unique_folders)
+        try:
+            for position, folder in enumerate(unique_folders, start=1):
+                if callable(progress_callback):
+                    progress_callback(position - 1, total, os.path.basename(folder) or folder)
+                try:
+                    self.configure_paths_for_readonly_export(folder)
+                    result = self.export_current_bisse_to_platform_root(preview_root)
+                    index_entries.append(result["index_entry"])
+                except Exception as exc:
+                    errors.append(f"{os.path.basename(folder) or folder} : {exc}")
+                if callable(progress_callback):
+                    progress_callback(position, total, os.path.basename(folder) or folder)
+        finally:
+            self.restore_active_bisse_state(saved_state)
+
+        if not index_entries:
+            shutil.rmtree(preview_root, ignore_errors=True)
+            raise RuntimeError(
+                "Aucun bisse n'a pu être préparé pour la prévisualisation.\n\n"
+                + "\n".join(errors[:8])
+            )
+        index_entries.sort(
+            key=lambda item: (str(item.get("title") or "").casefold(), str(item.get("id") or ""))
+        )
+        data_root = os.path.join(preview_root, "data")
+        os.makedirs(data_root, exist_ok=True)
+        self._write_json_atomic_v65(
+            os.path.join(data_root, "bisses_index.json"), index_entries, indent=2
+        )
+        return preview_root, errors
+
+    def preview_current_bisse_web(self):
+        if not self.base_folder or not os.path.isdir(self.base_folder):
+            messagebox.showwarning("Rendu / Prévisualisation", "Aucun bisse actif.")
+            return
+        token = self.begin_activity("Génération de la prévisualisation…", delay_ms=120)
+        try:
+            root, errors = self.build_render_preview_for_folders([self.base_folder])
+            self.start_local_preview_server(root)
+            if errors:
+                messagebox.showwarning("Prévisualisation partielle", "\n".join(errors[:8]))
+        except Exception as exc:
+            messagebox.showerror("Prévisualisation impossible", str(exc))
+        finally:
+            self.end_activity(token, restore_status=True)
+
+    def preview_all_workspace_bisses_web(self):
+        folders = [
+            entry.get("folder") for entry in self.get_workspace_entries()
+            if entry.get("folder") and os.path.isdir(entry.get("folder"))
+        ]
+        if not folders:
+            messagebox.showwarning("Rendu / Prévisualisation", "Aucun bisse accessible dans Mes bisses.")
+            return
+        token = self.begin_activity(
+            "Génération de la prévisualisation…",
+            mode="determinate",
+            maximum=max(1, len(folders)),
+            delay_ms=120,
+        )
+        def progress(position, total, name):
+            self.update_activity(
+                token,
+                f"Prévisualisation… {position}/{total} · {name}",
+                position,
+                max(1, total),
+            )
+        try:
+            root, errors = self.build_render_preview_for_folders(
+                folders, progress_callback=progress
+            )
+            self.start_local_preview_server(root)
+            if errors:
+                messagebox.showwarning(
+                    "Prévisualisation partielle",
+                    "Certains bisses n'ont pas pu être prévisualisés :\n\n" + "\n".join(errors[:8]),
+                )
+        except Exception as exc:
+            messagebox.showerror("Prévisualisation impossible", str(exc))
+        finally:
+            self.end_activity(token, restore_status=True)
+
+    def show_render_preview_module(self):
+        """Prévisualisation locale et temporaire ; aucune publication ni écriture source."""
+        self.clear_main_frame()
+        self.status_header.config(text="Rendu / Prévisualisation", fg="#1f618d")
+        outer = tk.Frame(self.main_frame, padx=24, pady=22)
+        outer.pack(fill="both", expand=True)
+        outer.grid_columnconfigure(0, weight=1)
+        top = tk.Frame(outer)
+        top.grid(row=0, column=0, sticky="ew", pady=(0, 18))
+        top.grid_columnconfigure(1, weight=1)
+        tk.Button(
+            top,
+            text="↩️ Tableau de bord",
+            command=self.return_to_active_bisse_or_home,
+        ).grid(row=0, column=0, sticky="w")
+        tk.Label(
+            top,
+            text="Rendu / Prévisualisation",
+            font=("Arial", 19, "bold"),
+        ).grid(row=0, column=1, sticky="w", padx=14)
+        tk.Label(
+            outer,
+            text=(
+                "La prévisualisation utilise localement le moteur de rendu Bisses dans "
+                "un dossier temporaire. Elle ne modifie ni catalogue.json, ni Data, ni Export_Platform."
+            ),
+            justify="left",
+            anchor="w",
+            wraplength=950,
+            fg="#555555",
+        ).grid(row=1, column=0, sticky="ew", pady=(0, 16))
+        actions = tk.Frame(outer)
+        actions.grid(row=2, column=0, sticky="ew")
+        actions.grid_columnconfigure(0, weight=1)
+        actions.grid_columnconfigure(1, weight=1)
+        current_box = tk.LabelFrame(actions, text="Ce bisse", padx=12, pady=12)
+        current_box.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        tk.Label(
+            current_box,
+            text="Voir le bisse actif dans le rendu réel de la plateforme.",
+            justify="left",
+            anchor="w",
+            wraplength=380,
+            fg="#555555",
+        ).pack(fill="x", pady=(0, 10))
+        tk.Button(
+            current_box,
+            text="👁 Prévisualiser ce bisse",
+            command=self.preview_current_bisse_web,
+            bg="#2980b9",
+            fg="white",
+            height=2,
+            state="normal" if self.base_folder and os.path.isdir(self.base_folder) else "disabled",
+        ).pack(fill="x")
+        all_box = tk.LabelFrame(actions, text="Mes bisses", padx=12, pady=12)
+        all_box.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        tk.Label(
+            all_box,
+            text="Voir ensemble tous les bisses accessibles de Mes bisses.",
+            justify="left",
+            anchor="w",
+            wraplength=380,
+            fg="#555555",
+        ).pack(fill="x", pady=(0, 10))
+        tk.Button(
+            all_box,
+            text="👁 Prévisualiser Mes bisses",
+            command=self.preview_all_workspace_bisses_web,
+            bg="#6c3483",
+            fg="white",
+            height=2,
+        ).pack(fill="x")
+
     def show_gpx_sync_selector(self):
         """
         Ouvre le flux de sélection d'une ou plusieurs traces GPX horodatées
@@ -11936,7 +13477,7 @@ namespace GestionBissesFolderPicker
                     f"JPG utilisés directement : {direct_jpg_count}\n"
                     f"HEIC/HEIF convertis : {convert_count}\n"
                     f"GPS EXIF trouvés : {gps_found_count}\n\n"
-                    "Vous pouvez maintenant renommer, géolocaliser ou ouvrir la carte."
+                    "Vous pouvez maintenant géolocaliser les photos, définir leur ordre puis poursuivre le workflow."
                 )
             )
 
@@ -11947,108 +13488,91 @@ namespace GestionBissesFolderPicker
             self.log(f"❌ Erreur générale : {e}")
 
     # ============================================================
-    # MODULE RENOMMAGE
+    # MODULE ORDRE DES PHOTOS / RENOMMAGE
     # ============================================================
 
-    def show_rename_interface(self):
+    def show_photo_order_interface(self):
+        """Définit l'ordre logique des photos sans renommer aucun fichier."""
         try:
             self.catalog_data = self.read_catalog()
-        except Exception as e:
-            messagebox.showerror("Erreur", f"Impossible de lire le catalogue :\n{e}")
+        except Exception as exc:
+            messagebox.showerror("Erreur", f"Impossible de lire le catalogue :\n{exc}")
             return
 
-        if not self.catalog_data:
+        active_entries = [
+            entry for entry in self.catalog_data
+            if isinstance(entry, dict) and entry.get("status") == "OK"
+        ]
+        if not active_entries:
             messagebox.showwarning(
-                "Renommage indisponible",
-                (
-                    "Aucune photo active n’est disponible dans le catalogue.\n\n"
-                    "Vous pouvez créer le catalogue photo depuis le tableau de bord "
-                    "ou continuer à travailler dans l’atelier GPX."
-                )
+                "Ordre indisponible",
+                "Aucune photo active n'est disponible dans le catalogue."
             )
             return
 
         self.stop_rename_map_watch()
         self.clear_main_frame()
-        self.status_header.config(text="Module Renommer / déterminer l’ordre des photos", fg="#8e44ad")
+        self.status_header.config(text="Ordre des photos", fg="#8e44ad")
 
         top = tk.Frame(self.main_frame)
         top.pack(fill="x", pady=(0, 6))
 
         tk.Button(
             top,
-            text="↩️ Retour au dossier",
+            text="↩️ Tableau de bord",
             command=lambda: self.load_folder(self.base_folder)
         ).pack(side="left", padx=4)
 
-        default_prefix = self.sanitize_filename_part(os.path.basename(self.base_folder))
-        self.rename_prefix_var.set(default_prefix)
-        self.rename_year_var.set(str(datetime.now().year))
-        self.rename_start_var.set(1)
-        self.rename_order_mode_var.set("datetime")
+        tk.Label(
+            top,
+            text=(
+                "Cette étape fixe l'ordre logique utilisé ensuite dans Photos et pour le renommage. "
+                "Aucun fichier n'est renommé ici."
+            ),
+            fg="#666666",
+            anchor="w",
+            justify="left",
+            wraplength=950
+        ).pack(side="left", fill="x", expand=True, padx=(12, 4))
+
+        existing_modes = {
+            str(entry.get("photo_order_mode") or "").strip()
+            for entry in active_entries
+            if int(entry.get("photo_order") or 0) > 0
+        }
+        existing_modes.discard("")
+        self.rename_order_mode_var.set(
+            next(iter(existing_modes))
+            if len(existing_modes) == 1 and next(iter(existing_modes)) in {"datetime", "gps"}
+            else "datetime"
+        )
         self.rename_reverse_var.set(False)
         self.rename_map_selected_plan_index = None
         self.rename_gpx_source_choice = None
         self.rename_gpx_guidance_info = None
         self.rename_manual_gpx_sources = []
+        self.rename_gpx_manual_override = False
+        self.photo_order_topo_status_var.set(
+            "Guide topo : utilisé uniquement avec « Position GPS »."
+        )
 
         controls = tk.LabelFrame(
             self.main_frame,
-            text="Paramètres de renommage",
+            text="Définition de l'ordre",
             padx=8,
             pady=6
         )
         controls.pack(fill="x", pady=(0, 6))
-
-        tk.Label(controls, text="Préfixe").grid(row=0, column=0, sticky="w", padx=(4, 3))
-        tk.Entry(
-            controls,
-            textvariable=self.rename_prefix_var,
-            width=28
-        ).grid(row=0, column=1, sticky="w", padx=(0, 10))
-
-        tk.Label(controls, text="Année").grid(row=0, column=2, sticky="w", padx=(0, 3))
-        tk.Entry(
-            controls,
-            textvariable=self.rename_year_var,
-            width=8
-        ).grid(row=0, column=3, sticky="w", padx=(0, 10))
-
-        tk.Label(controls, text="Premier numéro").grid(row=0, column=4, sticky="w", padx=(0, 3))
-        tk.Spinbox(
-            controls,
-            from_=1,
-            to=99999,
-            textvariable=self.rename_start_var,
-            width=7
-        ).grid(row=0, column=5, sticky="w", padx=(0, 14))
-
-        tk.Button(
-            controls,
-            text="👁️ Prévisualiser",
-            command=self.preview_rename_plan
-        ).grid(row=0, column=6, padx=(0, 10))
-
-        tk.Button(
-            controls,
-            text="✅ Appliquer le renommage",
-            command=self.apply_rename_plan,
-            bg="#8e44ad",
-            fg="white"
-        ).grid(row=0, column=7, padx=(0, 4))
-
-        order_frame = tk.Frame(controls)
-        order_frame.grid(row=1, column=0, columnspan=8, sticky="ew", pady=(7, 0))
-        order_frame.grid_columnconfigure(7, weight=1)
+        controls.grid_columnconfigure(7, weight=1)
 
         def order_changed():
             self.rename_map_fit_done = False
-            self.preview_rename_plan()
+            self.preview_photo_order_plan()
 
-        tk.Label(order_frame, text="Ordre :").grid(row=0, column=0, sticky="w", padx=(4, 8))
+        tk.Label(controls, text="Ordre :").grid(row=0, column=0, sticky="w", padx=(4, 8))
 
         tk.Radiobutton(
-            order_frame,
+            controls,
             text="Date / heure",
             variable=self.rename_order_mode_var,
             value="datetime",
@@ -12056,7 +13580,7 @@ namespace GestionBissesFolderPicker
         ).grid(row=0, column=1, sticky="w", padx=(0, 10))
 
         tk.Radiobutton(
-            order_frame,
+            controls,
             text="Position GPS",
             variable=self.rename_order_mode_var,
             value="gps",
@@ -12064,15 +13588,15 @@ namespace GestionBissesFolderPicker
         ).grid(row=0, column=2, sticky="w", padx=(0, 10))
 
         tk.Checkbutton(
-            order_frame,
+            controls,
             text="Inverser",
             variable=self.rename_reverse_var,
             command=order_changed
         ).grid(row=0, column=3, sticky="w", padx=(0, 12))
 
-        tk.Label(order_frame, text="Proximité").grid(row=0, column=4, sticky="e", padx=(0, 4))
+        tk.Label(controls, text="Proximité").grid(row=0, column=4, sticky="e", padx=(0, 4))
         tk.Spinbox(
-            order_frame,
+            controls,
             from_=0,
             to=80,
             increment=1,
@@ -12080,10 +13604,37 @@ namespace GestionBissesFolderPicker
             width=5,
             command=order_changed
         ).grid(row=0, column=5, sticky="w")
-        tk.Label(order_frame, text="m").grid(row=0, column=6, sticky="w", padx=(3, 0))
+        tk.Label(controls, text="m").grid(row=0, column=6, sticky="w", padx=(3, 8))
 
-        # Agencement principal : tableau à gauche, carte à droite.
-        # Ratio visé : 60% tableau / 40% carte.
+        tk.Button(
+            controls,
+            text="🧭 Choisir / changer le GPX topo",
+            command=self.select_photo_order_topo_sources
+        ).grid(row=0, column=7, sticky="e", padx=(0, 8))
+
+        tk.Button(
+            controls,
+            text="↻ Actualiser l'ordre",
+            command=self.preview_photo_order_plan
+        ).grid(row=0, column=8, sticky="e", padx=(0, 8))
+
+        tk.Button(
+            controls,
+            text="✅ Enregistrer l'ordre",
+            command=self.apply_photo_order_plan,
+            bg="#8e44ad",
+            fg="white"
+        ).grid(row=0, column=9, sticky="e", padx=(0, 4))
+
+        tk.Label(
+            controls,
+            textvariable=self.photo_order_topo_status_var,
+            fg="#555555",
+            justify="left",
+            anchor="w",
+            wraplength=1250
+        ).grid(row=1, column=0, columnspan=10, sticky="ew", padx=4, pady=(7, 1))
+
         content = tk.PanedWindow(
             self.main_frame,
             orient=tk.HORIZONTAL,
@@ -12094,35 +13645,29 @@ namespace GestionBissesFolderPicker
 
         table_frame = tk.Frame(content)
         map_frame = tk.Frame(content)
-
-        content.add(table_frame, minsize=560, width=960)
+        content.add(table_frame, minsize=520, width=900)
         content.add(map_frame, minsize=360, width=640)
 
         self.build_rename_order_map_panel(map_frame)
 
-        columns = ("order", "date", "current", "new", "status")
+        columns = ("order", "date", "current", "status")
         self.rename_tree = ttk.Treeview(
             table_frame,
             columns=columns,
             show="headings"
         )
-
         self.rename_tree.heading("order", text="#")
         self.rename_tree.heading("date", text="Date de prise de vue")
-        self.rename_tree.heading("current", text="Nom actuel")
-        self.rename_tree.heading("new", text="Nouveau nom")
-        self.rename_tree.heading("status", text="Statut")
-
+        self.rename_tree.heading("current", text="Photo")
+        self.rename_tree.heading("status", text="Ordre proposé")
         self.rename_tree.column("order", width=55, anchor="center", stretch=False)
         self.rename_tree.column("date", width=145, stretch=False)
-        self.rename_tree.column("current", width=215)
-        self.rename_tree.column("new", width=245)
-        self.rename_tree.column("status", width=170, stretch=False)
+        self.rename_tree.column("current", width=280)
+        self.rename_tree.column("status", width=210)
 
         y_scroll = tk.Scrollbar(table_frame, orient="vertical", command=self.rename_tree.yview)
         x_scroll = tk.Scrollbar(table_frame, orient="horizontal", command=self.rename_tree.xview)
         self.rename_tree.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
-
         self.rename_tree.grid(row=0, column=0, sticky="nsew")
         y_scroll.grid(row=0, column=1, sticky="ns")
         x_scroll.grid(row=1, column=0, sticky="ew")
@@ -12137,136 +13682,374 @@ namespace GestionBissesFolderPicker
                 return
             children = list(self.rename_tree.get_children())
             try:
-                index = children.index(selection[0])
+                self.rename_map_selected_plan_index = children.index(selection[0])
             except Exception:
                 return
 
-            # v51f : carte passive. Le tableau mémorise la sélection seulement.
-            self.rename_map_selected_plan_index = index
-
-        def on_tree_double_click(_event=None):
-            on_tree_select(_event)
-
         self.rename_tree.bind("<<TreeviewSelect>>", on_tree_select)
-        self.rename_tree.bind("<Double-1>", on_tree_double_click)
-
-        self.preview_rename_plan()
+        self.preview_photo_order_plan()
 
         try:
             self.root.after(
                 500,
                 lambda: content.sash_place(
                     0,
-                    max(560, int(content.winfo_width() * 0.60)),
+                    max(520, int(content.winfo_width() * 0.58)),
                     0
                 )
             )
         except Exception:
             pass
 
-    def build_rename_plan(self):
-        prefix = self.sanitize_filename_part(self.rename_prefix_var.get())
-        year = self.sanitize_filename_part(self.rename_year_var.get())
-        start = int(self.rename_start_var.get())
-
+    def build_photo_order_plan(self):
         candidates = []
-
         for catalog_index, entry in enumerate(self.catalog_data):
-            if entry.get("status") != "OK":
+            if not isinstance(entry, dict) or entry.get("status") != "OK":
                 continue
 
             image_path = self.get_entry_image_path(entry)
-
-            if not os.path.exists(image_path):
+            if not image_path or not os.path.exists(image_path):
                 candidates.append({
                     "catalog_index": catalog_index,
                     "entry": entry,
                     "source_path": image_path,
-                    "target_path": image_path,
                     "date": datetime.max,
                     "gps": self.get_entry_gps_latlon(entry),
                     "status": "Fichier introuvable",
-                    "skip": True
+                    "skip": True,
+                    "order_number": "",
                 })
                 continue
-
-            if not image_path.lower().endswith((".jpg", ".jpeg")):
-                candidates.append({
-                    "catalog_index": catalog_index,
-                    "entry": entry,
-                    "source_path": image_path,
-                    "target_path": image_path,
-                    "date": datetime.max,
-                    "gps": self.get_entry_gps_latlon(entry),
-                    "status": "Non JPG",
-                    "skip": True
-                })
-                continue
-
-            dt = self.get_capture_datetime_for_sort(image_path, entry)
-            gps = self.get_entry_gps_latlon(entry)
 
             candidates.append({
                 "catalog_index": catalog_index,
                 "entry": entry,
                 "source_path": image_path,
-                "date": dt,
-                "gps": gps,
-                "skip": False
+                "date": self.get_capture_datetime_for_sort(image_path, entry),
+                "gps": self.get_entry_gps_latlon(entry),
+                "skip": False,
             })
 
-        sortable = [p for p in candidates if not p.get("skip")]
-        skipped = [p for p in candidates if p.get("skip")]
-
+        sortable = [item for item in candidates if not item.get("skip")]
+        skipped = [item for item in candidates if item.get("skip")]
         ordered = self.sort_rename_candidates(sortable)
 
-        plan = []
-        number = start
-        mode_label = self.rename_order_mode_label()
+        mode = self.rename_order_mode_var.get()
+        mode_label = self.rename_order_mode_label(mode)
         guidance = getattr(self, "rename_gpx_guidance_info", None) or {}
-        gps_topo_used = bool(
-            self.rename_order_mode_var.get() == "gps"
-            and guidance.get("used")
+        gps_topo_used = bool(mode == "gps" and guidance.get("used"))
+
+        plan = []
+        for number, item in enumerate(ordered, start=1):
+            item["order_number"] = number
+            item["order_mode"] = mode
+            item["gps_guided_by_topo"] = bool(item.get("gps") and gps_topo_used)
+            item["gps_topo_source"] = (
+                guidance.get("source_filename", "")
+                if item["gps_guided_by_topo"] else ""
+            )
+            item["gps_topo_sources"] = (
+                list(guidance.get("source_filenames", []))
+                if item["gps_guided_by_topo"] else []
+            )
+            if gps_topo_used:
+                status = "GPS + topo"
+                if item.get("gps") and item.get("gps_topo_offset_m") is not None:
+                    status += f" · écart {float(item['gps_topo_offset_m']):.1f} m"
+                if item.get("gps_topo_ambiguous"):
+                    status += " · ⚠ projection ambiguë"
+            else:
+                status = mode_label
+            if mode == "gps" and not item.get("gps"):
+                status += " · sans GPS, placé en fin"
+            item["status"] = status
+            plan.append(item)
+
+        plan.extend(skipped)
+        return plan
+
+    def preview_photo_order_plan(self):
+        if not self.rename_tree:
+            return
+
+        self.rename_plan = self.build_photo_order_plan()
+        for tree_item in self.rename_tree.get_children():
+            self.rename_tree.delete(tree_item)
+
+        for index, item in enumerate(self.rename_plan, start=1):
+            dt = item.get("date")
+            date_text = (
+                dt.strftime("%Y-%m-%d %H:%M:%S")
+                if isinstance(dt, datetime) and dt != datetime.max
+                else "—"
+            )
+            self.rename_tree.insert(
+                "",
+                "end",
+                values=(
+                    item.get("order_number", ""),
+                    date_text,
+                    os.path.basename(item.get("source_path") or ""),
+                    item.get("status", ""),
+                )
+            )
+
+        if self.rename_map_widget:
+            self.schedule_initial_rename_map_draw()
+
+        self.update_photo_order_topo_status()
+
+        self.log(
+            f"↕️ Ordre proposé pour {len([p for p in self.rename_plan if not p.get('skip')])} photo(s). "
+            f"{self.rename_plan_sort_text()}."
         )
 
-        for p in ordered:
-            folder = os.path.dirname(p["source_path"])
-            new_name = f"{prefix}_{year}_{number}.jpg"
-            target_path = os.path.join(folder, new_name)
+    def apply_photo_order_plan(self):
+        self.preview_photo_order_plan()
+        ordered_plan = [
+            item for item in self.rename_plan
+            if not item.get("skip") and item.get("order_number")
+        ]
+        if not ordered_plan:
+            messagebox.showwarning("Aucun ordre", "Aucune photo exploitable à ordonner.")
+            return
 
-            status_label = "GPS + topo" if gps_topo_used else mode_label
-            status = f"À renommer · {status_label}"
-            if os.path.abspath(p["source_path"]) == os.path.abspath(target_path):
-                status = f"Déjà correct · {status_label}"
-
-            if self.rename_order_mode_var.get() == "gps" and not p.get("gps"):
-                status += " · sans GPS, placé en fin"
-
-            p["target_path"] = target_path
-            p["new_name"] = new_name
-            p["status"] = status
-            p["order_number"] = number
-            p["order_mode"] = self.rename_order_mode_var.get()
-            p["gps_guided_by_topo"] = bool(p.get("gps") and gps_topo_used)
-            p["gps_topo_source"] = (
-                guidance.get("source_filename", "")
-                if p["gps_guided_by_topo"]
-                else ""
+        changes = []
+        for item in ordered_plan:
+            entry = self.catalog_data[item["catalog_index"]]
+            expected_guidance = ""
+            if item.get("order_mode") == "gps":
+                expected_guidance = (
+                    "gpx_topology" if item.get("gps_guided_by_topo") else "gps_autonomous"
+                )
+            expected_source = item.get("gps_topo_source", "") if item.get("gps_guided_by_topo") else ""
+            expected_sources = (
+                list(item.get("gps_topo_sources", []))
+                if item.get("gps_guided_by_topo") else []
             )
-            p["gps_topo_sources"] = (
-                list(guidance.get("source_filenames", []))
-                if p["gps_guided_by_topo"]
-                else []
+            if (
+                int(entry.get("photo_order") or 0) != int(item["order_number"])
+                or str(entry.get("photo_order_mode") or "") != str(item.get("order_mode") or "")
+                or str(entry.get("photo_order_guidance") or "") != expected_guidance
+                or str(entry.get("photo_order_gpx_source") or "") != expected_source
+                or list(entry.get("photo_order_gpx_sources") or []) != expected_sources
+            ):
+                changes.append(item)
+
+        if not changes:
+            messagebox.showinfo("Ordre déjà enregistré", "L'ordre proposé est déjà celui du catalogue.")
+            return
+
+        if not messagebox.askyesno(
+            "Enregistrer l'ordre ?",
+            (
+                f"Enregistrer cet ordre pour {len(ordered_plan)} photo(s) ?\n\n"
+                f"{self.rename_plan_sort_text()}.\n\n"
+                "Aucun fichier ne sera renommé. L'ordre de publication reste indépendant."
             )
+        ):
+            return
 
-            plan.append(p)
-            number += 1
+        now = datetime.now().isoformat(timespec="seconds")
+        for item in ordered_plan:
+            entry = self.catalog_data[item["catalog_index"]]
+            entry["photo_order"] = int(item["order_number"])
+            entry["photo_order_mode"] = item.get("order_mode", self.rename_order_mode_var.get())
+            entry["photo_order_label"] = self.rename_order_mode_label(item.get("order_mode"))
+            entry["photo_order_date"] = now
 
-        for p in skipped:
-            p["new_name"] = os.path.basename(p["source_path"])
-            p["order_number"] = ""
-            plan.append(p)
+            if item.get("order_mode") == "gps":
+                entry["photo_order_guidance"] = (
+                    "gpx_topology" if item.get("gps_guided_by_topo") else "gps_autonomous"
+                )
+            else:
+                entry.pop("photo_order_guidance", None)
 
+            if item.get("gps_guided_by_topo") and item.get("gps_topo_source"):
+                entry["photo_order_gpx_source"] = item["gps_topo_source"]
+                entry["photo_order_gpx_sources"] = list(item.get("gps_topo_sources", []))
+            else:
+                entry.pop("photo_order_gpx_source", None)
+                entry.pop("photo_order_gpx_sources", None)
+
+        self.save_catalog()
+        messagebox.showinfo(
+            "Ordre enregistré",
+            f"Ordre enregistré pour {len(ordered_plan)} photo(s). Aucun fichier n'a été renommé."
+        )
+        self.load_folder(self.base_folder)
+
+    def show_rename_interface(self):
+        """Renomme les JPG en suivant exclusivement l'ordre logique déjà enregistré."""
+        try:
+            self.catalog_data = self.read_catalog()
+        except Exception as exc:
+            messagebox.showerror("Erreur", f"Impossible de lire le catalogue :\n{exc}")
+            return
+
+        active = [
+            (index, entry) for index, entry in enumerate(self.catalog_data)
+            if isinstance(entry, dict) and entry.get("status") == "OK"
+        ]
+        if not active:
+            messagebox.showwarning("Renommage indisponible", "Aucune photo active n'est disponible.")
+            return
+
+        ordered_count = sum(1 for _index, entry in active if int(entry.get("photo_order") or 0) > 0)
+        if ordered_count != len(active):
+            if messagebox.askyesno(
+                "Ordre des photos incomplet",
+                (
+                    f"L'ordre n'est défini que pour {ordered_count}/{len(active)} photo(s).\n\n"
+                    "Le renommage doit maintenant suivre l'ordre établi à l'étape 2.\n"
+                    "Ouvrir l'étape Ordre des photos ?"
+                )
+            ):
+                self.show_photo_order_interface()
+            return
+
+        self.stop_rename_map_watch()
+        self.clear_main_frame()
+        self.status_header.config(text="Renommage des photos", fg="#7d3c98")
+
+        top = tk.Frame(self.main_frame)
+        top.pack(fill="x", pady=(0, 8))
+        tk.Button(
+            top,
+            text="↩️ Tableau de bord",
+            command=lambda: self.load_folder(self.base_folder)
+        ).pack(side="left", padx=4)
+        tk.Label(
+            top,
+            text="Les numéros suivent l'ordre enregistré à l'étape 2. Cette étape ne recalcule pas l'ordre.",
+            fg="#666666",
+            anchor="w"
+        ).pack(side="left", fill="x", expand=True, padx=(12, 4))
+
+        default_prefix = self.sanitize_filename_part(os.path.basename(self.base_folder))
+        self.rename_prefix_var.set(default_prefix)
+        self.rename_year_var.set(str(datetime.now().year))
+
+        controls = tk.LabelFrame(
+            self.main_frame,
+            text="Paramètres de renommage",
+            padx=8,
+            pady=8
+        )
+        controls.pack(fill="x", pady=(0, 8))
+
+        tk.Label(controls, text="Préfixe").grid(row=0, column=0, sticky="w", padx=(4, 3))
+        tk.Entry(
+            controls,
+            textvariable=self.rename_prefix_var,
+            width=32
+        ).grid(row=0, column=1, sticky="w", padx=(0, 12))
+
+        tk.Label(controls, text="Année").grid(row=0, column=2, sticky="w", padx=(0, 3))
+        tk.Entry(
+            controls,
+            textvariable=self.rename_year_var,
+            width=8
+        ).grid(row=0, column=3, sticky="w", padx=(0, 16))
+
+        tk.Button(
+            controls,
+            text="👁️ Prévisualiser",
+            command=self.preview_rename_plan
+        ).grid(row=0, column=4, padx=(0, 10))
+
+        tk.Button(
+            controls,
+            text="✅ Appliquer le renommage",
+            command=self.apply_rename_plan,
+            bg="#7d3c98",
+            fg="white"
+        ).grid(row=0, column=5, padx=(0, 4))
+
+        table_frame = tk.Frame(self.main_frame)
+        table_frame.pack(fill="both", expand=True)
+
+        columns = ("order", "current", "new", "status")
+        self.rename_tree = ttk.Treeview(table_frame, columns=columns, show="headings")
+        self.rename_tree.heading("order", text="#")
+        self.rename_tree.heading("current", text="Nom actuel")
+        self.rename_tree.heading("new", text="Nouveau nom")
+        self.rename_tree.heading("status", text="Statut")
+        self.rename_tree.column("order", width=55, anchor="center", stretch=False)
+        self.rename_tree.column("current", width=300)
+        self.rename_tree.column("new", width=300)
+        self.rename_tree.column("status", width=180, stretch=False)
+
+        y_scroll = tk.Scrollbar(table_frame, orient="vertical", command=self.rename_tree.yview)
+        x_scroll = tk.Scrollbar(table_frame, orient="horizontal", command=self.rename_tree.xview)
+        self.rename_tree.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+        self.rename_tree.grid(row=0, column=0, sticky="nsew")
+        y_scroll.grid(row=0, column=1, sticky="ns")
+        x_scroll.grid(row=1, column=0, sticky="ew")
+        table_frame.grid_rowconfigure(0, weight=1)
+        table_frame.grid_columnconfigure(0, weight=1)
+
+        self.preview_rename_plan()
+
+    def build_rename_plan(self):
+        prefix = self.sanitize_filename_part(self.rename_prefix_var.get())
+        year = self.sanitize_filename_part(self.rename_year_var.get())
+        plan = []
+
+        for catalog_index, entry in enumerate(self.catalog_data):
+            if not isinstance(entry, dict) or entry.get("status") != "OK":
+                continue
+
+            try:
+                order_number = int(entry.get("photo_order") or 0)
+            except Exception:
+                order_number = 0
+
+            image_path = self.get_entry_image_path(entry)
+            item = {
+                "catalog_index": catalog_index,
+                "entry": entry,
+                "source_path": image_path,
+                "target_path": image_path,
+                "order_number": order_number if order_number > 0 else "",
+                "skip": False,
+            }
+
+            if order_number <= 0:
+                item["status"] = "Ordre manquant"
+                item["skip"] = True
+                plan.append(item)
+                continue
+
+            if not image_path or not os.path.exists(image_path):
+                item["status"] = "Fichier introuvable"
+                item["skip"] = True
+                plan.append(item)
+                continue
+
+            if not image_path.lower().endswith((".jpg", ".jpeg")):
+                item["status"] = "Non JPG — non renommé"
+                item["skip"] = True
+                plan.append(item)
+                continue
+
+            new_name = f"{prefix}_{year}_{order_number}.jpg"
+            target_path = os.path.join(os.path.dirname(image_path), new_name)
+            item["target_path"] = target_path
+            item["new_name"] = new_name
+            item["status"] = (
+                "Déjà correct"
+                if os.path.abspath(image_path) == os.path.abspath(target_path)
+                else "À renommer"
+            )
+            plan.append(item)
+
+        plan.sort(
+            key=lambda item: (
+                int(item.get("order_number") or 10**9),
+                os.path.basename(item.get("source_path") or "").casefold()
+            )
+        )
         return plan
 
     def preview_rename_plan(self):
@@ -12274,206 +14057,104 @@ namespace GestionBissesFolderPicker
             return
 
         self.rename_plan = self.build_rename_plan()
+        for tree_item in self.rename_tree.get_children():
+            self.rename_tree.delete(tree_item)
 
-        for item in self.rename_tree.get_children():
-            self.rename_tree.delete(item)
-
-        for i, p in enumerate(self.rename_plan, start=1):
-            source_path = p.get("source_path", "")
-            target_path = p.get("target_path", source_path)
-            dt = p.get("date")
-
-            if isinstance(dt, datetime) and dt != datetime.max:
-                date_text = dt.strftime("%Y-%m-%d %H:%M:%S")
-            else:
-                date_text = "—"
-
-            raw_status = p.get("status", "")
-            if "Déjà correct" in raw_status:
-                status = "Déjà correct"
-            elif "sans GPS" in raw_status:
-                status = "Sans GPS"
-            elif "GPS + topo" in raw_status:
-                status = "À renommer · GPS + topo"
-            elif "GPS" in raw_status:
-                status = "À renommer · GPS"
-            elif "Date" in raw_status or "date" in raw_status:
-                status = "À renommer · Date"
-            else:
-                status = raw_status
-
+        for item in self.rename_plan:
             self.rename_tree.insert(
                 "",
                 "end",
                 values=(
-                    p.get("order_number", i),
-                    date_text,
-                    os.path.basename(source_path),
-                    os.path.basename(target_path),
-                    status
+                    item.get("order_number", ""),
+                    os.path.basename(item.get("source_path") or ""),
+                    os.path.basename(item.get("target_path") or item.get("source_path") or ""),
+                    item.get("status", ""),
                 )
             )
 
-        # v51g :
-        # Toute modification des paramètres d'ordre doit actualiser la carte.
-        # Le dessin reste différé pour attendre la taille réelle de la carte,
-        # mais il n'est plus conditionné par rename_map_fit_done.
-        if self.rename_map_widget:
-            self.schedule_initial_rename_map_draw()
-
         self.log(
-            f"👁️ Aperçu renommage généré : {len(self.rename_plan)} entrée(s). "
-            f"{self.rename_plan_sort_text()}."
+            f"🔤 Aperçu renommage généré selon l'ordre enregistré : "
+            f"{len([p for p in self.rename_plan if not p.get('skip')])} photo(s)."
         )
 
     def apply_rename_plan(self):
-        # v51g : toujours reconstruire le plan au moment d'appliquer.
-        # Cela évite d'utiliser un aperçu périmé après un changement de préfixe,
-        # d'année, de premier numéro, de mode d'ordre, d'inversion ou de proximité.
         self.preview_rename_plan()
-
         if not self.rename_plan:
             messagebox.showwarning("Aucun renommage", "Aucun plan de renommage disponible.")
             return
 
-        ordered_plan = [
-            p for p in self.rename_plan
-            if not p.get("skip") and p.get("order_number")
-        ]
-
         active_plan = [
-            p for p in ordered_plan
-            if os.path.abspath(p.get("source_path", "")) != os.path.abspath(p.get("target_path", ""))
+            item for item in self.rename_plan
+            if not item.get("skip")
+            and os.path.abspath(item.get("source_path", "")) != os.path.abspath(item.get("target_path", ""))
         ]
 
-        metadata_changes = []
-        for p in ordered_plan:
-            entry = self.catalog_data[p["catalog_index"]]
-            expected_guidance = "gpx_topology" if p.get("gps_guided_by_topo") else "gps_autonomous"
-            if p.get("order_mode") != "gps":
-                expected_guidance = ""
-            expected_source = p.get("gps_topo_source", "") if p.get("gps_guided_by_topo") else ""
-            expected_sources = (
-                list(p.get("gps_topo_sources", []))
-                if p.get("gps_guided_by_topo")
-                else []
-            )
-            if (
-                int(entry.get("platform_order") or 0) != int(p["order_number"])
-                or entry.get("photo_order_mode") != p.get("order_mode")
-                or str(entry.get("photo_order_guidance") or "") != expected_guidance
-                or str(entry.get("photo_order_gpx_source") or "") != expected_source
-                or list(entry.get("photo_order_gpx_sources") or []) != expected_sources
-            ):
-                metadata_changes.append(p)
-
-        if not active_plan and not metadata_changes:
-            messagebox.showinfo("Rien à faire", "Tous les noms et ordres sont déjà corrects.")
+        if not active_plan:
+            messagebox.showinfo("Rien à faire", "Tous les noms sont déjà corrects selon l'ordre enregistré.")
             return
 
         if not messagebox.askyesno(
             "Confirmation",
             (
-                f"Renommer {len(active_plan)} photo(s) et mettre à jour "
-                f"l'ordre de {len(ordered_plan)} photo(s) dans le catalogue ?\n\n"
-                f"{self.rename_plan_sort_text()}.\n\n"
-                "Cette opération modifiera les fichiers JPG lorsque nécessaire, "
-                "mettra à jour le catalogue et n'altèrera pas les fichiers HEIC originaux."
+                f"Renommer {len(active_plan)} photo(s) selon l'ordre déjà enregistré ?\n\n"
+                "Cette opération ne modifie ni l'ordre logique des photos ni l'ordre de publication. "
+                "Les fichiers HEIC originaux ne sont pas altérés."
             )
         ):
             return
 
         try:
-            source_set = {os.path.abspath(p["source_path"]) for p in active_plan}
+            source_set = {os.path.abspath(item["source_path"]) for item in active_plan}
 
-            for p in active_plan:
-                target_abs = os.path.abspath(p["target_path"])
-                if os.path.exists(p["target_path"]) and target_abs not in source_set:
+            for item in active_plan:
+                target_abs = os.path.abspath(item["target_path"])
+                if os.path.exists(item["target_path"]) and target_abs not in source_set:
                     messagebox.showerror(
                         "Collision de nom",
                         (
                             "Un fichier cible existe déjà :\n\n"
-                            f"{p['target_path']}\n\n"
+                            f"{item['target_path']}\n\n"
                             "Renommage annulé."
                         )
                     )
                     return
 
             temp_moves = []
-
-            for p in active_plan:
-                source_path = p["source_path"]
+            for item in active_plan:
+                source_path = item["source_path"]
                 folder = os.path.dirname(source_path)
                 temp_name = f".tmp_rename_{uuid.uuid4().hex}_{os.path.basename(source_path)}"
                 temp_path = os.path.join(folder, temp_name)
-
                 os.rename(source_path, temp_path)
-                temp_moves.append((p, temp_path))
+                temp_moves.append((item, temp_path))
 
-            active_by_catalog_index = {}
-
-            for p, temp_path in temp_moves:
-                os.rename(temp_path, p["target_path"])
-                active_by_catalog_index[p["catalog_index"]] = p
-
-                self.log(
-                    f"🔤 Renommé : {os.path.basename(p['source_path'])} -> {os.path.basename(p['target_path'])}"
-                )
-
-            for p in ordered_plan:
-                entry = self.catalog_data[p["catalog_index"]]
-                active = active_by_catalog_index.get(p["catalog_index"])
-
-                if active:
-                    self.set_entry_image_path(entry, active["target_path"])
-
-                    if "original_filename_before_rename" not in entry:
-                        entry["original_filename_before_rename"] = entry.get(
-                            "original_filename",
-                            os.path.basename(active["source_path"])
-                        )
-
-                    entry["renamed"] = True
-                    entry["rename_date"] = datetime.now().isoformat(timespec="seconds")
-                    entry["previous_filename"] = os.path.basename(active["source_path"])
-
-                entry["photo_order"] = int(p["order_number"])
-                entry["photo_order_mode"] = p.get("order_mode", self.rename_order_mode_var.get())
-                entry["photo_order_label"] = self.rename_order_mode_label(p.get("order_mode"))
-                entry["photo_order_date"] = datetime.now().isoformat(timespec="seconds")
-                entry["platform_order"] = int(p["order_number"])
-
-                if p.get("order_mode") == "gps":
-                    entry["photo_order_guidance"] = (
-                        "gpx_topology"
-                        if p.get("gps_guided_by_topo")
-                        else "gps_autonomous"
+            for item, temp_path in temp_moves:
+                os.rename(temp_path, item["target_path"])
+                entry = self.catalog_data[item["catalog_index"]]
+                self.set_entry_image_path(entry, item["target_path"])
+                if "original_filename_before_rename" not in entry:
+                    entry["original_filename_before_rename"] = entry.get(
+                        "original_filename",
+                        os.path.basename(item["source_path"])
                     )
-                else:
-                    entry.pop("photo_order_guidance", None)
-
-                if p.get("gps_guided_by_topo") and p.get("gps_topo_source"):
-                    entry["photo_order_gpx_source"] = p["gps_topo_source"]
-                    entry["photo_order_gpx_sources"] = list(p.get("gps_topo_sources", []))
-                else:
-                    entry.pop("photo_order_gpx_source", None)
-                    entry.pop("photo_order_gpx_sources", None)
+                entry["renamed"] = True
+                entry["rename_date"] = datetime.now().isoformat(timespec="seconds")
+                entry["previous_filename"] = os.path.basename(item["source_path"])
+                self.log(
+                    f"🔤 Renommé : {os.path.basename(item['source_path'])} -> "
+                    f"{os.path.basename(item['target_path'])}"
+                )
 
             self.save_catalog()
-
             messagebox.showinfo(
                 "Renommage terminé",
-                (
-                    f"{len(active_plan)} photo(s) renommée(s).\n"
-                    f"Ordre enregistré pour {len(ordered_plan)} photo(s)."
-                )
+                f"{len(active_plan)} photo(s) renommée(s) selon l'ordre enregistré."
             )
-
             self.load_folder(self.base_folder)
 
-        except Exception as e:
-            messagebox.showerror("Erreur", str(e))
-            self.log(f"❌ Erreur renommage : {e}")
+        except Exception as exc:
+            messagebox.showerror("Erreur", str(exc))
+            self.log(f"❌ Erreur renommage : {exc}")
 
     def strip_accents(self, text):
         normalized = unicodedata.normalize("NFD", str(text))
@@ -20366,14 +22047,15 @@ namespace GestionBissesFolderPicker
     # MODULE 3 : CARTE + VISIONNEUSE + ÉDITION
     # ============================================================
 
-    def load_geolocated_photos(self):
+    def load_geolocated_photos(self, log_errors=True):
         if not os.path.exists(self.catalog_path):
             return []
 
         try:
             catalog = self.read_catalog()
         except Exception as e:
-            self.log(f"❌ Impossible de lire le catalogue : {e}")
+            if log_errors:
+                self.log(f"❌ Impossible de lire le catalogue : {e}")
             return []
 
         self.catalog_data = catalog
@@ -20569,9 +22251,17 @@ namespace GestionBissesFolderPicker
 
             tk.Button(
                 actions,
-                text="🔤 Renommer / déterminer l’ordre des photos",
-                command=self.show_rename_interface,
+                text="↕️ Définir l’ordre des photos",
+                command=self.show_photo_order_interface,
                 bg="#8e44ad",
+                fg="white"
+            ).pack(fill="x", pady=4)
+
+            tk.Button(
+                actions,
+                text="🔤 Renommer les photos",
+                command=self.show_rename_interface,
+                bg="#7d3c98",
                 fg="white"
             ).pack(fill="x", pady=4)
 
@@ -20589,7 +22279,7 @@ namespace GestionBissesFolderPicker
         Regroupe les fonctions de préparation photos hors du tableau de bord.
 
         Cette fenêtre accueille les commandes techniques liées aux photos :
-        choix du dossier, catalogue, GPS, géolocalisation et renommage.
+        choix du dossier, catalogue, GPS, géolocalisation, ordre puis renommage.
         La visionneuse reste ainsi centrée sur l'édition des métadonnées.
         """
         if not self.base_folder:
@@ -20609,7 +22299,7 @@ namespace GestionBissesFolderPicker
 
         window = tk.Toplevel(self.root)
         window.title("Préparation photos")
-        window.geometry("520x430")
+        window.geometry("520x470")
         window.minsize(460, 360)
         window.transient(self.root)
 
@@ -20697,12 +22387,21 @@ namespace GestionBissesFolderPicker
 
         tk.Button(
             actions,
-            text="🔤 Renommer / déterminer l’ordre des photos",
-            command=close_then(self.show_rename_interface),
+            text="↕️ Définir l’ordre des photos",
+            command=close_then(self.show_photo_order_interface),
             bg="#8e44ad",
             fg="white",
             state=gps_state
         ).grid(row=5, column=0, sticky="ew", pady=3)
+
+        tk.Button(
+            actions,
+            text="🔤 Renommer les photos",
+            command=close_then(self.show_rename_interface),
+            bg="#7d3c98",
+            fg="white",
+            state=gps_state
+        ).grid(row=6, column=0, sticky="ew", pady=3)
 
         tk.Label(
             frame,
@@ -20723,18 +22422,79 @@ namespace GestionBissesFolderPicker
         ).grid(row=4, column=0, sticky="e", pady=(12, 0))
 
     def show_map_interface(self):
-        photos = self.load_geolocated_photos()
-
-        if not photos:
-            self.show_empty_photo_workshop()
+        """Ouvre Photos sans bloquer Tk pendant les lectures lentes du stockage."""
+        if self._photo_workspace_loading:
             return
+        self._photo_workspace_loading = True
+        self._photo_workspace_load_generation += 1
+        generation = self._photo_workspace_load_generation
 
+        def worker(report):
+            report("Lecture du catalogue et des métadonnées photo…")
+            return self.load_geolocated_photos(log_errors=False)
+
+        def success(photos, token):
+            if generation != self._photo_workspace_load_generation:
+                self._photo_workspace_loading = False
+                self.end_activity(token, restore_status=True)
+                return
+            self._photo_workspace_loading = False
+            self._photo_workspace_loading_activity_token = None
+            if not photos:
+                self.end_activity(token, restore_status=False)
+                self.show_empty_photo_workshop()
+                return
+            try:
+                self._show_map_interface_ready(photos)
+            except Exception as exc:
+                self.end_activity(token, restore_status=True)
+                messagebox.showerror(
+                    "Photos",
+                    f"Impossible de construire l'atelier Photos :\n{exc}"
+                )
+                return
+            # Le premier décodage image a déjà été lancé, mais son callback Tk
+            # ne peut s'exécuter qu'après la fin de cette construction d'interface.
+            self._photo_workspace_open_activity_token = token
+            # Sécurité : un fichier image pathologique ne doit jamais laisser
+            # l'indicateur actif indéfiniment.
+            try:
+                self.root.after(5000, self._finish_photo_open_activity_if_pending)
+            except Exception:
+                pass
+
+        def error(exc, token):
+            self._photo_workspace_loading = False
+            self._photo_workspace_loading_activity_token = None
+            messagebox.showerror("Photos", f"Impossible d'ouvrir l'atelier Photos :\n{exc}")
+
+        self._photo_workspace_loading_activity_token = self.run_background_activity(
+            "Ouverture de l'atelier Photos…",
+            worker,
+            success,
+            error,
+            delay_ms=180,
+            keep_activity=True,
+        )
+
+    def _finish_photo_open_activity_if_pending(self):
+        token = self._photo_workspace_open_activity_token
+        if token is None:
+            return
+        self._photo_workspace_open_activity_token = None
+        self.end_activity(token, restore_status=False)
+        try:
+            self.status_header.config(text="Photos", fg="#2980b9")
+        except Exception:
+            pass
+
+    def _show_map_interface_ready(self, photos):
         self.geolocated_photos = photos
         self.current_photo = None
         self.gpx_workshop_active = False
 
         self.clear_main_frame()
-        self.status_header.config(text="Atelier Photos · carte · visionneuse · métadonnées", fg="#2980b9")
+        self.status_header.config(text="Photos", fg="#2980b9")
 
         toolbar = tk.Frame(self.main_frame)
         toolbar.pack(fill="x", pady=(0, 8))
@@ -20928,6 +22688,7 @@ namespace GestionBissesFolderPicker
         self.start_photo_layer_watch("photo")
 
         self.log(f"🗺️ Atelier Photos ouvert avec {len(photos)} photo(s).")
+
 
     def build_map_panel(self, parent):
         header = tk.Frame(parent, bg="#eeeeee")
@@ -22210,6 +23971,8 @@ namespace GestionBissesFolderPicker
             pass
 
     def load_photo_in_viewer(self, image_path):
+        self._viewer_load_generation += 1
+        generation = self._viewer_load_generation
         self.viewer_original_image = None
         self.viewer_display_image = None
 
@@ -22217,23 +23980,60 @@ namespace GestionBissesFolderPicker
             self.viewer_info_var.set("Image introuvable")
             if self.viewer_canvas:
                 self.viewer_canvas.delete("all")
+            self._finish_photo_open_activity_if_pending()
             return
 
-        try:
-            img = Image.open(image_path)
-            img = ImageOps.exif_transpose(img)
-            self.viewer_original_image = img.copy()
+        self.viewer_info_var.set(f"Chargement de {os.path.basename(image_path)}…")
+        result_queue = queue.Queue()
 
+        def worker():
+            try:
+                with Image.open(image_path) as source:
+                    image = ImageOps.exif_transpose(source)
+                    prepared = image.copy()
+                result_queue.put(("ok", prepared))
+            except Exception as exc:
+                result_queue.put(("error", exc))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+        def poll():
+            try:
+                kind, value = result_queue.get_nowait()
+            except queue.Empty:
+                if generation == self._viewer_load_generation:
+                    try:
+                        self.root.after(60, poll)
+                    except Exception:
+                        pass
+                return
+
+            # Une navigation plus récente gagne toujours.
+            if generation != self._viewer_load_generation:
+                return
+
+            if kind == "error":
+                self.viewer_info_var.set(f"Aperçu impossible : {value}")
+                if self.viewer_canvas:
+                    self.viewer_canvas.delete("all")
+                self._finish_photo_open_activity_if_pending()
+                return
+
+            self.viewer_original_image = value
             filename = os.path.basename(image_path)
             w, h = self.viewer_original_image.size
             self.viewer_info_var.set(f"{filename} · {w} × {h}px")
+            try:
+                self.viewer_canvas.after(100, self.viewer_fit_to_panel)
+            except Exception:
+                pass
+            self._finish_photo_open_activity_if_pending()
 
-            self.viewer_canvas.after(100, self.viewer_fit_to_panel)
+        try:
+            self.root.after(60, poll)
+        except Exception:
+            pass
 
-        except Exception as e:
-            self.viewer_info_var.set(f"Aperçu impossible : {e}")
-            if self.viewer_canvas:
-                self.viewer_canvas.delete("all")
 
     def viewer_render_image(self):
         if self.viewer_original_image is None or self.viewer_canvas is None:
