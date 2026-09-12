@@ -1,7 +1,6 @@
 import os
 import re
 import json
-import hashlib
 import uuid
 import math
 import unicodedata
@@ -9,8 +8,6 @@ import difflib
 import copy
 import shutil
 import sys
-import traceback
-import faulthandler
 import subprocess
 import tempfile
 import queue
@@ -18,9 +15,6 @@ import threading
 import time
 import csv
 import heapq
-import webbrowser
-import html
-import http.server
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk, colorchooser, simpledialog
 from PIL import Image, ImageTk, ImageOps, ImageDraw, ImageFont
@@ -43,71 +37,6 @@ from abisses_update_ui import AbissesUpdateController
 pillow_heif.register_heif_opener()
 
 APP_VERSION = get_current_version()
-
-def atomic_write_json_file(
-    path,
-    data,
-    *,
-    indent=4,
-    ensure_ascii=False,
-    trailing_newline=True,
-):
-    """
-    Écriture JSON transactionnelle sur le même volume.
-
-    Le fichier existant n'est remplacé qu'après sérialisation complète,
-    flush et fsync du fichier temporaire.
-    """
-    path = os.path.abspath(os.fspath(path))
-    directory = os.path.dirname(path)
-    os.makedirs(directory, exist_ok=True)
-
-    temp_path = os.path.join(
-        directory,
-        f".{os.path.basename(path)}.abisses_tmp_{uuid.uuid4().hex}"
-    )
-
-    try:
-        with open(temp_path, "w", encoding="utf-8", newline="\n") as handle:
-            json.dump(
-                data,
-                handle,
-                indent=indent,
-                ensure_ascii=ensure_ascii
-            )
-            if trailing_newline:
-                handle.write("\n")
-            handle.flush()
-            try:
-                os.fsync(handle.fileno())
-            except OSError:
-                # Certains systèmes/fichiers réseau ne proposent pas fsync
-                # de manière fiable. Le remplacement atomique reste utilisé.
-                pass
-
-        os.replace(temp_path, path)
-
-    finally:
-        if os.path.exists(temp_path):
-            try:
-                os.remove(temp_path)
-            except OSError:
-                pass
-
-
-# ============================================================
-# V61 — moteur de rendu local Bisses
-# Copie exacte du générateur de plateforme fourni avec cette version.
-# La prévisualisation écrit ces mêmes index.html / CSS / JS dans un
-# dossier temporaire puis les sert uniquement sur 127.0.0.1.
-# ============================================================
-BISSES_RENDER_INDEX_HTML = '<!doctype html>\n<html lang="fr">\n<head>\n  <meta charset="utf-8">\n  <meta name="viewport" content="width=device-width, initial-scale=1">\n  <title>Bisses du Valais</title>\n  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css">\n  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet.markercluster@1.5.3/dist/MarkerCluster.css">\n  <link rel="stylesheet" href="assets/css/styles.css">\n</head>\n\n<body>\n  <div id="app-shell">\n    <main id="map-region" aria-label="Carte des bisses du Valais">\n      <div id="map"></div>\n\n      <header class="topbar">\n        <div class="brand">\n          <div class="eyebrow">Inventaire cartographique</div>\n          <h1>Bisses du Valais</h1>\n          <div class="build-version">bisses-ui-clusters-2026-08-11-v6.3</div>\n        </div>\n\n        <div class="toolbar">\n          <button id="btn-valais" type="button">Vue Valais</button>\n          <button id="btn-list" type="button">Liste</button>\n          <button id="btn-basemap" type="button">Satellite</button>\n        </div>\n      </header>\n\n      <div id="legend" class="legend"></div>\n      <div id="scale-pill" class="scale-pill">Fond carte</div>\n      <div id="status-pill" class="status-pill">Chargement…</div>\n    </main>\n\n    <aside id="side-panel" class="side-panel" aria-label="Informations">\n      <button id="btn-close-panel" class="close-button" type="button" aria-label="Fermer">×</button>\n      <div class="panel-kicker" id="panel-kicker">Fiche bisse</div>\n      <h2 id="panel-title">Bisses du Valais</h2>\n      <div id="panel-content">\n        <p class="muted">Sélectionnez un bisse pour afficher sa fiche.</p>\n      </div>\n    </aside>\n  </div>\n\n  <script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js"></script>\n  <script src="https://cdn.jsdelivr.net/npm/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>\n  <script src="https://cdn.jsdelivr.net/npm/leaflet-tilelayer-swiss@2.4.0/dist/Leaflet.TileLayer.Swiss.umd.js"></script>\n  <script src="https://cdn.jsdelivr.net/npm/leaflet-polylineoffset@1.1.1/leaflet.polylineoffset.js"></script>\n  <script src="assets/js/app.js"></script>\n</body>\n</html>\n'
-
-BISSES_RENDER_STYLES_CSS = 'html,\nbody {\n  width: 100%;\n  height: 100%;\n  margin: 0;\n  padding: 0;\n}\n\nbody {\n  overflow: hidden;\n  font-family: Candara, "Segoe UI", system-ui, sans-serif;\n  color: #1f2d24;\n  background: #dfe5da;\n}\n\n#map {\n  position: fixed;\n  inset: 0;\n  z-index: 1;\n  width: 100vw;\n  height: 100vh;\n  height: 100dvh;\n  background: #dfe5da;\n}\n\n/* Fond Swisstopo : la CN 1:1 million reste non blanchie.\n   Les fonds plus détaillés sont légèrement blanchis pour laisser respirer les tracés. */\n.leaflet-tile-pane {\n  filter: none;\n}\n\n#map.basemap-muted .leaflet-tile-pane {\n  filter: brightness(1.10) saturate(0.82) contrast(0.90);\n}\n\n/* Sécurité : les pastilles disparaissent dès que la carte passe en mode traces. */\n#map.segments-mode .bisse-marker,\n#map.segments-mode .bisse-cluster {\n  display: none;\n}\n\n/* Supprime les cadres de focus parasites autour des objets Leaflet\n   dans les navigateurs qui donnent le focus aux SVG/paths après clic.\n   Les boutons HTML de l’interface conservent leur focus normal. */\n.leaflet-container,\n.leaflet-container *,\n.leaflet-interactive,\n.leaflet-marker-icon,\n.leaflet-marker-shadow,\n.leaflet-pane,\n.leaflet-overlay-pane svg,\n.leaflet-overlay-pane path {\n  -webkit-tap-highlight-color: transparent;\n}\n\n.leaflet-container:focus,\n.leaflet-container *:focus,\n.leaflet-interactive:focus,\n.leaflet-marker-icon:focus,\n.leaflet-marker-shadow:focus,\n.leaflet-overlay-pane svg:focus,\n.leaflet-overlay-pane path:focus {\n  outline: none !important;\n  box-shadow: none !important;\n}\n\nbutton {\n  font: inherit;\n}\n\n.topbar {\n  position: fixed;\n  z-index: 700;\n  top: 16px;\n  left: 16px;\n  right: 16px;\n  display: flex;\n  justify-content: space-between;\n  align-items: flex-start;\n  gap: 16px;\n  pointer-events: none;\n}\n\n.brand,\n.toolbar,\n.panel,\n.legend,\n.status-pill,\n.scale-pill {\n  pointer-events: auto;\n}\n\n.brand {\n  max-width: min(430px, calc(100vw - 32px));\n  padding: 14px 18px;\n  border-radius: 22px;\n  color: #fff;\n  background:\n    radial-gradient(circle at 15% 20%, rgba(255,255,255,.16), transparent 34%),\n    linear-gradient(135deg, rgba(31,47,37,.96), rgba(77,99,70,.93));\n  box-shadow: 0 16px 42px rgba(20, 30, 22, .22);\n  backdrop-filter: blur(8px);\n}\n\n.eyebrow,\n.panel-kicker {\n  margin: 0 0 5px;\n  text-transform: uppercase;\n  letter-spacing: .14em;\n  font-size: .72rem;\n  font-weight: 700;\n  opacity: .72;\n}\n\n.build-version {\n  margin-top: 6px;\n  font-size: .72rem;\n  opacity: .55;\n}\n\nh1,\nh2,\nh3 {\n  margin: 0;\n  line-height: 1.08;\n}\n\nh1 {\n  font-size: clamp(1.7rem, 3vw, 2.55rem);\n}\n\nh2 {\n  font-size: 1.45rem;\n}\n\nh3 {\n  font-size: 1.13rem;\n}\n\n.toolbar {\n  display: flex;\n  gap: 8px;\n  flex-wrap: wrap;\n  justify-content: flex-end;\n}\n\n.toolbar button,\n.close-button {\n  border: 1px solid rgba(66, 58, 43, .18);\n  background: rgba(255, 250, 241, .96);\n  color: #1f2d24;\n  box-shadow: 0 10px 28px rgba(20, 30, 22, .14);\n  cursor: pointer;\n}\n\n.toolbar button {\n  min-height: 40px;\n  padding: 9px 14px;\n  border-radius: 999px;\n}\n\n.toolbar button:hover,\n.close-button:hover {\n  background: #fff;\n}\n\n.panel {\n  position: fixed;\n  z-index: 650;\n  border: 1px solid rgba(66, 58, 43, .18);\n  border-radius: 24px;\n  background: rgba(255, 250, 241, .96);\n  box-shadow: 0 18px 52px rgba(20, 30, 22, .22);\n  backdrop-filter: blur(10px);\n  overflow: auto;\n}\n\n.panel-main {\n  left: 16px;\n  bottom: 16px;\n  width: min(390px, calc(100vw - 32px));\n  max-height: calc(100dvh - 155px);\n  padding: 20px;\n  transform: translateX(0);\n  transition: transform .22s ease, opacity .22s ease;\n}\n\n.panel-main:not(.is-open) {\n  transform: translateX(calc(-100% - 28px));\n  opacity: .1;\n  pointer-events: none;\n}\n\n.panel-context {\n  right: 16px;\n  bottom: 16px;\n  width: min(340px, calc(100vw - 32px));\n  max-height: min(56dvh, 520px);\n  padding: 18px;\n  transform: translateY(0);\n  transition: transform .18s ease, opacity .18s ease;\n}\n\n.panel-context:not(.is-open) {\n  transform: translateY(18px);\n  opacity: 0;\n  pointer-events: none;\n}\n\n.panel-list {\n  right: 16px;\n  top: 82px;\n  width: min(360px, calc(100vw - 32px));\n  max-height: calc(100dvh - 106px);\n  padding: 18px;\n  transform: translateX(0);\n  transition: transform .2s ease, opacity .2s ease;\n}\n\n.panel-list:not(.is-open) {\n  transform: translateX(calc(100% + 28px));\n  opacity: 0;\n  pointer-events: none;\n}\n\n.close-button {\n  position: absolute;\n  top: 10px;\n  right: 10px;\n  width: 32px;\n  height: 32px;\n  border-radius: 999px;\n  font-size: 1.25rem;\n  line-height: 1;\n}\n\n.muted {\n  color: #657064;\n}\n\n.lead {\n  margin: 12px 0 14px;\n  line-height: 1.5;\n}\n\n.fact-grid {\n  display: grid;\n  grid-template-columns: 1fr 1fr;\n  gap: 8px 12px;\n  margin-top: 14px;\n}\n\n.fact {\n  padding-top: 9px;\n  border-top: 1px solid rgba(66, 58, 43, .17);\n}\n\n.fact dt {\n  color: #657064;\n  font-size: .72rem;\n  text-transform: uppercase;\n  letter-spacing: .08em;\n}\n\n.fact dd {\n  margin: 3px 0 0;\n  font-weight: 700;\n}\n\n.tags {\n  display: flex;\n  flex-wrap: wrap;\n  gap: 7px;\n  margin-top: 14px;\n}\n\n.tag {\n  display: inline-flex;\n  border: 1px solid rgba(66, 58, 43, .17);\n  border-radius: 999px;\n  padding: 5px 9px;\n  background: #fff;\n  font-size: .86rem;\n}\n\n.gallery {\n  display: grid;\n  grid-template-columns: 1fr 1fr;\n  gap: 9px;\n  margin-top: 14px;\n}\n\n.photo-card {\n  border: 1px solid rgba(66, 58, 43, .17);\n  border-radius: 15px;\n  overflow: hidden;\n  background: #fff;\n  cursor: pointer;\n  text-align: left;\n  padding: 0;\n}\n\n.photo-card img {\n  width: 100%;\n  aspect-ratio: 4 / 3;\n  object-fit: cover;\n  display: block;\n}\n\n.photo-card div {\n  padding: 8px;\n}\n\n.photo-card strong {\n  display: block;\n  font-size: .9rem;\n}\n\n.photo-card span {\n  display: block;\n  margin-top: 3px;\n  color: #657064;\n  font-size: .78rem;\n  line-height: 1.25;\n}\n\n#bisse-list {\n  display: grid;\n  gap: 9px;\n  margin-top: 12px;\n}\n\n.bisse-button {\n  width: 100%;\n  border: 1px solid rgba(66, 58, 43, .17);\n  border-radius: 16px;\n  background: #fff;\n  color: #1f2d24;\n  padding: 12px;\n  text-align: left;\n  cursor: pointer;\n}\n\n.bisse-button:hover {\n  border-color: rgba(63, 98, 69, .55);\n}\n\n.bisse-button strong {\n  display: block;\n}\n\n.bisse-button span {\n  display: block;\n  margin-top: 3px;\n  color: #657064;\n  font-size: .86rem;\n}\n\n.legend {\n  position: fixed;\n  z-index: 620;\n  left: 50%;\n  bottom: 18px;\n  transform: translateX(-50%);\n  display: flex;\n  flex-wrap: wrap;\n  justify-content: center;\n  gap: 7px;\n  max-width: min(760px, calc(100vw - 40px));\n  padding: 8px;\n  border: 1px solid rgba(66, 58, 43, .18);\n  border-radius: 999px;\n  background: rgba(255, 250, 241, .94);\n  box-shadow: 0 12px 34px rgba(20, 30, 22, .18);\n  backdrop-filter: blur(8px);\n}\n\n.legend:empty,\n.legend.is-hidden {\n  display: none;\n}\n\n.legend-item {\n  display: inline-flex;\n  align-items: center;\n  gap: 6px;\n  min-height: 27px;\n  padding: 4px 9px;\n  border: 1px solid rgba(66, 58, 43, .17);\n  border-radius: 999px;\n  background: #fff;\n  font-size: .86rem;\n}\n\n.legend-swatch {\n  width: 12px;\n  height: 12px;\n  border-radius: 50%;\n}\n\n.status-pill,\n.scale-pill {\n  position: fixed;\n  z-index: 620;\n  max-width: min(430px, calc(100vw - 32px));\n  padding: 8px 11px;\n  border-radius: 999px;\n  color: #fff;\n  font-size: .84rem;\n  box-shadow: 0 10px 30px rgba(20, 30, 22, .22);\n}\n\n.status-pill {\n  left: 16px;\n  bottom: 16px;\n  background: rgba(31, 45, 36, .88);\n}\n\n.scale-pill {\n  right: 16px;\n  bottom: 16px;\n  background: rgba(31, 45, 36, .78);\n}\n\n.status-pill.is-hidden,\n.scale-pill.is-hidden {\n  display: none;\n}\n\n.bisse-marker {\n  width: 30px;\n  height: 30px;\n  border: 3px solid #fff;\n  border-radius: 50%;\n  background: #1e88e5;\n  box-shadow: 0 4px 15px rgba(0,0,0,.35);\n}\n\n.bisse-cluster {\n  width: 30px;\n  height: 30px;\n  border: 3px solid #fff;\n  border-radius: 50%;\n  display: grid;\n  place-items: center;\n  background: #1e88e5;\n  color: #fff;\n  font-weight: 700;\n  font-size: .9rem;\n  line-height: 1;\n  box-shadow: 0 4px 15px rgba(0,0,0,.35);\n}\n\n.marker-cluster,\n.marker-cluster-small,\n.marker-cluster-medium,\n.marker-cluster-large {\n  background: transparent;\n  border: 0;\n}\n\n.marker-cluster div,\n.marker-cluster-small div,\n.marker-cluster-medium div,\n.marker-cluster-large div {\n  background: transparent;\n  margin: 0;\n}\n\n.photo-marker {\n  width: 18px;\n  height: 18px;\n  border: 2px solid #fff;\n  border-radius: 50%;\n  background:\n    radial-gradient(circle at center, #fff 0 2px, transparent 3px),\n    #1f2d24;\n  box-shadow: 0 4px 12px rgba(0,0,0,.3);\n}\n\n.leaflet-tooltip.bisse-tooltip,\n.leaflet-tooltip.segment-tooltip {\n  border: 0;\n  border-radius: 999px;\n  padding: 6px 9px;\n  background: rgba(31, 45, 36, .94);\n  color: #fff;\n  box-shadow: 0 8px 22px rgba(0,0,0,.20);\n  font-family: Candara, "Segoe UI", system-ui, sans-serif;\n  font-size: .88rem;\n}\n\n.context-row {\n  padding: 9px 0;\n  border-top: 1px solid rgba(66, 58, 43, .17);\n}\n\n.context-row strong {\n  display: block;\n  color: #657064;\n  font-size: .72rem;\n  text-transform: uppercase;\n  letter-spacing: .08em;\n}\n\n.context-row span {\n  display: block;\n  margin-top: 3px;\n}\n\n.context-photo {\n  width: 100%;\n  border-radius: 16px;\n  margin-bottom: 12px;\n  display: block;\n}\n\n.error-box {\n  padding: 12px;\n  border: 1px solid rgba(150, 62, 48, .35);\n  border-radius: 16px;\n  color: #76382f;\n  background: rgba(150, 62, 48, .08);\n}\n\n\n\n/* Réforme UI : panneau latéral non flottant.\n   La fiche ne recouvre plus la carte : elle réduit la largeur utile de la carte. */\n#app-shell {\n  position: fixed;\n  inset: 0;\n  overflow: hidden;\n}\n\n#map-region {\n  position: fixed;\n  inset: 0;\n  transition: right .24s ease;\n}\n\n#map {\n  position: absolute;\n  inset: 0;\n  width: auto;\n  height: auto;\n}\n\nbody.side-panel-open #map-region {\n  right: 430px;\n}\n\nbody.side-panel-open .topbar {\n  right: 446px;\n}\n\n.side-panel {\n  position: fixed;\n  z-index: 760;\n  top: 0;\n  right: 0;\n  bottom: 0;\n  width: 430px;\n  max-width: min(430px, 42vw);\n  box-sizing: border-box;\n  padding: 24px 24px 28px;\n  border-left: 1px solid rgba(66, 58, 43, .18);\n  background: rgba(255, 250, 241, .98);\n  box-shadow: -18px 0 52px rgba(20, 30, 22, .18);\n  overflow: auto;\n  transform: translateX(100%);\n  transition: transform .24s ease;\n}\n\nbody.side-panel-open .side-panel {\n  transform: translateX(0);\n}\n\n.side-panel .close-button {\n  top: 14px;\n  right: 14px;\n}\n\n\n.bisse-action-chip {\n  position: relative;\n  display: inline-flex;\n  align-items: center;\n  gap: 6px;\n  max-width: min(320px, calc(100vw - 96px));\n  padding: 6px 8px;\n  border: 1px solid rgba(66, 58, 43, .18);\n  border-radius: 18px;\n  background: rgba(255, 250, 241, .96);\n  color: #1f2d24;\n  box-shadow: 0 10px 24px rgba(20, 30, 22, .16);\n  backdrop-filter: blur(8px);\n  transform: translate(-50%, 0);\n  pointer-events: auto;\n  white-space: nowrap;\n}\n\n.bisse-action-title {\n  min-width: 0;\n  max-width: 170px;\n  overflow: hidden;\n  text-overflow: ellipsis;\n  font-weight: 700;\n  font-size: .85rem;\n}\n\n.bisse-action-button {\n  border: 1px solid rgba(66, 58, 43, .18);\n  border-radius: 999px;\n  padding: 4px 8px;\n  background: #fff;\n  color: #1f2d24;\n  cursor: pointer;\n  font-size: .8rem;\n  line-height: 1.1;\n}\n\n.bisse-action-button:hover {\n  background: rgba(31, 45, 36, .07);\n}\n\n.bisse-action-button.is-active {\n  background: #1f2d24;\n  color: #fff;\n}\n\n@media (max-width: 760px) {\n  .bisse-action-chip {\n    max-width: calc(100vw - 56px);\n    border-radius: 16px;\n    white-space: normal;\n  }\n\n  .bisse-action-title {\n    max-width: 150px;\n  }\n}\n\n.leaflet-popup-content-wrapper {\n  border-radius: 16px;\n  background: rgba(255, 250, 241, .98);\n  box-shadow: 0 14px 42px rgba(20, 30, 22, .24);\n}\n\n.leaflet-popup-content {\n  margin: 12px 14px;\n  font-family: Candara, "Segoe UI", system-ui, sans-serif;\n  color: #1f2d24;\n}\n\n.map-popup {\n  box-sizing: border-box;\n}\n\n.map-popup h3 {\n  margin: 0 0 7px;\n  font-size: 1rem;\n}\n\n.map-popup p {\n  margin: 4px 0;\n  line-height: 1.35;\n}\n\n.map-popup .popup-muted {\n  color: #657064;\n  font-size: .88rem;\n}\n\n.photo-popup {\n  width: 320px;\n  max-width: calc(100vw - 76px);\n}\n\n.photo-popup-media {\n  display: flex;\n  justify-content: center;\n  align-items: center;\n  width: 100%;\n  max-height: min(58vh, 430px);\n  margin-bottom: 10px;\n  border-radius: 14px;\n  overflow: hidden;\n  background: rgba(31, 45, 36, .07);\n}\n\n.photo-popup-media img {\n  display: block;\n  max-width: 100%;\n  max-height: min(58vh, 430px);\n  width: auto;\n  height: auto;\n  object-fit: contain;\n}\n\n.photo-popup h3 {\n  margin-bottom: 5px;\n}\n\n.photo-popup p {\n  max-height: 130px;\n  overflow: auto;\n}\n\n@media (max-width: 900px) {\n  body.side-panel-open #map-region {\n    right: 0;\n  }\n\n  body.side-panel-open .topbar {\n    right: 16px;\n  }\n\n  .side-panel {\n    top: auto;\n    left: 0;\n    width: 100vw;\n    max-width: none;\n    height: min(58dvh, 560px);\n    border-left: 0;\n    border-top: 1px solid rgba(66, 58, 43, .18);\n    border-radius: 24px 24px 0 0;\n    transform: translateY(100%);\n  }\n\n  body.side-panel-open .side-panel {\n    transform: translateY(0);\n  }\n}\n\n@media (max-width: 760px) {\n  .topbar {\n    display: block;\n  }\n\n  .brand {\n    width: fit-content;\n    margin-bottom: 8px;\n  }\n\n  .toolbar {\n    justify-content: flex-start;\n  }\n\n  .panel-main {\n    width: calc(100vw - 32px);\n    max-height: 48dvh;\n  }\n\n  .panel-context {\n    left: 16px;\n    right: 16px;\n    width: auto;\n  }\n\n  .legend {\n    display: none;\n  }\n\n  .fact-grid,\n  .gallery {\n    grid-template-columns: 1fr;\n  }\n}\n'
-
-BISSES_RENDER_APP_JS = '/* global L */\n"use strict";\n\nconsole.log("Bisses build bisses-ui-clusters-2026-08-11-v6.3");\n\nconst VALAIS_CENTER = [46.22, 7.55];\nconst VALAIS_ZOOM = 17;\nconst MIN_ZOOM = 16;\nconst MAX_ZOOM = 26;\n\nconst SHOW_SYNTHETIC_TRACES_AT_ZOOM = 19;\nconst SHOW_DETAILED_SEGMENTS_AT_ZOOM = 20.5;\nconst SHOW_BICOLOR_SPLIT_AT_ZOOM = 23.5;\nconst SHOW_EXACT_SEGMENT_DETAIL_AT_ZOOM = 25;\n\n// Option A : généralisation purement visuelle des plages de couleur.\n// Les données GeoJSON sources ne sont jamais modifiées.\nconst ENABLE_SEGMENT_GENERALIZATION = true;\nconst SAME_NEIGHBORS_MAX_PX = 18;\nconst DIFFERENT_NEIGHBORS_MAX_PX = 9;\n\nconst MAP_SCALE_STEPS = [\n  { min: 16, max: 16.5, label: "CN 1:1 million", layer: "ch.swisstopo.pixelkarte-farbe-pk1000.noscale", format: "jpeg", maxNativeZoom: 26, muted: false },\n  { min: 17, max: 18, label: "CN 1:500k", layer: "ch.swisstopo.pixelkarte-farbe-pk500.noscale", format: "jpeg", maxNativeZoom: 26, muted: true },\n  { min: 18.5, max: 18.5, label: "CN 1:200k", layer: "ch.swisstopo.pixelkarte-farbe-pk200.noscale", format: "jpeg", maxNativeZoom: 26, muted: true },\n  { min: 19, max: 20, label: "CN 1:100k", layer: "ch.swisstopo.pixelkarte-farbe-pk100.noscale", format: "jpeg", maxNativeZoom: 26, muted: true },\n  { min: 20.5, max: 21.5, label: "CN 1:50k", layer: "ch.swisstopo.pixelkarte-farbe-pk50.noscale", format: "jpeg", maxNativeZoom: 26, muted: true },\n  { min: 22, max: 23, label: "CN 1:25k", layer: "ch.swisstopo.pixelkarte-farbe-pk25.noscale", format: "jpeg", maxNativeZoom: 26, muted: true },\n  { min: 23.5, max: 26, label: "CN 1:10k", layer: "ch.swisstopo.landeskarte-farbe-10", format: "png", maxNativeZoom: 26, muted: true }\n];\n\nconst SATELLITE_STEP = {\n  label: "Satellite",\n  layer: "ch.swisstopo.swissimage",\n  format: "jpeg",\n  maxNativeZoom: 26,\n  muted: false\n};\n\nconst WATER_LABELS = {\n  in_water: "en eau",\n  dry: "sec",\n  intermittent: "intermittent",\n  unknown: "inconnu"\n};\n\nconst FALLBACK_CATEGORIES = {\n  open: { id: "open", name: "À ciel ouvert", color: "#1e88e5" },\n  canalized: { id: "canalized", name: "Canalisé", color: "#111111" },\n  abandoned: { id: "abandoned", name: "Abandonné", color: "#ef6c00" },\n  mixed: { id: "mixed", name: "Mixte", color: "#777777" },\n  unknown: { id: "unknown", name: "Non classé", color: "#777777" }\n};\n\n// Décision métier : un segment bicolore est toujours canalisé + abandonné.\n// En mode détaillé simplifié, avant le rendu bicolore complet, il est rendu en noir.\nconst BICOLOR_SIMPLIFIED_COLOR = "#111111";\n\n// v6.3 : la trace colorée stable reste arrondie, puis chaque jonction reçoit\n// une petite pastille de raccord recouvrant entièrement les deux caps. Cette\n// pastille est partagée en deux par une coupe droite, normale à la tangente\n// commune de la bisse. Les angles restent ainsi souples, mais la frontière\n// interne entre couleurs est nette et jointive.\nconst SEGMENT_LINE_CAP = "round";\nconst TRANSITION_TANGENT_SAMPLE_PX = 10;\nconst TRANSITION_PATCH_ARC_STEPS = 24;\nconst TRANSITION_PATCH_OVERLAP_PX = 0.35;\nconst TRANSITION_PATCH_OVERSCAN_PX = 0.35;\n\n// Les cibles invisibles de clic restent arrondies pour garder une zone de clic confortable.\nconst HIT_LINE_CAP = "round";\n\nfunction clusterRadiusForZoom(zoom) {\n  // Rayon en pixels : compromis entre v1 et v2.\n  // z16.5 reste assez tolérant pour éviter les chevauchements visuels,\n  // mais moins rassembleur que v2.\n  if (zoom >= 18.5) return 15;\n  if (zoom >= 18) return 24;\n  if (zoom >= 17.5) return 35;\n  if (zoom >= 17) return 47;\n  if (zoom >= 16.5) return 66;\n  return 80;\n}\n\nfunction createBisseMarkerLayer() {\n  if (!L.markerClusterGroup) {\n    console.warn("Leaflet.markercluster n\'est pas chargé : fallback vers pastilles simples.");\n    return L.layerGroup();\n  }\n\n  return L.markerClusterGroup({\n    showCoverageOnHover: false,\n    zoomToBoundsOnClick: false,\n    spiderfyOnMaxZoom: false,\n    spiderfyOnEveryZoom: false,\n    removeOutsideVisibleBounds: true,\n    disableClusteringAtZoom: SHOW_SYNTHETIC_TRACES_AT_ZOOM,\n    maxClusterRadius: () => clusterRadiusForZoom(roundedZoom()),\n    iconCreateFunction: (cluster) => L.divIcon({\n      className: "",\n      html: `<div class="bisse-cluster">${cluster.getChildCount()}</div>`,\n      iconSize: [30, 30],\n      iconAnchor: [15, 15]\n    })\n  });\n}\n\nconst state = {\n  index: [],\n  cache: new Map(),\n  selectedId: null,\n  selectedData: null,\n  photoMarkersVisible: false,\n  bisseActionMarker: null,\n  base: "carto",\n  currentStepKey: "",\n  currentSegmentsKey: "",\n  currentVisibleSegmentCount: 0,\n  segmentRefreshToken: 0,\n  listHtml: "",\n  legendHtml: "",\n  baseLayer: null,\n  bisseMarkers: createBisseMarkerLayer(),\n  segmentOutlineLayer: null,\n  segmentColorLayer: null,\n  photoLayer: L.layerGroup()\n};\n\nconst $ = (id) => document.getElementById(id);\n\nfunction elementWithinLeaflet(el) {\n  let node = el;\n\n  while (node) {\n    if (node.classList && node.classList.contains("leaflet-container")) {\n      return true;\n    }\n    node = node.parentElement || node.parentNode;\n  }\n\n  return false;\n}\n\nfunction blurIfPossible(el) {\n  if (el && typeof el.blur === "function") {\n    el.blur();\n  }\n}\n\nfunction clearLeafletFocus() {\n  window.setTimeout(() => {\n    const active = document.activeElement;\n\n    if (elementWithinLeaflet(active)) {\n      blurIfPossible(active);\n    }\n\n    document\n      .querySelectorAll(".leaflet-interactive, .leaflet-marker-icon, .leaflet-marker-shadow, .leaflet-overlay-pane svg, .leaflet-overlay-pane path")\n      .forEach((el) => blurIfPossible(el));\n  }, 0);\n}\n\nfunction escapeHtml(value) {\n  return String(value ?? "")\n    .replaceAll("&", "&amp;")\n    .replaceAll("<", "&lt;")\n    .replaceAll(">", "&gt;")\n    .replaceAll(\'"\', "&quot;")\n    .replaceAll("\'", "&#039;");\n}\n\nfunction isNum(value) {\n  return typeof value === "number" && Number.isFinite(value);\n}\n\nfunction showStatus(text) {\n  const pill = $("status-pill");\n  pill.textContent = text;\n  pill.classList.remove("is-hidden");\n}\n\nfunction hideStatus() {\n  $("status-pill").classList.add("is-hidden");\n}\n\nfunction showScale(text) {\n  const pill = $("scale-pill");\n  pill.textContent = text;\n  pill.classList.remove("is-hidden");\n}\n\nasync function loadJson(path) {\n  const response = await fetch(path);\n  if (!response.ok) throw new Error(`Impossible de charger ${path}`);\n  return response.json();\n}\n\nif (!L.CRS || !L.CRS.EPSG2056 || !L.tileLayer || !L.tileLayer.swiss) {\n  throw new Error("Leaflet.TileLayer.Swiss n\'est pas chargé correctement.");\n}\n\nconst map = L.map("map", {\n  crs: L.CRS.EPSG2056,\n  zoomControl: false,\n  scrollWheelZoom: true,\n  minZoom: MIN_ZOOM,\n  maxZoom: MAX_ZOOM,\n  zoomSnap: 0.5,\n  zoomDelta: 0.5\n});\n\nL.control.zoom({ position: "bottomright" }).addTo(map);\n\nmap.createPane("segmentOutlinePane");\nmap.getPane("segmentOutlinePane").style.zIndex = 405;\n\nmap.createPane("segmentColorPane");\nmap.getPane("segmentColorPane").style.zIndex = 410;\n\nmap.createPane("segmentHitPane");\nmap.getPane("segmentHitPane").style.zIndex = 425;\n\nmap.createPane("photoPane");\nmap.getPane("photoPane").style.zIndex = 430;\n\nstate.bisseMarkers.addTo(map);\nstate.photoLayer.addTo(map);\n\nif (L.markerClusterGroup && state.bisseMarkers.on) {\n  state.bisseMarkers.on("clusterclick", (event) => {\n    clearLeafletFocus();\n\n    if (event.originalEvent) {\n      L.DomEvent.stop(event.originalEvent);\n    }\n\n    const nextZoom = Math.min(SHOW_SYNTHETIC_TRACES_AT_ZOOM, roundedZoom() + 0.5);\n    map.setView(event.latlng, nextZoom, { animate: true });\n  });\n}\n\nfunction roundedZoom() {\n  return Math.round(map.getZoom() * 2) / 2;\n}\n\nfunction segmentRenderMode() {\n  const zoom = roundedZoom();\n\n  if (zoom < SHOW_SYNTHETIC_TRACES_AT_ZOOM) {\n    return "markers";\n  }\n\n  if (zoom < SHOW_DETAILED_SEGMENTS_AT_ZOOM) {\n    return "synthetic";\n  }\n\n  return "detailed";\n}\n\nfunction segmentStyleForZoom() {\n  const zoom = roundedZoom();\n\n  if (zoom < SHOW_DETAILED_SEGMENTS_AT_ZOOM) {\n    return { key: "synthetic", outlineWeight: 9, colorWeight: 6, opacity: 0.96, clickWeight: 16 };\n  }\n\n  if (zoom <= 22.5) {\n    return { key: "detail-light", outlineWeight: 11, colorWeight: 7, opacity: 0.98, clickWeight: 18 };\n  }\n\n  if (zoom <= 24.5) {\n    return { key: "detail-medium", outlineWeight: 12, colorWeight: 8, opacity: 0.99, clickWeight: 19 };\n  }\n\n  return { key: "detail-final", outlineWeight: 13, colorWeight: 9, opacity: 0.99, clickWeight: 20 };\n}\n\nfunction bicolorStyleForZoom() {\n  const base = segmentStyleForZoom();\n  const zoom = roundedZoom();\n\n  if (zoom < SHOW_BICOLOR_SPLIT_AT_ZOOM) {\n    return {\n      ...base,\n      mode: "simplified"\n    };\n  }\n\n  return {\n    ...base,\n    mode: "split",\n    outlineWeight: 13,\n    flankWeight: 5.8,\n    offset: 2.35,\n    opacity: 0.99,\n    clickWeight: 20\n  };\n}\n\nfunction stepForZoom(zoom) {\n  const clampedZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, zoom));\n  return MAP_SCALE_STEPS.find((step) => clampedZoom >= step.min && clampedZoom <= step.max) || MAP_SCALE_STEPS[0];\n}\n\nfunction makeSwissLayer(step) {\n  return L.tileLayer.swiss({\n    layer: step.layer,\n    format: step.format || "jpeg",\n    maxNativeZoom: step.maxNativeZoom || MAX_ZOOM,\n    pluginAttribution: false\n  });\n}\n\nfunction refreshBasemapFilter(step) {\n  const mapEl = $("map");\n  if (step.muted) {\n    mapEl.classList.add("basemap-muted");\n  } else {\n    mapEl.classList.remove("basemap-muted");\n  }\n}\n\nfunction setBaseLayer(step) {\n  const key = `${state.base}:${step.layer}:${step.format}`;\n\n  refreshBasemapFilter(step);\n\n  if (state.currentStepKey === key && state.baseLayer) {\n    updateScalePill();\n    return;\n  }\n\n  state.currentStepKey = key;\n\n  if (state.baseLayer) {\n    map.removeLayer(state.baseLayer);\n  }\n\n  state.baseLayer = makeSwissLayer(step);\n  state.baseLayer.addTo(map);\n  state.baseLayer.bringToBack();\n\n  updateScalePill();\n}\n\nfunction refreshBaseLayer() {\n  if (state.base === "satellite") {\n    setBaseLayer(SATELLITE_STEP);\n  } else {\n    setBaseLayer(stepForZoom(roundedZoom()));\n  }\n}\n\nfunction toggleBase() {\n  state.base = state.base === "carto" ? "satellite" : "carto";\n  $("btn-basemap").textContent = state.base === "carto" ? "Satellite" : "Carte";\n  state.currentStepKey = "";\n  refreshBaseLayer();\n}\n\nfunction updateScalePill(count = null, unit = "segments") {\n  const zoom = roundedZoom();\n  const step = state.base === "satellite" ? SATELLITE_STEP : stepForZoom(zoom);\n  const extra = count === null ? "" : ` · ${count} ${unit}`;\n  showScale(`${step.label} · z${zoom}${extra}`);\n}\n\nfunction invalidateMapSoon() {\n  map.invalidateSize({ pan: false });\n  window.setTimeout(() => map.invalidateSize({ pan: false }), 260);\n}\n\nfunction openPanel() {\n  document.body.classList.add("side-panel-open");\n  $("side-panel").classList.add("is-open");\n  invalidateMapSoon();\n}\n\nfunction closePanel() {\n  document.body.classList.remove("side-panel-open");\n  $("side-panel").classList.remove("is-open");\n  invalidateMapSoon();\n}\n\nfunction openContext() {\n  // Ancien panneau contextuel supprimé : les détails courts passent par des popups Leaflet.\n}\n\nfunction closeContext() {\n  map.closePopup();\n}\n\nfunction openList() {\n  $("panel-kicker").textContent = "Vue alternative";\n  $("panel-title").textContent = "Liste des bisses";\n  $("panel-content").innerHTML = state.listHtml || `<p class="muted">Aucun bisse chargé.</p>`;\n  bindListButtons();\n  openPanel();\n}\n\nfunction closeList() {\n  closePanel();\n}\n\nfunction cataloguePath(item) {\n  return item.catalogue || `data/bisses/${item.id}/catalogue.json`;\n}\n\nfunction segmentsPath(item) {\n  return item.segments || `data/bisses/${item.id}/segments.geojson`;\n}\n\nasync function loadBisse(item) {\n  if (state.cache.has(item.id)) return state.cache.get(item.id);\n\n  const [catalogue, geojson] = await Promise.all([\n    loadJson(cataloguePath(item)),\n    loadJson(segmentsPath(item))\n  ]);\n\n  const data = { item, catalogue, geojson };\n  state.cache.set(item.id, data);\n  return data;\n}\n\nfunction normalizeStructureType(value) {\n  const raw = String(value || "")\n    .trim()\n    .toLowerCase()\n    .normalize("NFD")\n    .replace(/[\\u0300-\\u036f]/g, "")\n    .replaceAll("-", "_")\n    .replaceAll(" ", "_");\n\n  if (["open", "ciel_ouvert", "a_ciel_ouvert", "à_ciel_ouvert"].includes(raw)) return "open";\n  if (["canalized", "canalise", "canalise_couvert", "canalized_covered"].includes(raw)) return "canalized";\n  if (["abandoned", "abandonne", "abandoned_dry"].includes(raw)) return "abandoned";\n  if (["mixed", "mixte"].includes(raw)) return "mixed";\n  if (["unknown", "non_classe", "non_classee"].includes(raw)) return "unknown";\n\n  return raw || "unknown";\n}\n\nfunction isBicolorFeature(feature) {\n  return String(feature?.properties?.display_mode || "").toLowerCase() === "bicolor";\n}\n\nfunction normalizedStructureTypes(feature) {\n  const p = feature.properties || {};\n  const arr = Array.isArray(p.structure_types) && p.structure_types.length\n    ? p.structure_types\n    : [p.structure_type];\n\n  return arr.map(normalizeStructureType).filter(Boolean);\n}\n\nfunction selectedPhotos(catalogue) {\n  return (catalogue.photos || [])\n    .filter((p) => p.filename_web)\n    .sort((a, b) => Number(a.platform_order || 999999) - Number(b.platform_order || 999999));\n}\n\nfunction categories(catalogue) {\n  const result = {};\n\n  for (const cat of catalogue.segment_categories || []) {\n    const id = normalizeStructureType(cat.id);\n    result[id] = {\n      ...cat,\n      id,\n      name: cat.name || cat.label || FALLBACK_CATEGORIES[id]?.name || id,\n      color: cat.color || FALLBACK_CATEGORIES[id]?.color || "#777777"\n    };\n  }\n\n  return result;\n}\n\nfunction categoryForType(type, cats) {\n  const norm = normalizeStructureType(type);\n  return cats[norm] || FALLBACK_CATEGORIES[norm] || { id: norm, name: norm, color: "#777777" };\n}\n\nfunction categoryFor(feature, cats) {\n  const type = normalizeStructureType(feature?.properties?.structure_type);\n  return categoryForType(type, cats);\n}\n\nfunction bicolorColors(feature, cats) {\n  const p = feature.properties || {};\n  const explicit = Array.isArray(p.bicolor_colors) ? p.bicolor_colors.filter(Boolean) : [];\n\n  if (explicit.length >= 2) {\n    return [explicit[0], explicit[1]];\n  }\n\n  const types = normalizedStructureTypes(feature);\n  const c1 = categoryForType(types[0], cats).color || "#777777";\n  const c2 = categoryForType(types[1], cats).color || "#333333";\n  return [c1, c2];\n}\n\nfunction segmentDisplayName(feature, cats) {\n  if (isBicolorFeature(feature)) {\n    const names = normalizedStructureTypes(feature)\n      .map((t) => categoryForType(t, cats).name)\n      .filter(Boolean);\n    return names.length ? names.join(" + ") : "Segment mixte";\n  }\n\n  return categoryFor(feature, cats).name || "Segment";\n}\n\nfunction featureCoords(feature) {\n  const g = feature.geometry || {};\n  if (g.type === "LineString") return g.coordinates || [];\n  if (g.type === "MultiLineString") return (g.coordinates || []).flat();\n  return [];\n}\n\nfunction latlngPartsFromGeometry(geometry) {\n  if (!geometry) return [];\n\n  if (geometry.type === "LineString") {\n    return [(geometry.coordinates || []).map((c) => [c[1], c[0]])];\n  }\n\n  if (geometry.type === "MultiLineString") {\n    return (geometry.coordinates || []).map((line) => line.map((c) => [c[1], c[0]]));\n  }\n\n  return [];\n}\n\nfunction approximateLineLength(coords) {\n  let length = 0;\n\n  for (let i = 1; i < coords.length; i += 1) {\n    const a = coords[i - 1];\n    const b = coords[i];\n    if (!Array.isArray(a) || !Array.isArray(b) || a.length < 2 || b.length < 2) continue;\n\n    const latMean = ((a[1] + b[1]) / 2) * Math.PI / 180;\n    const dx = (b[0] - a[0]) * Math.cos(latMean);\n    const dy = b[1] - a[1];\n    length += Math.sqrt((dx * dx) + (dy * dy));\n  }\n\n  return length;\n}\n\nfunction approximateFeatureLength(feature) {\n  const g = feature.geometry || {};\n  if (g.type === "LineString") return approximateLineLength(g.coordinates || []);\n  if (g.type === "MultiLineString") {\n    return (g.coordinates || []).reduce((sum, line) => sum + approximateLineLength(line), 0);\n  }\n  return 0;\n}\n\nfunction dominantCategoryForData(data) {\n  const cats = categories(data.catalogue);\n  const totals = { open: 0, canalized: 0, abandoned: 0, mixed: 0, unknown: 0 };\n\n  for (const feature of data.geojson.features || []) {\n    const len = approximateFeatureLength(feature) || 1;\n\n    if (isBicolorFeature(feature)) {\n      const types = normalizedStructureTypes(feature);\n      if (!types.length) {\n        totals.mixed += len;\n      } else {\n        const share = len / types.length;\n        for (const type of types) {\n          const norm = normalizeStructureType(type);\n          totals[norm] = (totals[norm] || 0) + share;\n        }\n      }\n    } else {\n      const type = normalizeStructureType(feature?.properties?.structure_type);\n      totals[type] = (totals[type] || 0) + len;\n    }\n  }\n\n  const priority = ["open", "canalized", "abandoned", "mixed", "unknown"];\n  let bestType = "unknown";\n  let bestValue = -1;\n\n  for (const type of priority) {\n    const value = totals[type] || 0;\n    if (value > bestValue) {\n      bestType = type;\n      bestValue = value;\n    }\n  }\n\n  return categoryForType(bestType, cats);\n}\n\nfunction geoBounds(geojson) {\n  const b = L.latLngBounds();\n\n  for (const feature of geojson.features || []) {\n    for (const c of featureCoords(feature)) {\n      if (Array.isArray(c) && c.length >= 2) {\n        b.extend([c[1], c[0]]);\n      }\n    }\n  }\n\n  return b;\n}\n\nfunction boundsWithPhotos(bounds, photos) {\n  for (const p of photos || []) {\n    if (isNum(p.lat) && isNum(p.lon)) {\n      bounds.extend([p.lat, p.lon]);\n    }\n  }\n\n  return bounds;\n}\n\nfunction mappablePhotos(catalogue) {\n  return selectedPhotos(catalogue).filter((p) => isNum(p.lat) && isNum(p.lon));\n}\n\nfunction interpolateLinePoint(coords, fraction = 0.5) {\n  if (!coords.length) return null;\n  if (coords.length === 1) return L.latLng(coords[0][1], coords[0][0]);\n\n  const total = approximateLineLength(coords);\n  if (!total) {\n    const first = coords[0];\n    return L.latLng(first[1], first[0]);\n  }\n\n  const target = total * fraction;\n  let passed = 0;\n\n  for (let i = 1; i < coords.length; i += 1) {\n    const a = coords[i - 1];\n    const b = coords[i];\n    const length = approximateLineLength([a, b]);\n\n    if (!length) continue;\n\n    if (passed + length >= target) {\n      const ratio = (target - passed) / length;\n      const lon = a[0] + ((b[0] - a[0]) * ratio);\n      const lat = a[1] + ((b[1] - a[1]) * ratio);\n      return L.latLng(lat, lon);\n    }\n\n    passed += length;\n  }\n\n  const last = coords[coords.length - 1];\n  return L.latLng(last[1], last[0]);\n}\n\nfunction representativePointForBisse(geojson) {\n  let bestLine = null;\n  let bestLength = -1;\n\n  for (const feature of geojson.features || []) {\n    const geometry = feature.geometry || {};\n    const lines = geometry.type === "LineString"\n      ? [geometry.coordinates || []]\n      : (geometry.type === "MultiLineString" ? (geometry.coordinates || []) : []);\n\n    for (const line of lines) {\n      const length = approximateLineLength(line);\n      if (length > bestLength) {\n        bestLength = length;\n        bestLine = line;\n      }\n    }\n  }\n\n  const point = bestLine ? interpolateLinePoint(bestLine, 0.52) : null;\n  if (point) return point;\n\n  const b = geoBounds(geojson);\n  return b.isValid() ? b.getCenter() : null;\n}\n\nfunction bisseActionChipPoint(geojson) {\n  const b = geoBounds(geojson);\n  if (b.isValid()) {\n    const size = map.getSize();\n    const nw = map.latLngToContainerPoint(b.getNorthWest());\n    const ne = map.latLngToContainerPoint(b.getNorthEast());\n\n    const x = Math.max(52, Math.min(size.x - 52, (nw.x + ne.x) / 2));\n    const y = Math.max(76, Math.min(size.y - 80, nw.y - 6));\n\n    return map.containerPointToLatLng(L.point(x, y));\n  }\n\n  return representativePointForBisse(geojson);\n}\n\nfunction selectedBisseTitle(data) {\n  const info = data.catalogue.bisse_info || {};\n  return info.title || data.item.title || "Bisse";\n}\n\nfunction removeBisseActionChip() {\n  if (state.bisseActionMarker) {\n    map.removeLayer(state.bisseActionMarker);\n    state.bisseActionMarker = null;\n  }\n}\n\nfunction bisseActionChipHtml(data) {\n  const title = selectedBisseTitle(data);\n  const count = mappablePhotos(data.catalogue).length;\n  const photoButton = count ? `\n    <button class="bisse-action-button ${state.photoMarkersVisible ? "is-active" : ""}" type="button" data-action="toggle-photos">\n      ${state.photoMarkersVisible ? "Masquer photos" : `Photos · ${count}`}\n    </button>\n  ` : "";\n\n  return `\n    <div class="bisse-action-chip">\n      <span class="bisse-action-title">${escapeHtml(title)}</span>\n      ${photoButton}\n    </div>\n  `;\n}\n\nfunction bindBisseActionChipEvents() {\n  if (!state.bisseActionMarker) return;\n\n  const el = state.bisseActionMarker.getElement();\n  if (!el) return;\n\n  L.DomEvent.disableClickPropagation(el);\n  L.DomEvent.disableScrollPropagation(el);\n\n  const button = el.querySelector(\'[data-action="toggle-photos"]\');\n  if (!button) return;\n\n  button.addEventListener("click", (event) => {\n    event.preventDefault();\n    event.stopPropagation();\n    clearLeafletFocus();\n    toggleSelectedPhotos();\n  });\n}\n\nfunction showBisseActionChip(data) {\n  removeBisseActionChip();\n\n  const point = bisseActionChipPoint(data.geojson);\n  if (!point) return;\n\n  state.bisseActionMarker = L.marker(point, {\n    interactive: true,\n    keyboard: false,\n    zIndexOffset: 1200,\n    icon: L.divIcon({\n      className: "",\n      html: bisseActionChipHtml(data),\n      iconSize: [1, 1],\n      iconAnchor: [0, 0]\n    })\n  }).addTo(map);\n\n  window.setTimeout(bindBisseActionChipEvents, 0);\n}\n\nfunction refreshBisseActionChip() {\n  if (state.selectedData) {\n    showBisseActionChip(state.selectedData);\n  }\n}\n\nfunction setSelectedPhotosVisible(visible) {\n  if (!state.selectedData) return;\n\n  state.photoMarkersVisible = Boolean(visible) && roundedZoom() >= SHOW_SYNTHETIC_TRACES_AT_ZOOM;\n  state.photoLayer.clearLayers();\n  map.closePopup();\n\n  if (state.photoMarkersVisible) {\n    renderPhotos(state.selectedData);\n  }\n\n  refreshBisseActionChip();\n}\n\nfunction toggleSelectedPhotos() {\n  setSelectedPhotosVisible(!state.photoMarkersVisible);\n}\n\nfunction clearSelectedBisseMapControls() {\n  state.selectedData = null;\n  state.photoMarkersVisible = false;\n  state.photoLayer.clearLayers();\n  removeBisseActionChip();\n}\n\nfunction fitBisseData(data) {\n  const b = boundsWithPhotos(geoBounds(data.geojson), selectedPhotos(data.catalogue));\n  if (!b.isValid()) return;\n\n  map.invalidateSize({ pan: false });\n  map.fitBounds(b, {\n    paddingTopLeft: [80, 90],\n    paddingBottomRight: [80, 90],\n    maxZoom: MAX_ZOOM\n  });\n}\n\nfunction fitBisseDataAfterPanel(data) {\n  // Le panneau droit redimensionne la zone de carte avec une transition CSS.\n  // On attend donc la fin du mouvement avant de cadrer le bisse entier.\n  window.setTimeout(() => fitBisseData(data), 300);\n  window.setTimeout(() => fitBisseData(data), 560);\n}\n\nfunction refreshMarkerVisibility() {\n  const tracesMode = roundedZoom() >= SHOW_SYNTHETIC_TRACES_AT_ZOOM;\n  const mapEl = $("map");\n\n  if (tracesMode) {\n    mapEl.classList.add("segments-mode");\n    if (map.hasLayer(state.bisseMarkers)) {\n      map.removeLayer(state.bisseMarkers);\n    }\n  } else {\n    mapEl.classList.remove("segments-mode");\n    if (state.photoMarkersVisible) {\n      state.photoMarkersVisible = false;\n      state.photoLayer.clearLayers();\n      refreshBisseActionChip();\n    } else {\n      state.photoLayer.clearLayers();\n    }\n    if (!map.hasLayer(state.bisseMarkers)) {\n      state.bisseMarkers.addTo(map);\n    }\n  }\n\n  refreshLegendVisibility();\n}\n\nfunction removeVisibleSegments() {\n  if (state.segmentOutlineLayer) {\n    map.removeLayer(state.segmentOutlineLayer);\n    state.segmentOutlineLayer = null;\n  }\n\n  if (state.segmentColorLayer) {\n    map.removeLayer(state.segmentColorLayer);\n    state.segmentColorLayer = null;\n  }\n}\n\nfunction buildSyntheticFeatureCollection(dataList) {\n  const features = [];\n\n  for (const data of dataList) {\n    const dominant = dominantCategoryForData(data);\n    const info = data.catalogue.bisse_info || {};\n    const bisseTitle = info.title || data.item.title || "Bisse";\n\n    for (const feature of data.geojson.features || []) {\n      const cloned = JSON.parse(JSON.stringify(feature));\n      cloned.properties = cloned.properties || {};\n      cloned.properties.__display_mode = "synthetic";\n      cloned.properties.__bisse_id = data.item.id;\n      cloned.properties.__bisse_title = bisseTitle;\n      cloned.properties.__category_name = dominant.name || "Tracé synthétique";\n      cloned.properties.__category_color = dominant.color || "#1e88e5";\n      features.push(cloned);\n    }\n  }\n\n  return { type: "FeatureCollection", features };\n}\n\nfunction buildDetailedFeatureCollection(dataList) {\n  const features = [];\n\n  for (const data of dataList) {\n    const cats = categories(data.catalogue);\n    const dominant = dominantCategoryForData(data);\n    const info = data.catalogue.bisse_info || {};\n    const bisseTitle = info.title || data.item.title || "Bisse";\n\n    for (const feature of data.geojson.features || []) {\n      const cloned = JSON.parse(JSON.stringify(feature));\n      cloned.properties = cloned.properties || {};\n      cloned.properties.structure_type = normalizeStructureType(cloned.properties.structure_type);\n      cloned.properties.__bisse_id = data.item.id;\n      cloned.properties.__bisse_title = bisseTitle;\n      cloned.properties.__category_name = segmentDisplayName(cloned, cats);\n\n      if (isBicolorFeature(cloned)) {\n        const bstyle = bicolorStyleForZoom();\n\n        if (bstyle.mode === "split") {\n          cloned.properties.__display_mode = "bicolor";\n          cloned.properties.__bicolor_colors = bicolorColors(cloned, cats);\n        } else {\n          cloned.properties.__display_mode = "single";\n          cloned.properties.__category_color = BICOLOR_SIMPLIFIED_COLOR;\n        }\n      } else {\n        const cat = categoryFor(cloned, cats);\n        cloned.properties.__display_mode = "single";\n        cloned.properties.__category_color = cat.color;\n      }\n\n      features.push(cloned);\n    }\n  }\n\n  return { type: "FeatureCollection", features };\n}\n\nfunction coordinateKey(coord) {\n  if (!Array.isArray(coord) || coord.length < 2) return "";\n  return `${Number(coord[0]).toFixed(7)}:${Number(coord[1]).toFixed(7)}`;\n}\n\nfunction displayStyleForFeature(feature) {\n  const properties = feature.properties || {};\n  const name = properties.__category_name || "Segment";\n\n  if (properties.__display_mode === "bicolor") {\n    const colors = Array.isArray(properties.__bicolor_colors)\n      ? properties.__bicolor_colors.slice(0, 2)\n      : ["#ef6c00", "#111111"];\n\n    return {\n      key: `bicolor:${colors.join("|")}:${name}`,\n      mode: "bicolor",\n      colors,\n      color: null,\n      name,\n      protected: true\n    };\n  }\n\n  const color = properties.__category_color || "#777777";\n  return {\n    key: `single:${color}:${name}`,\n    mode: "single",\n    colors: null,\n    color,\n    name,\n    protected: false\n  };\n}\n\nfunction applyDisplayStyle(properties, style) {\n  properties.__display_mode = style.mode;\n  properties.__category_name = style.name;\n\n  if (style.mode === "bicolor") {\n    properties.__bicolor_colors = style.colors.slice();\n    delete properties.__category_color;\n  } else {\n    properties.__category_color = style.color;\n    delete properties.__bicolor_colors;\n  }\n}\n\nfunction displayRecordOrder(feature, featureIndex, partIndex) {\n  const raw = Number(feature?.properties?.order);\n  const order = Number.isFinite(raw) ? raw : featureIndex;\n  return (order * 1000) + partIndex;\n}\n\nfunction makeDisplayPartRecord(feature, coordinates, featureIndex, partIndex) {\n  if (!Array.isArray(coordinates) || coordinates.length < 2) return null;\n\n  const clonedCoordinates = coordinates.map((coord) => coord.slice());\n  const properties = { ...(feature.properties || {}) };\n\n  return {\n    feature,\n    properties,\n    coordinates: clonedCoordinates,\n    startKey: coordinateKey(clonedCoordinates[0]),\n    endKey: coordinateKey(clonedCoordinates[clonedCoordinates.length - 1]),\n    style: displayStyleForFeature(feature),\n    order: displayRecordOrder(feature, featureIndex, partIndex),\n    sourceCount: 1,\n    generalized: false\n  };\n}\n\nfunction displayPartRecords(featureCollection) {\n  const byBisse = new Map();\n\n  (featureCollection.features || []).forEach((feature, featureIndex) => {\n    const geometry = feature.geometry || {};\n    const parts = geometry.type === "LineString"\n      ? [geometry.coordinates || []]\n      : (geometry.type === "MultiLineString" ? (geometry.coordinates || []) : []);\n    const bisseId = feature.properties?.__bisse_id || `__feature_${featureIndex}`;\n\n    if (!byBisse.has(bisseId)) byBisse.set(bisseId, []);\n\n    parts.forEach((coordinates, partIndex) => {\n      const record = makeDisplayPartRecord(feature, coordinates, featureIndex, partIndex);\n      if (record) byBisse.get(bisseId).push(record);\n    });\n  });\n\n  for (const records of byBisse.values()) {\n    records.sort((a, b) => a.order - b.order);\n  }\n\n  return byBisse;\n}\n\nfunction reverseDisplayRecord(record) {\n  const coordinates = record.coordinates.slice().reverse();\n  return {\n    ...record,\n    coordinates,\n    startKey: coordinateKey(coordinates[0]),\n    endKey: coordinateKey(coordinates[coordinates.length - 1])\n  };\n}\n\nfunction buildConnectedDisplayChains(featureCollection) {\n  const chains = [];\n  const byBisse = displayPartRecords(featureCollection);\n\n  for (const [bisseId, sourceRecords] of byBisse.entries()) {\n    const remaining = sourceRecords.slice();\n\n    while (remaining.length) {\n      const chain = [remaining.shift()];\n      let changed = true;\n\n      while (changed) {\n        changed = false;\n        const chainStart = chain[0].startKey;\n        const chainEnd = chain[chain.length - 1].endKey;\n\n        for (let index = 0; index < remaining.length; index += 1) {\n          const candidate = remaining[index];\n\n          if (chainEnd === candidate.startKey) {\n            chain.push(candidate);\n          } else if (chainEnd === candidate.endKey) {\n            chain.push(reverseDisplayRecord(candidate));\n          } else if (chainStart === candidate.endKey) {\n            chain.unshift(candidate);\n          } else if (chainStart === candidate.startKey) {\n            chain.unshift(reverseDisplayRecord(candidate));\n          } else {\n            continue;\n          }\n\n          remaining.splice(index, 1);\n          changed = true;\n          break;\n        }\n      }\n\n      chains.push({ bisseId, records: chain });\n    }\n  }\n\n  return chains;\n}\n\nfunction mergeRunCoordinates(left, right) {\n  if (coordinateKey(left[left.length - 1]) === coordinateKey(right[0])) {\n    return left.concat(right.slice(1));\n  }\n  return left.concat(right);\n}\n\nfunction mergeTwoDisplayRuns(left, right) {\n  return {\n    ...left,\n    coordinates: mergeRunCoordinates(left.coordinates, right.coordinates),\n    sourceCount: left.sourceCount + right.sourceCount,\n    generalized: left.generalized || right.generalized\n  };\n}\n\nfunction mergeAdjacentDisplayRuns(runs) {\n  const merged = [];\n\n  for (const run of runs) {\n    const previous = merged[merged.length - 1];\n\n    if (previous && previous.style.key === run.style.key) {\n      merged[merged.length - 1] = mergeTwoDisplayRuns(previous, run);\n    } else {\n      merged.push({\n        ...run,\n        coordinates: run.coordinates.map((coord) => coord.slice()),\n        style: { ...run.style, colors: run.style.colors ? run.style.colors.slice() : null }\n      });\n    }\n  }\n\n  return merged;\n}\n\nfunction buildDisplayColorRuns(records) {\n  const runs = records.map((record) => ({\n    properties: { ...record.properties },\n    coordinates: record.coordinates.map((coord) => coord.slice()),\n    style: { ...record.style, colors: record.style.colors ? record.style.colors.slice() : null },\n    sourceCount: record.sourceCount,\n    generalized: record.generalized\n  }));\n\n  return mergeAdjacentDisplayRuns(runs);\n}\n\nfunction snapAdjacentDisplayRunBoundaries(runs) {\n  for (let index = 0; index < runs.length - 1; index += 1) {\n    const leftCoordinates = runs[index].coordinates || [];\n    const rightCoordinates = runs[index + 1].coordinates || [];\n    if (!leftCoordinates.length || !rightCoordinates.length) continue;\n\n    const leftEnd = leftCoordinates[leftCoordinates.length - 1];\n    const rightStart = rightCoordinates[0];\n    if (coordinateKey(leftEnd) !== coordinateKey(rightStart)) continue;\n\n    // Les chaînes tolèrent volontairement de minuscules différences de\n    // coordonnées (clé arrondie à 7 décimales). À très fort zoom, ces écarts\n    // suffisent toutefois à décentrer les deux caps de plusieurs pixels.\n    // Le rendu utilise donc leur milieu exact, sans modifier le GeoJSON source.\n    const shared = leftEnd.slice();\n    shared[0] = (Number(leftEnd[0]) + Number(rightStart[0])) / 2;\n    shared[1] = (Number(leftEnd[1]) + Number(rightStart[1])) / 2;\n\n    if (leftEnd.length > 2 && rightStart.length > 2) {\n      const leftElevation = Number(leftEnd[2]);\n      const rightElevation = Number(rightStart[2]);\n      if (Number.isFinite(leftElevation) && Number.isFinite(rightElevation)) {\n        shared[2] = (leftElevation + rightElevation) / 2;\n      }\n    }\n\n    leftCoordinates[leftCoordinates.length - 1] = shared.slice();\n    rightCoordinates[0] = shared.slice();\n  }\n\n  return runs;\n}\n\nfunction displayRunPixelLength(run) {\n  let length = 0;\n  const coordinates = run.coordinates || [];\n\n  for (let index = 1; index < coordinates.length; index += 1) {\n    const a = coordinates[index - 1];\n    const b = coordinates[index];\n    const pointA = map.latLngToLayerPoint([a[1], a[0]]);\n    const pointB = map.latLngToLayerPoint([b[1], b[0]]);\n    length += pointA.distanceTo(pointB);\n  }\n\n  return length;\n}\n\nfunction availableGeneralizationNeighbor(runs, index) {\n  if (index < 0 || index >= runs.length) return null;\n  return runs[index].style.protected ? null : runs[index];\n}\n\nfunction generalizationThreshold(runs, index) {\n  const run = runs[index];\n  if (!run || run.style.protected) return 0;\n\n  const left = availableGeneralizationNeighbor(runs, index - 1);\n  const right = availableGeneralizationNeighbor(runs, index + 1);\n  if (!left && !right) return 0;\n\n  if (left && right && left.style.key === right.style.key) {\n    return SAME_NEIGHBORS_MAX_PX;\n  }\n\n  return DIFFERENT_NEIGHBORS_MAX_PX;\n}\n\nfunction generalizationTargetIndex(runs, index) {\n  const left = availableGeneralizationNeighbor(runs, index - 1);\n  const right = availableGeneralizationNeighbor(runs, index + 1);\n\n  if (left && right && left.style.key === right.style.key) return index - 1;\n  if (left && !right) return index - 1;\n  if (!left && right) return index + 1;\n  if (!left && !right) return -1;\n\n  const leftLength = displayRunPixelLength(left);\n  const rightLength = displayRunPixelLength(right);\n  return leftLength >= rightLength ? index - 1 : index + 1;\n}\n\nfunction copyRunDisplayStyle(run, target) {\n  return {\n    ...run,\n    style: {\n      ...target.style,\n      colors: target.style.colors ? target.style.colors.slice() : null\n    },\n    generalized: true\n  };\n}\n\nfunction generalizeDisplayRuns(sourceRuns, zoom) {\n  let runs = mergeAdjacentDisplayRuns(sourceRuns);\n\n  if (!ENABLE_SEGMENT_GENERALIZATION || zoom >= SHOW_EXACT_SEGMENT_DETAIL_AT_ZOOM) {\n    return runs;\n  }\n\n  let guard = 0;\n\n  while (guard < 1000) {\n    guard += 1;\n    let candidateIndex = -1;\n    let candidateRatio = Number.POSITIVE_INFINITY;\n\n    for (let index = 0; index < runs.length; index += 1) {\n      const threshold = generalizationThreshold(runs, index);\n      if (!threshold) continue;\n\n      const length = displayRunPixelLength(runs[index]);\n      if (length > threshold) continue;\n\n      const ratio = length / threshold;\n      if (ratio < candidateRatio) {\n        candidateRatio = ratio;\n        candidateIndex = index;\n      }\n    }\n\n    if (candidateIndex < 0) break;\n\n    const targetIndex = generalizationTargetIndex(runs, candidateIndex);\n    if (targetIndex < 0) break;\n\n    runs[candidateIndex] = copyRunDisplayStyle(runs[candidateIndex], runs[targetIndex]);\n    runs = mergeAdjacentDisplayRuns(runs);\n  }\n\n  return runs;\n}\n\nfunction displayRunFeature(run, chainId, runIndex) {\n  const properties = {\n    ...run.properties,\n    __display_chain_id: chainId,\n    __display_run_index: runIndex,\n    __source_feature_count: run.sourceCount,\n    __generalized: Boolean(run.generalized)\n  };\n\n  applyDisplayStyle(properties, run.style);\n\n  return {\n    type: "Feature",\n    properties,\n    geometry: {\n      type: "LineString",\n      coordinates: run.coordinates.map((coord) => coord.slice())\n    }\n  };\n}\n\nfunction buildGeneralizedDisplayFeatureCollection(featureCollection, allowAbsorption) {\n  const features = [];\n  const zoom = allowAbsorption ? roundedZoom() : SHOW_EXACT_SEGMENT_DETAIL_AT_ZOOM;\n  const chains = buildConnectedDisplayChains(featureCollection);\n\n  chains.forEach((chain, chainIndex) => {\n    const chainId = `${chain.bisseId}:${chainIndex}`;\n    const colorRuns = buildDisplayColorRuns(chain.records);\n    const displayRuns = snapAdjacentDisplayRunBoundaries(\n      generalizeDisplayRuns(colorRuns, zoom)\n    );\n\n    displayRuns.forEach((run, runIndex) => {\n      features.push(displayRunFeature(run, chainId, runIndex));\n    });\n  });\n\n  return { type: "FeatureCollection", features };\n}\n\nfunction pointVector(from, to) {\n  return { x: to.x - from.x, y: to.y - from.y };\n}\n\nfunction vectorLength(vector) {\n  return Math.hypot(vector.x, vector.y);\n}\n\nfunction normalizedVector(vector) {\n  const length = vectorLength(vector);\n  if (length < 1e-6) return null;\n  return { x: vector.x / length, y: vector.y / length };\n}\n\nfunction sampledPointAwayFromEndpoint(latlngs, fromStart, targetDistance) {\n  if (!Array.isArray(latlngs) || latlngs.length < 2) return null;\n\n  let index = fromStart ? 0 : latlngs.length - 1;\n  const step = fromStart ? 1 : -1;\n  let current = map.latLngToLayerPoint(latlngs[index]);\n  let remaining = targetDistance;\n\n  while (index + step >= 0 && index + step < latlngs.length) {\n    const next = map.latLngToLayerPoint(latlngs[index + step]);\n    const segment = pointVector(current, next);\n    const length = vectorLength(segment);\n\n    if (length >= 1e-6) {\n      if (length >= remaining) {\n        const ratio = remaining / length;\n        return L.point(\n          current.x + (segment.x * ratio),\n          current.y + (segment.y * ratio)\n        );\n      }\n      remaining -= length;\n    }\n\n    index += step;\n    current = next;\n  }\n\n  return current;\n}\n\nfunction sharedTransitionTangent(leftLatLngs, rightLatLngs) {\n  if (leftLatLngs.length < 2 || rightLatLngs.length < 2) return null;\n\n  const boundary = map.latLngToLayerPoint(leftLatLngs[leftLatLngs.length - 1]);\n  const before = sampledPointAwayFromEndpoint(\n    leftLatLngs,\n    false,\n    TRANSITION_TANGENT_SAMPLE_PX\n  );\n  const after = sampledPointAwayFromEndpoint(\n    rightLatLngs,\n    true,\n    TRANSITION_TANGENT_SAMPLE_PX\n  );\n  if (!before || !after) return null;\n\n  const incoming = normalizedVector(pointVector(before, boundary));\n  const outgoing = normalizedVector(pointVector(boundary, after));\n  if (!incoming && !outgoing) return null;\n  if (!incoming) return outgoing;\n  if (!outgoing) return incoming;\n\n  // La bisse change de direction au point de transition : la somme des deux\n  // directions donne la tangente de la bisse au niveau de l\'angle (bissectrice).\n  const bisector = normalizedVector({\n    x: incoming.x + outgoing.x,\n    y: incoming.y + outgoing.y\n  });\n\n  // Repli sûr pour un demi-tour presque parfait, où la bissectrice est indéfinie.\n  return bisector || incoming;\n}\n\nfunction buildTransitionPatchRecords(featureCollection) {\n  const byChain = new Map();\n  const records = [];\n\n  for (const feature of featureCollection.features || []) {\n    const geometry = feature.geometry || {};\n    const coordinates = geometry.type === "LineString" ? (geometry.coordinates || []) : [];\n    if (coordinates.length < 2) continue;\n\n    const latlngs = coordinates.map((coord) => L.latLng(coord[1], coord[0]));\n    const record = {\n      feature,\n      latlngs,\n      startKey: coordinateKey(coordinates[0]),\n      endKey: coordinateKey(coordinates[coordinates.length - 1])\n    };\n\n    const chainId = feature.properties.__display_chain_id\n      || `${feature.properties.__bisse_id || "bisse"}:${byChain.size}`;\n    if (!byChain.has(chainId)) byChain.set(chainId, []);\n    byChain.get(chainId).push(record);\n  }\n\n  for (const chainRecords of byChain.values()) {\n    chainRecords.sort((a, b) => (\n      Number(a.feature.properties.__display_run_index || 0)\n      - Number(b.feature.properties.__display_run_index || 0)\n    ));\n\n    for (let index = 0; index < chainRecords.length - 1; index += 1) {\n      const previous = chainRecords[index];\n      const next = chainRecords[index + 1];\n      if (previous.endKey !== next.startKey) continue;\n\n      const tangent = sharedTransitionTangent(previous.latlngs, next.latlngs);\n      if (!tangent) continue;\n\n      records.push({\n        center: map.latLngToLayerPoint(previous.latlngs[previous.latlngs.length - 1]),\n        tangent,\n        previousFeature: previous.feature,\n        nextFeature: next.feature\n      });\n    }\n  }\n\n  return records;\n}\n\nfunction bindSegmentInteraction(layer, feature) {\n  const title = feature.properties.__bisse_title || "Bisse";\n  const baseType = feature.properties.__category_name || "Segment";\n  const type = feature.properties.__generalized\n    ? `${baseType} (vue simplifiée)`\n    : baseType;\n\n  layer.bindTooltip(`${escapeHtml(title)} — ${escapeHtml(type)}`, {\n    className: "segment-tooltip",\n    sticky: true\n  });\n\n  // Clic sur n’importe quelle trace visible = même action qu’une pastille :\n  // ouvrir la fiche du bisse dans le panneau droit et recadrer le bisse entier.\n  layer.on("click", () => {\n    clearLeafletFocus();\n\n    const id = feature.properties.__bisse_id;\n    if (id) {\n      map.closePopup();\n      selectBisse(id, { fit: true });\n    }\n  });\n}\n\nfunction addHaloForPart(layerGroup, latlngs, style) {\n  if (!latlngs.length) return;\n\n  L.polyline(latlngs, {\n    pane: "segmentOutlinePane",\n    color: "#ffffff",\n    weight: style.outlineWeight,\n    opacity: style.opacity,\n    lineCap: SEGMENT_LINE_CAP,\n    lineJoin: "round",\n    interactive: false\n  }).addTo(layerGroup);\n}\n\nfunction addClickTarget(layerGroup, latlngs, feature, style) {\n  if (!latlngs.length) return;\n\n  const target = L.polyline(latlngs, {\n    pane: "segmentHitPane",\n    color: "#000000",\n    weight: style.clickWeight,\n    opacity: 0,\n    lineCap: HIT_LINE_CAP,\n    lineJoin: "round",\n    interactive: true\n  }).addTo(layerGroup);\n\n  bindSegmentInteraction(target, feature);\n}\n\nfunction continuousHaloCoordinateParts(features) {\n  const parts = [];\n  let current = [];\n\n  const ordered = features.slice().sort((a, b) => (\n    Number(a.properties.__display_run_index || 0) - Number(b.properties.__display_run_index || 0)\n  ));\n\n  for (const feature of ordered) {\n    const geometry = feature.geometry || {};\n    const geometryParts = geometry.type === "LineString"\n      ? [geometry.coordinates || []]\n      : (geometry.type === "MultiLineString" ? (geometry.coordinates || []) : []);\n\n    for (const coordinates of geometryParts) {\n      if (!coordinates.length) continue;\n\n      if (!current.length) {\n        current = coordinates.map((coord) => coord.slice());\n        continue;\n      }\n\n      const currentEnd = coordinateKey(current[current.length - 1]);\n      const partStart = coordinateKey(coordinates[0]);\n      const partEnd = coordinateKey(coordinates[coordinates.length - 1]);\n\n      if (currentEnd === partStart) {\n        current = current.concat(coordinates.slice(1).map((coord) => coord.slice()));\n      } else if (currentEnd === partEnd) {\n        current = current.concat(coordinates.slice().reverse().slice(1).map((coord) => coord.slice()));\n      } else {\n        parts.push(current);\n        current = coordinates.map((coord) => coord.slice());\n      }\n    }\n  }\n\n  if (current.length) parts.push(current);\n  return parts;\n}\n\nfunction addContinuousSegmentHalos(outlineGroup, featureCollection) {\n  const byChain = new Map();\n\n  for (const feature of featureCollection.features || []) {\n    const chainId = feature.properties.__display_chain_id\n      || `${feature.properties.__bisse_id || "bisse"}:${byChain.size}`;\n    if (!byChain.has(chainId)) byChain.set(chainId, []);\n    byChain.get(chainId).push(feature);\n  }\n\n  for (const features of byChain.values()) {\n    const baseStyle = segmentStyleForZoom();\n    const hasBicolor = features.some((feature) => feature.properties.__display_mode === "bicolor");\n    const style = hasBicolor\n      ? { ...baseStyle, outlineWeight: Math.max(baseStyle.outlineWeight, bicolorStyleForZoom().outlineWeight) }\n      : baseStyle;\n\n    for (const coordinates of continuousHaloCoordinateParts(features)) {\n      const latlngs = coordinates.map((coord) => [coord[1], coord[0]]);\n      addHaloForPart(outlineGroup, latlngs, style);\n    }\n  }\n}\n\nfunction addSingleSegment(layerGroup, feature) {\n  const parts = latlngPartsFromGeometry(feature.geometry);\n  const style = segmentStyleForZoom();\n  const color = feature.properties.__category_color || "#777777";\n\n  for (const latlngs of parts) {\n    const line = L.polyline(latlngs, {\n      pane: "segmentColorPane",\n      color,\n      weight: style.colorWeight,\n      opacity: style.opacity,\n      lineCap: SEGMENT_LINE_CAP,\n      lineJoin: "round",\n      interactive: true\n    }).addTo(layerGroup);\n\n    bindSegmentInteraction(line, feature);\n    addClickTarget(layerGroup, latlngs, feature, style);\n  }\n}\n\nfunction addBicolorSegment(layerGroup, feature) {\n  const parts = latlngPartsFromGeometry(feature.geometry);\n  const style = bicolorStyleForZoom();\n  const colors = Array.isArray(feature.properties.__bicolor_colors)\n    ? feature.properties.__bicolor_colors\n    : ["#ef6c00", "#111111"];\n\n  const colorA = colors[0] || "#ef6c00";\n  const colorB = colors[1] || "#111111";\n\n  for (const latlngs of parts) {\n    const left = L.polyline(latlngs, {\n      pane: "segmentColorPane",\n      color: colorA,\n      weight: style.flankWeight,\n      opacity: style.opacity,\n      lineCap: SEGMENT_LINE_CAP,\n      lineJoin: "round",\n      offset: -style.offset,\n      interactive: true\n    }).addTo(layerGroup);\n\n    const right = L.polyline(latlngs, {\n      pane: "segmentColorPane",\n      color: colorB,\n      weight: style.flankWeight,\n      opacity: style.opacity,\n      lineCap: SEGMENT_LINE_CAP,\n      lineJoin: "round",\n      offset: style.offset,\n      interactive: true\n    }).addTo(layerGroup);\n\n    bindSegmentInteraction(left, feature);\n    bindSegmentInteraction(right, feature);\n    addClickTarget(layerGroup, latlngs, feature, style);\n  }\n}\n\nfunction circlePolygon(radius) {\n  const points = [];\n  for (let index = 0; index < TRANSITION_PATCH_ARC_STEPS; index += 1) {\n    const angle = (index / TRANSITION_PATCH_ARC_STEPS) * Math.PI * 2;\n    points.push({ x: Math.cos(angle) * radius, y: Math.sin(angle) * radius });\n  }\n  return points;\n}\n\nfunction clipPolygonOnAxis(points, axis, limit, keepLess) {\n  if (!points.length) return [];\n  const clipped = [];\n\n  function signedDistance(point) {\n    return keepLess ? point[axis] - limit : limit - point[axis];\n  }\n\n  for (let index = 0; index < points.length; index += 1) {\n    const current = points[index];\n    const previous = points[(index + points.length - 1) % points.length];\n    const currentDistance = signedDistance(current);\n    const previousDistance = signedDistance(previous);\n    const currentInside = currentDistance <= 0;\n    const previousInside = previousDistance <= 0;\n\n    if (currentInside !== previousInside) {\n      const ratio = previousDistance / (previousDistance - currentDistance);\n      clipped.push({\n        x: previous.x + ((current.x - previous.x) * ratio),\n        y: previous.y + ((current.y - previous.y) * ratio)\n      });\n    }\n\n    if (currentInside) clipped.push(current);\n  }\n\n  return clipped;\n}\n\nfunction patchStyleForFeature(feature) {\n  if (feature.properties.__display_mode === "bicolor") {\n    const colors = Array.isArray(feature.properties.__bicolor_colors)\n      ? feature.properties.__bicolor_colors.slice(0, 2)\n      : ["#ef6c00", "#111111"];\n    return {\n      mode: "bicolor",\n      colors: [colors[0] || "#ef6c00", colors[1] || "#111111"]\n    };\n  }\n\n  return {\n    mode: "single",\n    colors: [feature.properties.__category_color || "#777777"]\n  };\n}\n\nfunction transitionPatchRadius(record) {\n  const baseStyle = segmentStyleForZoom();\n  const hasBicolor = (\n    record.previousFeature.properties.__display_mode === "bicolor"\n    || record.nextFeature.properties.__display_mode === "bicolor"\n  );\n  if (!hasBicolor) {\n    return (baseStyle.colorWeight / 2) + TRANSITION_PATCH_OVERSCAN_PX;\n  }\n\n  const splitStyle = bicolorStyleForZoom();\n  return Math.max(\n    baseStyle.colorWeight / 2,\n    (splitStyle.flankWeight / 2) + splitStyle.offset\n  ) + TRANSITION_PATCH_OVERSCAN_PX;\n}\n\nfunction localPatchPointToLatLng(record, point) {\n  const normal = { x: -record.tangent.y, y: record.tangent.x };\n  return map.layerPointToLatLng(L.point(\n    record.center.x + (record.tangent.x * point.x) + (normal.x * point.y),\n    record.center.y + (record.tangent.y * point.x) + (normal.y * point.y)\n  ));\n}\n\nfunction addTransitionPatchPolygon(layerGroup, record, localPoints, color, opacity) {\n  if (localPoints.length < 3) return;\n  L.polygon(localPoints.map((point) => localPatchPointToLatLng(record, point)), {\n    pane: "segmentColorPane",\n    stroke: false,\n    fill: true,\n    fillColor: color,\n    fillOpacity: opacity,\n    interactive: false,\n    smoothFactor: 0\n  }).addTo(layerGroup);\n}\n\nfunction addStyledTransitionHalf(layerGroup, record, localPoints, feature, opacity) {\n  const style = patchStyleForFeature(feature);\n\n  if (style.mode === "single") {\n    addTransitionPatchPolygon(layerGroup, record, localPoints, style.colors[0], opacity);\n    return;\n  }\n\n  // PolylineOffset place l\'offset négatif du côté -normale : on reproduit\n  // donc exactement la répartition longitudinale des deux couleurs.\n  const colorAHalf = clipPolygonOnAxis(\n    localPoints,\n    "y",\n    TRANSITION_PATCH_OVERLAP_PX,\n    true\n  );\n  const colorBHalf = clipPolygonOnAxis(\n    localPoints,\n    "y",\n    -TRANSITION_PATCH_OVERLAP_PX,\n    false\n  );\n  addTransitionPatchPolygon(layerGroup, record, colorAHalf, style.colors[0], opacity);\n  addTransitionPatchPolygon(layerGroup, record, colorBHalf, style.colors[1], opacity);\n}\n\nfunction addStraightTransitionPatch(layerGroup, record) {\n  const baseStyle = segmentStyleForZoom();\n  const radius = transitionPatchRadius(record);\n  const disc = circlePolygon(radius);\n\n  // Efface d\'abord les caps colorés superposés avec la même base blanche que\n  // le halo ; les couleurs semi-opaques gardent ainsi exactement leur teinte.\n  // Le disque blanc et les deux demi-disques utilisent le même polygone :\n  // aucune couture ne peut apparaître sur leur bord extérieur.\n  addTransitionPatchPolygon(layerGroup, record, disc, "#ffffff", 1);\n\n  const previousHalf = clipPolygonOnAxis(\n    disc,\n    "x",\n    TRANSITION_PATCH_OVERLAP_PX,\n    true\n  );\n  const nextHalf = clipPolygonOnAxis(\n    disc,\n    "x",\n    -TRANSITION_PATCH_OVERLAP_PX,\n    false\n  );\n\n  addStyledTransitionHalf(\n    layerGroup,\n    record,\n    previousHalf,\n    record.previousFeature,\n    baseStyle.opacity\n  );\n  addStyledTransitionHalf(\n    layerGroup,\n    record,\n    nextHalf,\n    record.nextFeature,\n    baseStyle.opacity\n  );\n}\n\nfunction drawVisibleSegments(featureCollection) {\n  const outlineGroup = L.layerGroup();\n  const colorGroup = L.layerGroup();\n  const transitions = buildTransitionPatchRecords(featureCollection);\n\n  addContinuousSegmentHalos(outlineGroup, featureCollection);\n\n  for (const feature of featureCollection.features || []) {\n    if (feature.properties.__display_mode === "bicolor") {\n      addBicolorSegment(colorGroup, feature);\n    } else {\n      addSingleSegment(colorGroup, feature);\n    }\n  }\n\n  for (const transition of transitions) {\n    addStraightTransitionPatch(colorGroup, transition);\n  }\n\n  state.segmentOutlineLayer = outlineGroup.addTo(map);\n  state.segmentColorLayer = colorGroup.addTo(map);\n}\n\nasync function refreshVisibleSegments() {\n  refreshMarkerVisibility();\n\n  const token = state.segmentRefreshToken + 1;\n  state.segmentRefreshToken = token;\n\n  const mode = segmentRenderMode();\n  const style = segmentStyleForZoom();\n  const bstyle = bicolorStyleForZoom();\n  const zoom = roundedZoom();\n  const key = `${mode}:${style.key}:${bstyle.mode}:${zoom}:${ENABLE_SEGMENT_GENERALIZATION}:${state.index.length}:${state.cache.size}`;\n\n  if (mode === "markers") {\n    state.currentSegmentsKey = key;\n    state.currentVisibleSegmentCount = 0;\n    removeVisibleSegments();\n    updateScalePill(0);\n    return;\n  }\n\n  if (state.currentSegmentsKey === key && state.segmentColorLayer) {\n    updateScalePill(state.currentVisibleSegmentCount, mode === "synthetic" ? "tracés" : "segments");\n    return;\n  }\n\n  state.currentSegmentsKey = key;\n  removeVisibleSegments();\n\n  const dataList = [];\n\n  for (const item of state.index) {\n    try {\n      dataList.push(await loadBisse(item));\n    } catch (error) {\n      console.warn("Bisse non chargé pour la vue segments", item, error);\n    }\n\n    if (token !== state.segmentRefreshToken) {\n      return;\n    }\n  }\n\n  if (token !== state.segmentRefreshToken || segmentRenderMode() !== mode) {\n    return;\n  }\n\n  const sourceGeojson = mode === "synthetic"\n    ? buildSyntheticFeatureCollection(dataList)\n    : buildDetailedFeatureCollection(dataList);\n\n  const visibleGeojson = buildGeneralizedDisplayFeatureCollection(\n    sourceGeojson,\n    mode === "detailed"\n  );\n\n  if (token !== state.segmentRefreshToken || segmentRenderMode() !== mode) {\n    return;\n  }\n\n  drawVisibleSegments(visibleGeojson);\n  state.currentVisibleSegmentCount = visibleGeojson.features.length;\n\n  const unit = mode === "synthetic" ? "tracés" : "segments";\n  updateScalePill(visibleGeojson.features.length, unit);\n}\n\nfunction markerIcon() {\n  return L.divIcon({\n    className: "",\n    html: `<div class="bisse-marker"></div>`,\n    iconSize: [30, 30],\n    iconAnchor: [15, 15]\n  });\n}\n\nfunction photoIcon() {\n  return L.divIcon({\n    className: "",\n    html: `<div class="photo-marker"></div>`,\n    iconSize: [18, 18],\n    iconAnchor: [9, 9]\n  });\n}\n\nfunction photoPopupWidth() {\n  const viewportWidth = typeof window === "undefined" ? 1200 : window.innerWidth;\n  return Math.max(240, Math.min(320, viewportWidth - 76));\n}\n\nfunction photoPopupOptions() {\n  const width = photoPopupWidth();\n\n  return {\n    minWidth: width,\n    maxWidth: width,\n    autoPan: true,\n    closeButton: true,\n    className: "photo-leaflet-popup"\n  };\n}\n\nfunction photoPopupContent(photo) {\n  return `\n    <div class="map-popup photo-popup">\n      ${photo.filename_web ? `\n        <div class="photo-popup-media">\n          <img src="${escapeHtml(photo.filename_web)}" alt="">\n        </div>\n      ` : ""}\n      <h3>${escapeHtml(photo.title || "Photo")}</h3>\n      ${photo.description ? `<p class="popup-muted">${escapeHtml(photo.description)}</p>` : ""}\n    </div>\n  `;\n}\n\nfunction bindListButtons() {\n  document.querySelectorAll(".bisse-button").forEach((btn) => {\n    btn.addEventListener("click", () => {\n      selectBisse(btn.dataset.id);\n    });\n  });\n}\n\nfunction renderList() {\n  state.listHtml = state.index.map((item) => `\n    <button class="bisse-button" type="button" data-id="${escapeHtml(item.id)}">\n      <strong>${escapeHtml(item.title || item.id)}</strong>\n      <span>${escapeHtml([item.region, item.commune].filter(Boolean).join(" · "))}</span>\n    </button>\n  `).join("");\n}\n\nasync function renderMarkers() {\n  state.bisseMarkers.clearLayers();\n\n  for (const item of state.index) {\n    try {\n      const data = await loadBisse(item);\n      const b = geoBounds(data.geojson);\n      const center = item.center && item.center.length >= 2\n        ? L.latLng(item.center[0], item.center[1])\n        : (b.isValid() ? b.getCenter() : L.latLng(VALAIS_CENTER));\n\n      const marker = L.marker(center, {\n        icon: markerIcon(),\n        title: item.title || item.id\n      });\n\n      marker.bindTooltip(escapeHtml(item.title || item.id), {\n        className: "bisse-tooltip",\n        direction: "top",\n        offset: [0, -10]\n      });\n\n      marker.on("click", () => {\n        clearLeafletFocus();\n        selectBisse(item.id);\n      });\n      marker.addTo(state.bisseMarkers);\n    } catch (error) {\n      console.warn("Bisse non chargé", item, error);\n    }\n  }\n\n  refreshMarkerVisibility();\n}\n\nfunction clearSelectedPhotosAndLegend() {\n  state.photoLayer.clearLayers();\n  refreshLegendVisibility();\n}\n\nfunction shouldShowCategoryInLegend(cat) {\n  const id = normalizeStructureType(cat.id || cat.name || cat.label);\n  const label = String(cat.name || cat.label || cat.id || "")\n    .trim()\n    .toLowerCase()\n    .normalize("NFD")\n    .replace(/[\\u0300-\\u036f]/g, "");\n\n  if (id === "unknown") return false;\n  if (label.includes("non classe")) return false;\n  if (label.includes("non class")) return false;\n\n  return true;\n}\n\nfunction collectLegendCategories() {\n  const byId = new Map();\n\n  for (const data of state.cache.values()) {\n    for (const cat of data.catalogue.segment_categories || []) {\n      const id = normalizeStructureType(cat.id || cat.name || cat.label);\n      if (!id || !shouldShowCategoryInLegend(cat)) continue;\n\n      byId.set(id, {\n        id,\n        name: cat.name || cat.label || FALLBACK_CATEGORIES[id]?.name || id,\n        color: cat.color || FALLBACK_CATEGORIES[id]?.color || "#777777"\n      });\n    }\n  }\n\n  // Fallback stable si certains catalogues ne sont pas encore chargés.\n  for (const id of ["open", "canalized", "abandoned"]) {\n    if (!byId.has(id)) {\n      byId.set(id, FALLBACK_CATEGORIES[id]);\n    }\n  }\n\n  const preferredOrder = ["open", "canalized", "abandoned"];\n  const ordered = preferredOrder\n    .map((id) => byId.get(id))\n    .filter(Boolean);\n\n  const extras = [...byId.values()]\n    .filter((cat) => !preferredOrder.includes(cat.id))\n    .sort((a, b) => String(a.name).localeCompare(String(b.name), "fr"));\n\n  return [...ordered, ...extras];\n}\n\nfunction refreshLegend() {\n  const cats = collectLegendCategories();\n\n  state.legendHtml = cats.map((cat) => `\n    <span class="legend-item">\n      <span class="legend-swatch" style="background:${escapeHtml(cat.color || "#777")}"></span>\n      ${escapeHtml(cat.name || cat.label || cat.id)}\n    </span>\n  `).join("");\n\n  $("legend").innerHTML = state.legendHtml;\n  refreshLegendVisibility();\n}\n\nfunction refreshLegendVisibility() {\n  const legend = $("legend");\n  const showLegend = roundedZoom() >= SHOW_SYNTHETIC_TRACES_AT_ZOOM && Boolean(state.legendHtml);\n\n  legend.classList.toggle("is-hidden", !showLegend);\n}\n\nfunction renderPhotos(data) {\n  const photos = selectedPhotos(data.catalogue);\n  state.photoLayer.clearLayers();\n\n  for (const photo of photos) {\n    if (!isNum(photo.lat) || !isNum(photo.lon)) continue;\n\n    const marker = L.marker([photo.lat, photo.lon], {\n      pane: "photoPane",\n      icon: photoIcon(),\n      title: photo.title || "Photo"\n    });\n\n    marker.bindTooltip(escapeHtml(photo.title || "Photo"), {\n      className: "bisse-tooltip",\n      direction: "top",\n      offset: [0, -8]\n    });\n\n    marker.bindPopup(photoPopupContent(photo), photoPopupOptions());\n\n    marker.on("click", () => {\n      clearLeafletFocus();\n    });\n\n    marker.addTo(state.photoLayer);\n  }\n}\n\nfunction boolLabel(value) {\n  if (value === true) return "oui";\n  if (value === false) return "non";\n  return "—";\n}\n\nfunction distanceLabel(value) {\n  return isNum(value) ? `${String(value).replace(".", ",")} km` : "—";\n}\n\nfunction altitudeLabel(min, max) {\n  if (isNum(min) && isNum(max)) return `${min}–${max} m`;\n  if (isNum(min)) return `${min} m`;\n  if (isNum(max)) return `${max} m`;\n  return "—";\n}\n\nfunction renderPanel(data) {\n  const info = data.catalogue.bisse_info || {};\n  const photos = selectedPhotos(data.catalogue);\n\n  $("panel-kicker").textContent = "Fiche bisse";\n  $("panel-title").textContent = info.title || data.item.title || "Bisse";\n\n  $("panel-content").innerHTML = `\n    <p class="lead">${escapeHtml(info.description || "Aucune description pour le moment.")}</p>\n\n    ${info.itinerary ? `\n      <div class="context-row">\n        <strong>Itinéraire</strong>\n        <span>${escapeHtml(info.itinerary)}</span>\n      </div>\n    ` : ""}\n\n    <dl class="fact-grid">\n      <div class="fact"><dt>Région</dt><dd>${escapeHtml(info.region || "—")}</dd></div>\n      <div class="fact"><dt>Commune</dt><dd>${escapeHtml(info.commune || "—")}</dd></div>\n      <div class="fact"><dt>Longueur</dt><dd>${escapeHtml(distanceLabel(info.length_km))}</dd></div>\n      <div class="fact"><dt>Altitude</dt><dd>${escapeHtml(altitudeLabel(info.altitude_min_m, info.altitude_max_m))}</dd></div>\n      <div class="fact"><dt>Cotation</dt><dd>${escapeHtml(info.difficulty || "—")}</dd></div>\n      <div class="fact"><dt>Sentier balisé</dt><dd>${escapeHtml(boolLabel(info.marked_trail))}</dd></div>\n      <div class="fact"><dt>État</dt><dd>${escapeHtml(info.state || "—")}</dd></div>\n    </dl>\n\n    ${(info.tags || []).length ? `\n      <div class="tags">\n        ${info.tags.map((tag) => `<span class="tag">${escapeHtml(tag)}</span>`).join("")}\n      </div>\n    ` : ""}\n\n    ${photos.length ? `\n      <h3 style="margin-top:18px;">Photos choisies</h3>\n      <div class="gallery">\n        ${photos.map((photo, i) => `\n          <button class="photo-card" type="button" data-photo="${i}">\n            <img src="${escapeHtml(photo.filename_web)}" alt="">\n            <div>\n              <strong>${escapeHtml(photo.title || "Photo")}</strong>\n              <span>${escapeHtml(photo.description || "")}</span>\n            </div>\n          </button>\n        `).join("")}\n      </div>\n    ` : `<p class="muted">Aucune photo choisie pour la plateforme.</p>`}\n  `;\n\n  document.querySelectorAll(".photo-card").forEach((btn) => {\n    btn.addEventListener("click", () => {\n      clearLeafletFocus();\n\n      const photo = photos[Number(btn.dataset.photo)];\n      if (!photo) return;\n\n      if (isNum(photo.lat) && isNum(photo.lon)) {\n        map.flyTo(\n          [photo.lat, photo.lon],\n          Math.min(MAX_ZOOM, Math.max(map.getZoom(), 23)),\n          { duration: 0.45 }\n        );\n      }\n\n      if (isNum(photo.lat) && isNum(photo.lon)) {\n        L.popup(photoPopupOptions())\n          .setLatLng([photo.lat, photo.lon])\n          .setContent(photoPopupContent(photo))\n          .openOn(map);\n      }\n    });\n  });\n\n  openPanel();\n}\n\nasync function selectBisse(id, options = {}) {\n  const item = state.index.find((x) => x.id === id);\n  if (!item) return;\n\n  state.selectedId = id;\n  state.selectedData = null;\n  state.photoMarkersVisible = false;\n  clearSelectedPhotosAndLegend();\n  removeBisseActionChip();\n  showStatus("Chargement du bisse…");\n\n  try {\n    const data = await loadBisse(item);\n    state.selectedData = data;\n    renderPanel(data);\n    refreshLegend();\n    state.photoLayer.clearLayers();\n    showBisseActionChip(data);\n\n    if (options.showPhotos === true) {\n      setSelectedPhotosVisible(true);\n    }\n\n    if (options.fit !== false) {\n      fitBisseDataAfterPanel(data);\n    }\n\n    hideStatus();\n    refreshVisibleSegments();\n  } catch (error) {\n    $("panel-title").textContent = "Erreur";\n    $("panel-content").innerHTML = `\n      <div class="error-box">\n        <strong>Chargement impossible</strong><br>\n        ${escapeHtml(error.message)}\n      </div>\n    `;\n    openPanel();\n    showStatus("Erreur de chargement");\n  }\n}\n\nfunction resetValais() {\n  state.selectedId = null;\n  clearSelectedBisseMapControls();\n  clearSelectedPhotosAndLegend();\n  closeContext();\n  closePanel();\n\n  map.setView(VALAIS_CENTER, VALAIS_ZOOM);\n  refreshVisibleSegments();\n}\n\nasync function init() {\n  try {\n    showStatus("Chargement des bisses…");\n\n    state.index = await loadJson("data/bisses_index.json");\n    renderList();\n    await renderMarkers();\n    refreshLegend();\n    resetValais();\n    await refreshVisibleSegments();\n\n    if (!state.index.length) {\n      $("panel-content").innerHTML = `\n        <div class="error-box">Aucun bisse trouvé dans data/bisses_index.json.</div>\n      `;\n      showStatus("Aucun bisse trouvé");\n    } else {\n      hideStatus();\n    }\n  } catch (error) {\n    $("panel-title").textContent = "Erreur";\n    $("panel-content").innerHTML = `\n      <div class="error-box">\n        <strong>Impossible d’initialiser la plateforme.</strong><br>\n        ${escapeHtml(error.message)}\n      </div>\n    `;\n    openPanel();\n    showStatus("Erreur d’initialisation");\n  }\n}\n\nmap.on("zoom", refreshMarkerVisibility);\n\nmap.on("zoomend", () => {\n  refreshBaseLayer();\n  refreshMarkerVisibility();\n  refreshVisibleSegments();\n});\n\n$("btn-basemap").addEventListener("click", toggleBase);\n$("btn-valais").addEventListener("click", resetValais);\n$("btn-list").addEventListener("click", openList);\n$("btn-close-panel").addEventListener("click", closePanel);\n\nmap.setView(VALAIS_CENTER, VALAIS_ZOOM);\nrefreshBaseLayer();\ninit();\n'
-
-BISSES_RENDER_README = "# Bisses\n\nPlateforme statique GitHub Pages pour l’inventaire cartographique des bisses du Valais.\n\nVersion générée par :\nbuild_bisses.py\nbisses-ui-clusters-2026-08-11-v6.3\n\nRendu des tronçons — coupes droites partagées :\n- halo blanc continu par chaîne connectée ;\n- regroupement des tronçons contigus de même style ;\n- absorption visuelle prudente des micro-plages selon leur longueur en pixels ;\n- tangente commune calculée à chaque transition, y compris dans les angles ;\n- coupes colorées droites, jointives et perpendiculaires à cette tangente ;\n- recalage visuel des extrémités quasi identiques sur un point commun ;\n- léger recouvrement sous-pixel pour supprimer les coutures d'anticrénelage ;\n- extrémités réelles du bisse conservées arrondies ;\n- détail original complet à partir de z25.\n\nGénérer le site :\npython build_bisses.py\n\nLe script génère :\n- index.html\n- .nojekyll\n- assets/css/styles.css\n- assets/js/app.js\n\nIl ne modifie pas :\n- data/\n- media/\n"
 
 
 class BisseManagerApp:
@@ -261,17 +190,6 @@ class BisseManagerApp:
         self.platform_selected_var = tk.BooleanVar(value=False)
         self.platform_order_var = tk.IntVar(value=0)
 
-        # v63 : le panneau Photos n'écrit plus rien lors d'une simple
-        # navigation. Les valeurs affichées sont comparées à cette référence
-        # mémoire avant toute sauvegarde.
-        self.photo_metadata_baseline = None
-        self.photo_metadata_save_in_progress = False
-
-        # Visionneuse v63 : le zoom logique peut toujours atteindre 800 %,
-        # mais seule la portion visible de l'image est redimensionnée.
-        self.viewer_render_after_id = None
-        self.viewer_render_margin_px = 320
-
         # Publication / export plateforme
         self.publication_tree = None
         self.publication_status_var = tk.StringVar(value="")
@@ -328,16 +246,14 @@ class BisseManagerApp:
         self.gpx_photo_mode_before_edit = None
         self.gpx_workshop_photos = []
         self.gpx_workshop_active = False
+        self.gpx_workshop_show_endpoints_var = tk.BooleanVar(value=True)
+        self.gpx_endpoint_toggle_button = None
+        self.gpx_endpoint_icon_cache = {}
         self.gpx_workshop_selected_source_id = None
         self.gpx_workshop_click_mode = None
         self.gpx_workshop_pending_segment_id = None
         self.gpx_workshop_undo_stack = []
         self.gpx_workshop_redo_stack = []
-
-        # v64 : ordonnanceur central des redessins Cartographie.
-        self.gpx_redraw_after_id = None
-        self.gpx_redraw_pending_reasons = set()
-        self.gpx_redraw_in_progress = False
 
         # v52b : micro-correction non destructive et création prudente d'un
         # segment par clics. Le même moteur de brouillon est partagé par les
@@ -348,6 +264,7 @@ class BisseManagerApp:
         self.gpx_geometry_edit_kind = None
         self.gpx_geometry_edit_segment_id = None
         self.gpx_geometry_create_anchor_segment_id = None
+        self.gpx_geometry_creation_phase = None
         self.gpx_geometry_creation_snap_count = 0
         self.gpx_geometry_edit_draft_parts = []
         self.gpx_geometry_edit_session_original_parts = []
@@ -361,6 +278,7 @@ class BisseManagerApp:
         self.gpx_geometry_edit_toolbar = None
         self.gpx_geometry_toolbar_title_var = tk.StringVar(value="✏️ Correction")
         self.gpx_geometry_tools_frame = None
+        self.gpx_geometry_orientation_frame = None
         self.gpx_geometry_save_button = None
         self.gpx_geometry_quit_button = None
         self.gpx_geometry_restore_button = None
@@ -526,21 +444,8 @@ class BisseManagerApp:
                 f"{self.local_environment.migration_error}"
             )
 
-        # Journal de crash persistant et fermeture propre.
-        self.install_crash_logging()
-        self.root.protocol(
-            "WM_DELETE_WINDOW",
-            self.close_application
-        )
-
         # La vérification reste asynchrone et ne retarde jamais l'ouverture.
-        self.root.after(
-            1800,
-            self.update_controller.maybe_check_automatically
-        )
-
-
-
+        self.root.after(1800, self.update_controller.maybe_check_automatically)
 
     def configure_main_window_geometry(self):
         """
@@ -666,251 +571,6 @@ class BisseManagerApp:
         self.log_text.config(state="disabled")
         self.root.update_idletasks()
 
-
-
-    # ============================================================
-    # V62 — OBSERVABILITÉ ET FERMETURE PROPRE
-    # ============================================================
-
-    def append_crash_report(
-        self,
-        exc_type,
-        exc_value,
-        tb,
-        context="exception"
-    ):
-        path = getattr(self, "crash_log_path", "")
-
-        if not path:
-            return
-
-        try:
-            os.makedirs(
-                os.path.dirname(path),
-                exist_ok=True
-            )
-
-            active_folder = getattr(
-                self,
-                "base_folder",
-                ""
-            )
-
-            with open(
-                path,
-                "a",
-                encoding="utf-8"
-            ) as handle:
-                handle.write("\n" + "=" * 78 + "\n")
-                handle.write(
-                    datetime.now().isoformat(timespec="seconds")
-                    + "\n"
-                )
-                handle.write(
-                    f"Abisses {APP_VERSION} · {context}\n"
-                )
-                handle.write(
-                    f"Python {sys.version.split()[0]}\n"
-                )
-                handle.write(
-                    f"Dossier actif : {active_folder or '—'}\n"
-                )
-                handle.write("-" * 78 + "\n")
-                traceback.print_exception(
-                    exc_type,
-                    exc_value,
-                    tb,
-                    file=handle
-                )
-                handle.flush()
-        except Exception:
-            pass
-
-    def handle_tk_callback_exception(
-        self,
-        exc_type,
-        exc_value,
-        tb
-    ):
-        self.append_crash_report(
-            exc_type,
-            exc_value,
-            tb,
-            context="callback Tkinter"
-        )
-
-        try:
-            self.log(
-                "❌ Erreur interne enregistrée dans le journal de crash : "
-                f"{exc_value}"
-            )
-        except Exception:
-            pass
-
-        try:
-            messagebox.showerror(
-                "Erreur interne",
-                (
-                    "Une erreur inattendue s'est produite.\n\n"
-                    "Elle a été enregistrée dans :\n"
-                    f"{self.crash_log_path}\n\n"
-                    f"Détail : {exc_value}"
-                )
-            )
-        except Exception:
-            pass
-
-    def install_crash_logging(self):
-        """
-        Installe trois filets :
-        - callbacks Tkinter ;
-        - exceptions Python non interceptées ;
-        - exceptions de threads ;
-        et active faulthandler pour les erreurs bas niveau.
-        """
-        self.crash_log_path = os.path.join(
-            os.path.dirname(self.local_log_path),
-            "abisses_crash.log"
-        )
-
-        self._previous_sys_excepthook = sys.excepthook
-        self._previous_threading_excepthook = getattr(
-            threading,
-            "excepthook",
-            None
-        )
-        self._faulthandler_stream = None
-
-        def main_excepthook(exc_type, exc_value, tb):
-            self.append_crash_report(
-                exc_type,
-                exc_value,
-                tb,
-                context="exception Python non interceptée"
-            )
-            previous = self._previous_sys_excepthook
-            if callable(previous):
-                previous(
-                    exc_type,
-                    exc_value,
-                    tb
-                )
-
-        def thread_excepthook(args):
-            self.append_crash_report(
-                args.exc_type,
-                args.exc_value,
-                args.exc_traceback,
-                context=(
-                    "thread "
-                    + str(
-                        getattr(
-                            args.thread,
-                            "name",
-                            "inconnu"
-                        )
-                    )
-                )
-            )
-
-            previous = self._previous_threading_excepthook
-            if callable(previous):
-                previous(args)
-
-        sys.excepthook = main_excepthook
-
-        if hasattr(threading, "excepthook"):
-            threading.excepthook = thread_excepthook
-
-        self.root.report_callback_exception = (
-            self.handle_tk_callback_exception
-        )
-
-        try:
-            os.makedirs(
-                os.path.dirname(self.crash_log_path),
-                exist_ok=True
-            )
-            self._faulthandler_stream = open(
-                self.crash_log_path,
-                "a",
-                encoding="utf-8"
-            )
-            faulthandler.enable(
-                file=self._faulthandler_stream,
-                all_threads=True
-            )
-        except Exception:
-            self._faulthandler_stream = None
-
-    def close_application(self):
-        """
-        Ferme les ressources temporaires.
-
-        v63 : si le panneau Photos contient une vraie modification, elle est
-        sauvegardée ; une simple consultation ne provoque aucune écriture.
-        """
-        try:
-            self.flush_current_photo_metadata_if_dirty()
-        except Exception:
-            pass
-        try:
-            self.stop_local_preview_server(
-                cleanup=True
-            )
-        except Exception:
-            pass
-
-        try:
-            if faulthandler.is_enabled():
-                faulthandler.disable()
-        except Exception:
-            pass
-
-        stream = getattr(
-            self,
-            "_faulthandler_stream",
-            None
-        )
-        if stream is not None:
-            try:
-                stream.close()
-            except Exception:
-                pass
-            self._faulthandler_stream = None
-
-        try:
-            previous = getattr(
-                self,
-                "_previous_sys_excepthook",
-                None
-            )
-            if callable(previous):
-                sys.excepthook = previous
-        except Exception:
-            pass
-
-        try:
-            previous = getattr(
-                self,
-                "_previous_threading_excepthook",
-                None
-            )
-            if (
-                previous is not None
-                and hasattr(threading, "excepthook")
-            ):
-                threading.excepthook = previous
-        except Exception:
-            pass
-
-        try:
-            self.root.destroy()
-        except Exception:
-            pass
-
-
-
     def clear_log(self):
         self.log_text.config(state="normal")
         self.log_text.delete("1.0", tk.END)
@@ -1004,16 +664,6 @@ class BisseManagerApp:
         self.show_text_tooltip(text, event.x_root, event.y_root)
 
     def clear_main_frame(self):
-        # v63 : une sortie de l'Atelier Photos n'entraîne une écriture que
-        # lorsqu'un champ a réellement été modifié.
-        try:
-            self.flush_current_photo_metadata_if_dirty()
-        except Exception as exc:
-            self.log(
-                "⚠️ Sauvegarde photo avant changement d'écran impossible : "
-                f"{exc}"
-            )
-
         if self.photo_workspace_layout_after_id:
             try:
                 self.root.after_cancel(self.photo_workspace_layout_after_id)
@@ -1029,7 +679,6 @@ class BisseManagerApp:
         self.stop_swisstopo_auto_watch("gpx")
         self.stop_photo_layer_watch("photo")
         self.stop_photo_layer_watch("gpx")
-        self.cancel_gpx_redraw_request()
 
         try:
             self.cancel_gpx_cut_mode(silent=True)
@@ -1072,18 +721,6 @@ class BisseManagerApp:
         self.gpx_map_holder = None
         self.gpx_photo_integrated_frame = None
         self.gpx_photo_integrated_canvas = None
-
-        # v63 : les marqueurs ont été détruits ; les PhotoImage peuvent donc
-        # être libérées sans risque d'effacer une icône encore visible.
-        self.photo_marker_icon_cache.clear()
-        self.photo_cluster_icon_cache.clear()
-        self.photo_discrete_icon_cache.clear()
-        self.photo_anchor_icon_cache.clear()
-
-        self.photo_metadata_baseline = None
-        self.viewer_render_after_id = None
-
-
 
     def make_scrollable_page(self, padx=0, pady=0, bind_mousewheel=True):
         """
@@ -1189,137 +826,23 @@ class BisseManagerApp:
         path = getattr(self, "local_settings_path", "")
         if not path:
             return
-
         try:
-            payload = copy.deepcopy(data) if isinstance(data, dict) else {}
-            payload["updated_at"] = datetime.now().isoformat(
-                timespec="seconds"
-            )
-            atomic_write_json_file(
-                path,
-                payload,
-                indent=2,
-                ensure_ascii=False
-            )
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            payload = data if isinstance(data, dict) else {}
+            payload["updated_at"] = datetime.now().isoformat(timespec="seconds")
+            temp_path = path + ".tmp"
+            with open(temp_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False)
+                f.write("\n")
+            os.replace(temp_path, path)
         except Exception as exc:
             try:
                 messagebox.showwarning(
                     "Paramètres locaux",
-                    "Impossible d'enregistrer settings.local.json :\n"
-                    f"{exc}"
+                    f"Impossible d'enregistrer settings.local.json :\n{exc}"
                 )
             except Exception:
                 pass
-
-
-
-
-    # ============================================================
-    # V61 — PUBLICATION LOCALE OPTIONNELLE
-    # ============================================================
-
-    def get_bisses_site_folder_setting(self):
-        """
-        Dossier local du site Bisses utilisé uniquement pour la publication.
-
-        Le réglage existe sur tous les postes mais peut rester vide.
-        La prévisualisation n'en dépend jamais.
-        """
-        settings = self.read_local_settings()
-        value = str(settings.get("bisses_site_folder") or "").strip()
-        if not value:
-            return ""
-        return os.path.abspath(os.path.expanduser(value))
-
-    def set_bisses_site_folder_setting(self, folder):
-        settings = self.read_local_settings()
-        value = str(folder or "").strip()
-        if value:
-            settings["bisses_site_folder"] = os.path.abspath(
-                os.path.expanduser(value)
-            )
-        else:
-            settings.pop("bisses_site_folder", None)
-        self.write_local_settings(settings)
-        return settings.get("bisses_site_folder", "")
-
-    def bisses_site_folder_looks_valid(self, folder):
-        if not folder or not os.path.isdir(folder):
-            return False
-        markers = (
-            os.path.join(folder, ".git"),
-            os.path.join(folder, "build_bisses.py"),
-            os.path.join(folder, "index.html"),
-            os.path.join(folder, "data"),
-            os.path.join(folder, "media"),
-        )
-        return any(os.path.exists(path) for path in markers)
-
-    def choose_bisses_site_folder_setting(self, parent=None):
-        """
-        Choix volontaire depuis Paramètres uniquement.
-        Aucun autre bouton du logiciel ne doit ouvrir ce sélecteur.
-        """
-        current = self.get_bisses_site_folder_setting()
-        initial = (
-            current
-            if current and os.path.isdir(current)
-            else os.path.expanduser("~")
-        )
-
-        folder = filedialog.askdirectory(
-            title="Choisir le dossier local du site Bisses",
-            initialdir=initial,
-            parent=parent
-        )
-        if not folder:
-            return ""
-
-        folder = os.path.abspath(folder)
-
-        if not self.bisses_site_folder_looks_valid(folder):
-            if not messagebox.askyesno(
-                "Dossier du site Bisses",
-                (
-                    "Ce dossier ne ressemble pas clairement au site Bisses "
-                    "(aucun dépôt, build_bisses.py, index.html, data/ ou media/ détecté).\n\n"
-                    "L'enregistrer quand même ?"
-                ),
-                parent=parent
-            ):
-                return ""
-
-        self.set_bisses_site_folder_setting(folder)
-        return folder
-
-    def clear_bisses_site_folder_setting(self):
-        self.set_bisses_site_folder_setting("")
-
-    def publication_is_configured_on_this_computer(self):
-        folder = self.get_bisses_site_folder_setting()
-        return bool(folder and os.path.isdir(folder))
-
-    def publication_not_configured_message(self):
-        messagebox.showinfo(
-            "Publication",
-            (
-                "Publication non configurée sur cet ordinateur.\n\n"
-                "La prévisualisation reste entièrement disponible.\n"
-                "Le dossier du site Bisses peut être renseigné dans Paramètres."
-            )
-        )
-
-    def open_publication_if_configured(self):
-        """
-        Même bouton sur tous les postes.
-        S'il n'y a pas de dossier de site configuré, aucune boîte de sélection
-        de dossier n'est ouverte et aucune donnée n'est modifiée.
-        """
-        if not self.publication_is_configured_on_this_computer():
-            self.publication_not_configured_message()
-            return
-        self.show_publication_module()
-
 
     def normalize_app_data_folder_choice(self, folder, create=False):
         """
@@ -1602,13 +1125,9 @@ class BisseManagerApp:
             return copy.deepcopy(default)
 
     def write_json_file_safe(self, path, data):
-        atomic_write_json_file(
-            path,
-            data,
-            indent=4,
-            ensure_ascii=False
-        )
-
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4, ensure_ascii=False)
 
     def normalize_json_for_compare(self, data):
         try:
@@ -1679,24 +1198,16 @@ class BisseManagerApp:
             self.catalog_container = previous_container
             self.catalog_data = previous_data
 
-    def write_catalog_container_to_path(
-        self,
-        catalog_path,
-        container,
-        folder=None,
-        update_timestamp=False
-    ):
+    def write_catalog_container_to_path(self, catalog_path, container, folder=None, update_timestamp=False):
         """
-        Écrit un catalogue vers un chemin arbitraire de manière atomique.
+        Écrit un catalogue vers un chemin arbitraire.
+        Utilisé pour synchroniser la copie Data et la copie locale.
         """
         if not catalog_path:
             return
+        os.makedirs(os.path.dirname(catalog_path), exist_ok=True)
 
-        data = (
-            copy.deepcopy(container)
-            if isinstance(container, dict)
-            else self.empty_catalog_container()
-        )
+        data = copy.deepcopy(container) if isinstance(container, dict) else self.empty_catalog_container()
         data.setdefault("catalogue_version", 3)
         data.setdefault("schema_version", "0.2-local")
         data.setdefault("project", {})
@@ -1707,34 +1218,18 @@ class BisseManagerApp:
             data["project"].setdefault("source_folder", "")
 
         if update_timestamp or not data["project"].get("updated_at"):
-            data["project"]["updated_at"] = datetime.now().isoformat(
-                timespec="seconds"
-            )
+            data["project"]["updated_at"] = datetime.now().isoformat(timespec="seconds")
 
-        info = data.setdefault(
-            "bisse_info",
-            self.default_bisse_info()
-        )
-        title = (
-            info.get("title")
-            or data["project"].get("title")
-            or data["project"].get("bisse_name")
-            or (os.path.basename(folder) if folder else "")
-        )
+        info = data.setdefault("bisse_info", self.default_bisse_info())
+        title = info.get("title") or data["project"].get("title") or data["project"].get("bisse_name") or (os.path.basename(folder) if folder else "")
         slug = info.get("slug") or self.slugify(title)
-
         info["title"] = title
         info["slug"] = slug
         data["project"]["bisse_name"] = title
         data["project"]["title"] = title
 
-        atomic_write_json_file(
-            catalog_path,
-            data,
-            indent=4,
-            ensure_ascii=False
-        )
-
+        with open(catalog_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4, ensure_ascii=False)
 
     def project_id_from_container_or_folder(self, folder=None, container=None):
         info = {}
@@ -3423,14 +2918,14 @@ class BisseManagerApp:
             "categories": normalized
         }
 
-        atomic_write_json_file(
-            self.segment_categories_file,
-            payload,
-            indent=4,
-            ensure_ascii=False
-        )
-        self.global_segment_categories = normalized
+        os.makedirs(os.path.dirname(self.segment_categories_file), exist_ok=True)
+        temp_path = self.segment_categories_file + ".tmp"
 
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=4, ensure_ascii=False)
+
+        os.replace(temp_path, self.segment_categories_file)
+        self.global_segment_categories = normalized
 
     def get_global_segment_category_by_id(self, category_id):
         for category in self.read_global_segment_categories():
@@ -3513,10 +3008,9 @@ class BisseManagerApp:
 
         if self.gpx_workshop_active:
             try:
-                self.request_gpx_redraw()
+                self.draw_gpx_workshop_map()
             except Exception:
                 pass
-
 
     def iter_known_catalogues_for_category_usage(self):
         """
@@ -3577,7 +3071,7 @@ class BisseManagerApp:
                     ids.extend(bicolor[:2])
 
                 # Une même catégorie ne compte qu'une fois par segment,
-                # même si elle est à la fois principale et présente dans le bicolore.
+                # même si elle est à la fois principale et côté A/B.
                 for category_id in dict.fromkeys(ids):
                     if not category_id:
                         continue
@@ -3689,69 +3183,6 @@ class BisseManagerApp:
             fg="#666666"
         ).pack(fill="x", pady=(16, 0))
 
-        publication_box = tk.LabelFrame(
-            info_tab,
-            text="Publication du site Bisses",
-            padx=10,
-            pady=9
-        )
-        publication_box.pack(fill="x", pady=(22, 0))
-
-        site_folder_var = tk.StringVar(
-            value=self.get_bisses_site_folder_setting()
-        )
-
-        tk.Label(
-            publication_box,
-            text=(
-                "Dossier local du site Bisses. Ce réglage est optionnel et "
-                "propre à cet ordinateur. Laissez-le vide sur un poste qui ne publie pas."
-            ),
-            justify="left",
-            anchor="w",
-            wraplength=800,
-            fg="#666666"
-        ).pack(fill="x", pady=(0, 7))
-
-        site_row = tk.Frame(publication_box)
-        site_row.pack(fill="x")
-        site_row.grid_columnconfigure(0, weight=1)
-
-        site_entry = tk.Entry(
-            site_row,
-            textvariable=site_folder_var,
-            state="readonly"
-        )
-        site_entry.grid(row=0, column=0, sticky="ew")
-
-        def choose_site_folder_from_settings():
-            chosen = self.choose_bisses_site_folder_setting(parent=window)
-            if chosen:
-                site_folder_var.set(chosen)
-
-        def clear_site_folder_from_settings():
-            if not site_folder_var.get():
-                return
-            if messagebox.askyesno(
-                "Publication du site Bisses",
-                "Effacer le dossier de publication configuré sur cet ordinateur ?",
-                parent=window
-            ):
-                self.clear_bisses_site_folder_setting()
-                site_folder_var.set("")
-
-        tk.Button(
-            site_row,
-            text="Choisir…",
-            command=choose_site_folder_from_settings
-        ).grid(row=0, column=1, padx=(7, 0))
-
-        tk.Button(
-            site_row,
-            text="Effacer",
-            command=clear_site_folder_from_settings
-        ).grid(row=0, column=2, padx=(7, 0))
-
         tk.Label(
             info_tab,
             text=(
@@ -3780,7 +3211,6 @@ class BisseManagerApp:
             window.destroy()
 
         window.protocol("WM_DELETE_WINDOW", close)
-
 
     def build_global_segment_categories_manager(self, parent):
         tk.Label(
@@ -4226,13 +3656,18 @@ class BisseManagerApp:
             return ""
 
     def category_cleanup_atomic_write_json(self, path, data):
-        atomic_write_json_file(
-            path,
-            data,
-            indent=4,
-            ensure_ascii=False
-        )
-
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        temp_path = f"{path}.category_migration_tmp_{uuid.uuid4().hex}"
+        try:
+            with open(temp_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=4, ensure_ascii=False)
+            os.replace(temp_path, path)
+        finally:
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
 
     def collect_category_cleanup_catalogues(self):
         """
@@ -5571,7 +5006,7 @@ class BisseManagerApp:
                     self.refresh_gpx_category_tree()
                     self.refresh_gpx_category_combo()
                     self.refresh_gpx_segment_tree()
-                    self.request_gpx_redraw()
+                    self.draw_gpx_workshop_map()
                 except Exception as exc:
                     self.log(
                         f"⚠️ Migration appliquée, mais rafraîchissement de l’atelier incomplet : {exc}"
@@ -5603,7 +5038,6 @@ class BisseManagerApp:
                     f"Dossier de diagnostic :\n{migration_root}"
                 )
             )
-
 
     def edit_selected_gpx_category(self):
         if not self.gpx_category_tree:
@@ -6663,113 +6097,54 @@ class BisseManagerApp:
         self.catalog_container = raw
         return raw
 
-    def save_catalog(self, interactive=True):
+    def save_catalog(self):
         if not isinstance(self.catalog_container, dict):
             self.catalog_container = self.empty_catalog_container()
 
-        self.ensure_safe_before_save(interactive=interactive)
+        self.ensure_safe_before_save(interactive=True)
 
-        self.catalog_container.setdefault(
-            "schema_version",
-            "0.2-local"
-        )
+        self.catalog_container.setdefault("schema_version", "0.2-local")
         self.catalog_container.setdefault("project", {})
-        self.catalog_container["project"]["bisse_name"] = (
-            os.path.basename(self.base_folder)
-            if self.base_folder
-            else ""
-        )
-        self.catalog_container["project"].setdefault(
-            "title",
-            self.catalog_container["project"].get("bisse_name", "")
-        )
-        self.catalog_container["project"].setdefault(
-            "year",
-            datetime.now().year
-        )
-        self.catalog_container["project"]["source_folder"] = (
-            self.base_folder or ""
-        )
-        self.catalog_container["project"]["updated_at"] = (
-            datetime.now().isoformat(timespec="seconds")
-        )
+        self.catalog_container["project"]["bisse_name"] = os.path.basename(self.base_folder) if self.base_folder else ""
+        self.catalog_container["project"].setdefault("title", self.catalog_container["project"].get("bisse_name", ""))
+        self.catalog_container["project"].setdefault("year", datetime.now().year)
+        self.catalog_container["project"]["source_folder"] = self.base_folder or ""
+        self.catalog_container["project"]["updated_at"] = datetime.now().isoformat(timespec="seconds")
 
-        self.catalog_container.setdefault(
-            "bisse_info",
-            self.default_bisse_info()
-        )
+        self.catalog_container.setdefault("bisse_info", self.default_bisse_info())
         self.catalog_container["bisse_info"].setdefault(
             "slug",
             self.slugify(
                 self.catalog_container["bisse_info"].get("title")
-                or self.catalog_container["project"].get(
-                    "bisse_name",
-                    ""
-                )
+                or self.catalog_container["project"].get("bisse_name", "")
             )
         )
         self.catalog_container["photos"] = self.catalog_data
 
         self.catalog_container.setdefault("gpx_traces", {})
-        self.catalog_container["gpx_traces"].setdefault(
-            "manual_segments",
-            []
-        )
-        self.catalog_container["gpx_traces"].setdefault(
-            "live_topo",
-            []
-        )
+        self.catalog_container["gpx_traces"].setdefault("manual_segments", [])
+        self.catalog_container["gpx_traces"].setdefault("live_topo", [])
 
-        self.catalog_container.setdefault(
-            "gpx_workshop",
-            self.empty_gpx_workshop()
-        )
-        self.catalog_container["gpx_workshop"].setdefault(
-            "categories",
-            self.default_gpx_categories()
-        )
-        self.catalog_container["gpx_workshop"].setdefault(
-            "sources",
-            []
-        )
-        self.catalog_container["gpx_workshop"].setdefault(
-            "segments",
-            []
-        )
-        self.catalog_container["gpx_workshop"].setdefault(
-            "last_export_at",
-            None
-        )
+        self.catalog_container.setdefault("gpx_workshop", self.empty_gpx_workshop())
+        self.catalog_container["gpx_workshop"].setdefault("categories", self.default_gpx_categories())
+        self.catalog_container["gpx_workshop"].setdefault("sources", [])
+        self.catalog_container["gpx_workshop"].setdefault("segments", [])
+        self.catalog_container["gpx_workshop"].setdefault("last_export_at", None)
 
         self.catalog_container.setdefault("external_resources", [])
-        self.catalog_container.setdefault(
-            "inventory_info",
-            self.empty_inventory_info()
-        )
-        self.catalog_container.setdefault(
-            "platform_export",
-            self.default_platform_export_state()
-        )
+        self.catalog_container.setdefault("inventory_info", self.empty_inventory_info())
+        self.catalog_container.setdefault("platform_export", self.default_platform_export_state())
 
-        # Le catalogue actif reste toujours le catalogue local du bisse.
+        # Mode sécurisé : écriture principale dans le dossier local actif.
         self.reset_active_catalog_paths_to_local()
-
-        atomic_write_json_file(
-            self.catalog_path,
-            self.catalog_container,
-            indent=4,
-            ensure_ascii=False
-        )
+        with open(self.catalog_path, "w", encoding="utf-8") as f:
+            json.dump(self.catalog_container, f, indent=4, ensure_ascii=False)
 
         # Copie portable dans Data, sans jamais réécrire le local depuis Data.
         try:
             self.write_portable_data_copy_for_active_project()
         except Exception as exc:
-            self.log(
-                f"⚠️ Copie Data portable impossible : {exc}"
-            )
-
-
+            self.log(f"⚠️ Copie Data portable impossible : {exc}")
 
     def read_catalog(self):
         container = self.read_catalog_container()
@@ -6789,1745 +6164,6 @@ class BisseManagerApp:
             self.log(f"💾 Catalogue vide créé pour le dossier : {self.catalog_path}")
 
         return self.catalog_container
-
-
-    def sanitize_new_bisse_folder_name(self, name):
-        """Produit un nom de dossier portable sans altérer le nom éditorial."""
-        text = unicodedata.normalize("NFC", str(name or "")).strip()
-        text = re.sub(r'[<>:"/\\|?*\x00-\x1f]', " ", text)
-        text = re.sub(r"\s+", " ", text).strip().rstrip(". ")
-        if not text:
-            return ""
-        reserved = {
-            "con", "prn", "aux", "nul",
-            *(f"com{i}" for i in range(1, 10)),
-            *(f"lpt{i}" for i in range(1, 10)),
-        }
-        if text.casefold() in reserved:
-            text += "_bisse"
-        return text
-
-    def collect_new_bisse_photo_files(self, source_folder):
-        """Inventorie récursivement JPG/JPEG/HEIC/HEIF sans toucher aux sources."""
-        if not source_folder:
-            return []
-        source_folder = os.path.abspath(os.path.expanduser(str(source_folder)))
-        if not os.path.isdir(source_folder):
-            return []
-        valid_ext = {".jpg", ".jpeg", ".heic", ".heif"}
-        files = []
-        for root, dirs, filenames in os.walk(source_folder):
-            dirs.sort(key=str.casefold)
-            for filename in sorted(filenames, key=str.casefold):
-                if os.path.splitext(filename)[1].casefold() not in valid_ext:
-                    continue
-                path = os.path.abspath(os.path.join(root, filename))
-                if os.path.isfile(path):
-                    files.append(path)
-        return files
-
-    def normalize_new_bisse_gpx_files(self, paths):
-        """Déduplique et valide une sélection de fichiers GPX."""
-        out = []
-        seen = set()
-        for raw_path in paths or []:
-            if not raw_path:
-                continue
-            path = os.path.abspath(os.path.expanduser(str(raw_path)))
-            key = os.path.normcase(path)
-            if key in seen:
-                continue
-            seen.add(key)
-            if os.path.isfile(path) and os.path.splitext(path)[1].casefold() == ".gpx":
-                out.append(path)
-        return out
-
-    def build_new_bisse_import_plan(
-        self,
-        name,
-        parent_folder,
-        photo_source_folder="",
-        live_gpx_files=None,
-        suissemobile_gpx_files=None,
-    ):
-        """
-        Construit le plan complet avant toute écriture.
-
-        Les photos sont aplaties dans Photos/ car les modules historiques
-        travaillent sur ce niveau. Une collision de nom est donc bloquante :
-        v59 ne renomme jamais silencieusement une source.
-        """
-        display_name = unicodedata.normalize("NFC", str(name or "")).strip()
-        folder_name = self.sanitize_new_bisse_folder_name(display_name)
-        parent = os.path.abspath(os.path.expanduser(str(parent_folder or ""))) if parent_folder else ""
-        final_folder = os.path.join(parent, folder_name) if parent and folder_name else ""
-        photo_source = (
-            os.path.abspath(os.path.expanduser(str(photo_source_folder)))
-            if photo_source_folder else ""
-        )
-        photos = self.collect_new_bisse_photo_files(photo_source) if photo_source else []
-        live = self.normalize_new_bisse_gpx_files(live_gpx_files)
-        suisse = self.normalize_new_bisse_gpx_files(suissemobile_gpx_files)
-
-        warnings = []
-        conflicts = []
-        if not display_name:
-            conflicts.append("Le nom du bisse est vide.")
-        if not folder_name:
-            conflicts.append("Le nom du bisse ne permet pas de créer un nom de dossier valide.")
-        if not parent:
-            conflicts.append("Aucun dossier parent n'a été choisi.")
-        elif not os.path.isdir(parent):
-            conflicts.append(f"Le dossier parent n'existe pas : {parent}")
-        elif not os.access(parent, os.W_OK):
-            warnings.append("Le dossier parent n'est pas signalé comme inscriptible par le système ; la création sera vérifiée au moment de l'import.")
-
-        if photo_source and not os.path.isdir(photo_source):
-            conflicts.append(f"Le dossier des photos n'existe pas : {photo_source}")
-        if final_folder and os.path.exists(final_folder):
-            conflicts.append(
-                "Le dossier cible existe déjà. v59 refuse volontairement de fusionner ou d'écraser un dossier existant : "
-                + final_folder
-            )
-        if not photos:
-            warnings.append("Aucune photo JPG/JPEG/HEIC/HEIF n'est prévue dans l'import.")
-        if not live:
-            warnings.append("Aucun GPX live n'est prévu dans l'import.")
-        if not suisse:
-            warnings.append("Aucun GPX SuisseMobile n'est prévu dans l'import.")
-
-        # Les destinations sont plates et doivent être uniques sur Windows
-        # comme sous Linux, d'où casefold() pour détecter IMG.JPG / img.jpg.
-        photo_by_name = {}
-        for path in photos:
-            key = os.path.basename(path).casefold()
-            photo_by_name.setdefault(key, []).append(path)
-        for paths in photo_by_name.values():
-            unique_paths = {os.path.normcase(os.path.abspath(path)) for path in paths}
-            if len(unique_paths) > 1:
-                conflicts.append(
-                    "Collision de photos : plusieurs sources portent le nom "
-                    f"« {os.path.basename(paths[0])} ». Elles ne seront pas renommées automatiquement."
-                )
-
-        all_gpx = [("live", path) for path in live] + [("suissemobile", path) for path in suisse]
-        gpx_by_name = {}
-        for role, path in all_gpx:
-            gpx_by_name.setdefault(os.path.basename(path).casefold(), []).append((role, path))
-        for entries in gpx_by_name.values():
-            unique_paths = {os.path.normcase(os.path.abspath(path)) for _role, path in entries}
-            if len(unique_paths) > 1:
-                conflicts.append(
-                    "Collision de GPX : plusieurs sources portent le nom "
-                    f"« {os.path.basename(entries[0][1])} »."
-                )
-
-        total_bytes = 0
-        for path in photos + live + suisse:
-            try:
-                total_bytes += os.path.getsize(path)
-            except OSError:
-                pass
-
-        plan = {
-            "schema_version": "v59-new-bisse-import-plan-1",
-            "name": display_name,
-            "folder_name": folder_name,
-            "parent_folder": parent,
-            "final_folder": final_folder,
-            "photos_folder": os.path.join(final_folder, "Photos") if final_folder else "",
-            "gpx_folder": os.path.join(final_folder, "Fichiers GPX") if final_folder else "",
-            "catalogue_path": os.path.join(final_folder, "catalogue.json") if final_folder else "",
-            "photo_source_folder": photo_source,
-            "photo_files": photos,
-            "live_gpx_files": live,
-            "suissemobile_gpx_files": suisse,
-            "conflicts": conflicts,
-            "warnings": warnings,
-            "total_files": len(photos) + len(live) + len(suisse),
-            "total_bytes": total_bytes,
-            "created_at": datetime.now().isoformat(timespec="seconds"),
-        }
-        return plan
-
-    def validate_new_bisse_import_plan(self, plan):
-        """Retourne (ok, erreurs). Aucun accès en écriture n'est effectué."""
-        errors = list((plan or {}).get("conflicts", []) or [])
-        if not isinstance(plan, dict):
-            return False, ["Plan d'import invalide."]
-        final_folder = plan.get("final_folder", "")
-        parent = plan.get("parent_folder", "")
-        if not final_folder or not parent:
-            errors.append("Dossier cible incomplet.")
-        for path in plan.get("photo_files", []) + plan.get("live_gpx_files", []) + plan.get("suissemobile_gpx_files", []):
-            if not os.path.isfile(path):
-                errors.append(f"Source introuvable depuis l'analyse : {path}")
-        if final_folder and os.path.exists(final_folder):
-            msg = f"Le dossier cible existe maintenant : {final_folder}"
-            if msg not in errors:
-                errors.append(msg)
-        return not errors, errors
-
-    def build_initial_new_bisse_catalogue(self, name, final_folder):
-        """Crée le même conteneur de catalogue que les bisses existants."""
-        saved_base = self.base_folder
-        try:
-            self.base_folder = final_folder
-            container = self.empty_catalog_container()
-        finally:
-            self.base_folder = saved_base
-        container["project"]["bisse_name"] = name
-        container["project"]["title"] = name
-        container["project"]["source_folder"] = final_folder
-        container["project"]["updated_at"] = datetime.now().isoformat(timespec="seconds")
-        container["bisse_info"]["title"] = name
-        container["bisse_info"]["slug"] = self.slugify(name)
-        return container
-
-    def new_bisse_import_plan_summary(self, plan):
-        if not isinstance(plan, dict):
-            return "Aucun plan d'import."
-        size_mb = float(plan.get("total_bytes", 0) or 0) / (1024 * 1024)
-        lines = [
-            "PRÉVISUALISATION — aucune copie n'a encore été faite",
-            "",
-            f"Bisse : {plan.get('name') or '—'}",
-            f"Dossier à créer : {plan.get('final_folder') or '—'}",
-            f"Photos originales : {len(plan.get('photo_files', []))}",
-            f"GPX live : {len(plan.get('live_gpx_files', []))}",
-            f"GPX SuisseMobile : {len(plan.get('suissemobile_gpx_files', []))}",
-            f"Volume à copier : {size_mb:.1f} Mo",
-            "",
-            "Structure prévue :",
-            "  Photos/",
-            "  Fichiers GPX/",
-            "  JPG de travail si nécessaire",
-        ]
-        if plan.get("live_gpx_files"):
-            lines.extend(["", "GPX live :"] + [f"  • {os.path.basename(path)}" for path in plan["live_gpx_files"]])
-        if plan.get("suissemobile_gpx_files"):
-            lines.extend(["", "GPX SuisseMobile :"] + [f"  • {os.path.basename(path)}" for path in plan["suissemobile_gpx_files"]])
-        conflicts = plan.get("conflicts", []) or []
-        warnings = plan.get("warnings", []) or []
-        if conflicts:
-            lines.extend(["", "⛔ CONFLITS À RÉSOUDRE :"] + [f"  • {item}" for item in conflicts])
-        if warnings:
-            lines.extend(["", "⚠️ AVERTISSEMENTS :"] + [f"  • {item}" for item in warnings])
-        if not conflicts:
-            lines.extend([
-                "",
-                "✅ Le plan est cohérent.",
-                "Les sources seront copiées avec leurs noms et métadonnées ; elles ne seront ni déplacées, ni renommées, ni supprimées."
-            ])
-        return "\n".join(lines)
-
-    def execute_new_bisse_import_plan(self, plan, progress_callback=None):
-        """
-        Import non destructif v60 avec progression continue jusqu'à la fin de
-        la préparation automatique des photos.
-        """
-        ok, errors = self.validate_new_bisse_import_plan(plan)
-        if not ok:
-            raise ValueError(
-                "Plan d'import non applicable :\n- " + "\n- ".join(errors)
-            )
-
-        parent = plan["parent_folder"]
-        final_folder = plan["final_folder"]
-        staging = os.path.join(
-            parent,
-            f".abisses_import_{self.slugify(plan.get('name') or 'bisse')}_"
-            f"{uuid.uuid4().hex[:8]}"
-        )
-
-        if os.path.exists(staging):
-            raise FileExistsError(
-                f"Dossier temporaire déjà présent : {staging}"
-            )
-
-        copy_total = int(plan.get("total_files", 0))
-        prep_total = len(plan.get("photo_files", []))
-        total = max(1, copy_total + prep_total + 2)
-        done = 0
-
-        def report(message, value=None):
-            if callable(progress_callback):
-                progress_callback(done if value is None else value, total, message)
-
-        try:
-            os.makedirs(os.path.join(staging, "Photos"), exist_ok=False)
-            os.makedirs(os.path.join(staging, "Fichiers GPX"), exist_ok=False)
-            report("Structure temporaire créée")
-
-            for source in plan.get("photo_files", []):
-                shutil.copy2(
-                    source,
-                    os.path.join(staging, "Photos", os.path.basename(source))
-                )
-                done += 1
-                report(f"Import des photos · {done}/{copy_total} · {os.path.basename(source)}")
-
-            for source in plan.get("live_gpx_files", []):
-                shutil.copy2(
-                    source,
-                    os.path.join(staging, "Fichiers GPX", os.path.basename(source))
-                )
-                done += 1
-                report(f"Import GPX live · {os.path.basename(source)}")
-
-            for source in plan.get("suissemobile_gpx_files", []):
-                shutil.copy2(
-                    source,
-                    os.path.join(staging, "Fichiers GPX", os.path.basename(source))
-                )
-                done += 1
-                report(f"Import GPX SuisseMobile · {os.path.basename(source)}")
-
-            catalogue = self.build_initial_new_bisse_catalogue(
-                plan["name"], final_folder
-            )
-
-            prep_base = done
-
-            def prep_progress(position, prep_count, filename):
-                report(
-                    f"Préparation des photos · {position}/{prep_count} · {filename}",
-                    prep_base + position
-                )
-
-            catalogue, _prep_summary, _changed = (
-                self.prepare_photo_foundation_for_folder(
-                    staging,
-                    catalogue,
-                    photos_folder=os.path.join(staging, "Photos"),
-                    export_folder=os.path.join(staging, "Export_JPG"),
-                    progress_callback=prep_progress,
-                )
-            )
-            done = prep_base + prep_total
-
-            catalogue_path = os.path.join(staging, "catalogue.json")
-            temp_catalogue = catalogue_path + ".tmp"
-            with open(temp_catalogue, "w", encoding="utf-8") as handle:
-                json.dump(catalogue, handle, indent=4, ensure_ascii=False)
-                handle.write("\n")
-            os.replace(temp_catalogue, catalogue_path)
-            done += 1
-            report("Préparation des photos terminée")
-
-            valid, validation_errors = self.validate_new_bisse_import_result(
-                plan, staging_folder=staging
-            )
-            if not valid:
-                raise RuntimeError(
-                    "Validation de l'import échouée :\n- "
-                    + "\n- ".join(validation_errors)
-                )
-
-            if os.path.exists(final_folder):
-                raise FileExistsError(
-                    f"Le dossier cible a été créé entre-temps : {final_folder}"
-                )
-
-            os.replace(staging, final_folder)
-            staging = ""
-
-            valid, validation_errors = self.validate_new_bisse_import_result(plan)
-            if not valid:
-                raise RuntimeError(
-                    "Validation finale incomplète :\n- "
-                    + "\n- ".join(validation_errors)
-                )
-
-            done += 1
-            report("Bisse prêt")
-            return final_folder
-
-        except Exception:
-            if staging and os.path.isdir(staging):
-                shutil.rmtree(staging, ignore_errors=True)
-            raise
-
-
-    def validate_new_bisse_import_result(self, plan, staging_folder=None):
-        """Valide une arborescence créée dans le staging ou déjà finalisée."""
-        root = staging_folder or plan.get("final_folder", "")
-        errors = []
-        photos_folder = os.path.join(root, "Photos")
-        gpx_folder = os.path.join(root, "Fichiers GPX")
-        catalogue_path = os.path.join(root, "catalogue.json")
-        for folder in (photos_folder, gpx_folder):
-            if not os.path.isdir(folder):
-                errors.append(f"Dossier créé introuvable : {folder}")
-        if not os.path.isfile(catalogue_path):
-            errors.append("catalogue.json n'a pas été créé.")
-        else:
-            try:
-                with open(catalogue_path, "r", encoding="utf-8") as handle:
-                    container = json.load(handle)
-                if not isinstance(container, dict) or not isinstance(container.get("photos"), list):
-                    errors.append("catalogue.json n'a pas la structure attendue.")
-            except Exception as exc:
-                errors.append(f"catalogue.json illisible : {exc}")
-        for source in plan.get("photo_files", []):
-            target = os.path.join(photos_folder, os.path.basename(source))
-            if not os.path.isfile(target):
-                errors.append(f"Photo copiée introuvable : {os.path.basename(source)}")
-            else:
-                try:
-                    if os.path.getsize(source) != os.path.getsize(target):
-                        errors.append(f"Taille différente après copie : {os.path.basename(source)}")
-                except OSError:
-                    pass
-        for source in plan.get("live_gpx_files", []) + plan.get("suissemobile_gpx_files", []):
-            target = os.path.join(gpx_folder, os.path.basename(source))
-            if not os.path.isfile(target):
-                errors.append(f"GPX copié introuvable : {os.path.basename(source)}")
-            else:
-                try:
-                    if os.path.getsize(source) != os.path.getsize(target):
-                        errors.append(f"Taille différente après copie : {os.path.basename(source)}")
-                except OSError:
-                    pass
-
-        try:
-            with open(catalogue_path, "r", encoding="utf-8") as handle:
-                checked_container = json.load(handle)
-            photo_entries = (
-                checked_container.get("photos", [])
-                if isinstance(checked_container, dict)
-                else []
-            )
-
-            if len(photo_entries) < len(plan.get("photo_files", [])):
-                errors.append(
-                    "Toutes les photos importées ne sont pas encore inscrites "
-                    "dans les données internes."
-                )
-
-            for source in plan.get("photo_files", []):
-                ext = os.path.splitext(source)[1].lower()
-                if ext in (".heic", ".heif"):
-                    expected_jpg = os.path.join(
-                        root,
-                        "Export_JPG",
-                        os.path.splitext(os.path.basename(source))[0] + ".jpg"
-                    )
-                    if not os.path.isfile(expected_jpg):
-                        errors.append(
-                            "JPG de travail HEIC/HEIF introuvable : "
-                            f"{os.path.basename(expected_jpg)}"
-                        )
-        except Exception as exc:
-            errors.append(
-                f"Validation des données photo impossible : {exc}"
-            )
-
-        return not errors, errors
-
-    def show_new_bisse_import_dialog(self):
-        """Assistant visuel v59 : analyse d'abord, copie uniquement après confirmation."""
-        window = tk.Toplevel(self.root)
-        window.title("Importer un nouveau bisse · v59")
-        window.geometry("940x760")
-        window.minsize(780, 620)
-        window.transient(self.root)
-
-        outer = tk.Frame(window, padx=14, pady=12)
-        outer.pack(fill="both", expand=True)
-        outer.grid_columnconfigure(1, weight=1)
-        outer.grid_rowconfigure(7, weight=1)
-
-        tk.Label(outer, text="Importer un nouveau bisse", font=("Arial", 16, "bold")).grid(row=0, column=0, columnspan=3, sticky="w")
-        tk.Label(
-            outer,
-            text=(
-                "1. Import  →  2. Préparation des photos  →  3. Atelier GPX  →  "
-                "4. Tri final  →  5. Publication\n"
-                "Catalogue, conversion HEIC/HEIF et lecture des métadonnées sont automatiques. "
-                "Les fichiers sources ne sont jamais modifiés."
-            ),
-            justify="left", anchor="w", fg="#555555"
-        ).grid(row=1, column=0, columnspan=3, sticky="ew", pady=(4, 12))
-
-        name_var = tk.StringVar(value="")
-        parent_var = tk.StringVar(value="")
-        photos_var = tk.StringVar(value="")
-        live_var = tk.StringVar(value="Aucun fichier")
-        suisse_var = tk.StringVar(value="Aucun fichier")
-        live_paths = []
-        suisse_paths = []
-        state = {"plan": None, "busy": False}
-
-        def invalidate(*_args):
-            state["plan"] = None
-            create_button.config(state="disabled")
-            status_var.set("Modifications en attente d'une nouvelle analyse.")
-
-        def choose_parent():
-            initial = self.get_default_collection_root()
-            selected = filedialog.askdirectory(
-                title="Choisir le dossier qui contiendra le nouveau bisse",
-                initialdir=initial if initial and os.path.isdir(initial) else os.path.expanduser("~")
-            )
-            if selected:
-                parent_var.set(selected)
-
-        def choose_photos():
-            selected = filedialog.askdirectory(
-                title="Choisir le dossier contenant les photographies originales",
-                initialdir=parent_var.get() if os.path.isdir(parent_var.get()) else os.path.expanduser("~")
-            )
-            if selected:
-                photos_var.set(selected)
-
-        def choose_live():
-            paths = filedialog.askopenfilenames(
-                title="Choisir les GPX live horodatés",
-                filetypes=[("Fichiers GPX", "*.gpx"), ("Tous les fichiers", "*.*")],
-                initialdir=parent_var.get() if os.path.isdir(parent_var.get()) else None
-            )
-            if paths:
-                live_paths[:] = list(paths)
-                live_var.set(f"{len(live_paths)} fichier(s) · " + ", ".join(os.path.basename(p) for p in live_paths[:3]) + ("…" if len(live_paths) > 3 else ""))
-                invalidate()
-
-        def choose_suisse():
-            paths = filedialog.askopenfilenames(
-                title="Choisir la trace principale et les branches SuisseMobile",
-                filetypes=[("Fichiers GPX", "*.gpx"), ("Tous les fichiers", "*.*")],
-                initialdir=parent_var.get() if os.path.isdir(parent_var.get()) else None
-            )
-            if paths:
-                suisse_paths[:] = list(paths)
-                suisse_var.set(f"{len(suisse_paths)} fichier(s) · " + ", ".join(os.path.basename(p) for p in suisse_paths[:3]) + ("…" if len(suisse_paths) > 3 else ""))
-                invalidate()
-
-        def set_summary(text):
-            summary.config(state="normal")
-            summary.delete("1.0", tk.END)
-            summary.insert("1.0", text)
-            summary.config(state="disabled")
-
-        def analyze():
-            plan = self.build_new_bisse_import_plan(
-                name_var.get(), parent_var.get(), photos_var.get(), live_paths, suisse_paths
-            )
-            state["plan"] = plan
-            set_summary(self.new_bisse_import_plan_summary(plan))
-            ok, _errors = self.validate_new_bisse_import_plan(plan)
-            create_button.config(state="normal" if ok else "disabled")
-            status_var.set("Analyse terminée : prêt à créer." if ok else "Analyse terminée : corrigez les conflits indiqués.")
-
-        def progress(done, total, message):
-            try:
-                progress_bar["maximum"] = max(1, total)
-                progress_bar["value"] = done
-                status_var.set(message)
-                window.update_idletasks()
-            except Exception:
-                pass
-
-        def create():
-            if state["busy"]:
-                return
-            plan = state.get("plan")
-            if not plan:
-                analyze()
-                plan = state.get("plan")
-            ok, errors = self.validate_new_bisse_import_plan(plan)
-            if not ok:
-                messagebox.showerror("Import impossible", "\n".join(errors), parent=window)
-                return
-            confirmation = (
-                self.new_bisse_import_plan_summary(plan)
-                + "\n\nCréer maintenant ce nouveau bisse ?\n\n"
-                "Aucun fichier source ne sera déplacé, renommé ou supprimé."
-            )
-            if not messagebox.askyesno("Créer le nouveau bisse", confirmation, parent=window):
-                return
-            state["busy"] = True
-            create_button.config(state="disabled")
-            analyze_button.config(state="disabled")
-            try:
-                final_folder = self.execute_new_bisse_import_plan(plan, progress_callback=progress)
-                self.add_folder_to_workspace(final_folder)
-                self.log(
-                    f"✅ Nouveau bisse importé : {plan['name']} · "
-                    f"{len(plan['photo_files'])} photo(s) · "
-                    f"{len(plan['live_gpx_files'])} GPX live · "
-                    f"{len(plan['suissemobile_gpx_files'])} GPX SuisseMobile"
-                )
-                window.destroy()
-                self.load_folder(final_folder)
-                go_photos = messagebox.askyesno(
-                    "Nouveau bisse créé",
-                    (
-                        f"Le bisse « {plan['name']} » a été créé.\n\n"
-                        f"Dossier : {final_folder}\n"
-                        f"Photos : {len(plan['photo_files'])}\n"
-                        f"GPX live : {len(plan['live_gpx_files'])}\n"
-                        f"GPX SuisseMobile : {len(plan['suissemobile_gpx_files'])}\n\n"
-                        "Poursuivre maintenant avec la géolocalisation des photos ?"
-                    )
-                )
-                if go_photos:
-                    self.show_photo_geolocation()
-            except Exception as exc:
-                self.log(f"❌ Import nouveau bisse interrompu : {exc}")
-                messagebox.showerror(
-                    "Import interrompu",
-                    (
-                        f"Le nouveau bisse n'a pas pu être créé :\n\n{exc}\n\n"
-                        "Les fichiers sources n'ont pas été modifiés. Un dossier temporaire "
-                        "éventuel a été nettoyé."
-                    ),
-                    parent=window
-                )
-                state["busy"] = False
-                analyze_button.config(state="normal")
-                analyze()
-
-        def field_row(row, label, variable, command, button_text):
-            tk.Label(outer, text=label, anchor="w").grid(row=row, column=0, sticky="w", pady=3)
-            entry = tk.Entry(outer, textvariable=variable)
-            entry.grid(row=row, column=1, sticky="ew", padx=8, pady=3)
-            tk.Button(outer, text=button_text, command=command, width=14).grid(row=row, column=2, sticky="e", pady=3)
-            return entry
-
-        name_entry = field_row(2, "Nom du bisse", name_var, lambda: None, "")
-        # Le bouton vide du nom n'apporte rien : on le masque sans changer la grille.
-        for child in outer.grid_slaves(row=2, column=2):
-            child.grid_remove()
-        field_row(3, "Créer dans", parent_var, choose_parent, "Choisir…")
-        field_row(4, "Photos originales", photos_var, choose_photos, "Choisir…")
-
-        tk.Label(outer, text="GPX live", anchor="w").grid(row=5, column=0, sticky="w", pady=3)
-        tk.Label(outer, textvariable=live_var, anchor="w", justify="left", fg="#444444").grid(row=5, column=1, sticky="ew", padx=8, pady=3)
-        tk.Button(outer, text="Choisir…", command=choose_live, width=14).grid(row=5, column=2, sticky="e", pady=3)
-        tk.Label(outer, text="GPX SuisseMobile", anchor="w").grid(row=6, column=0, sticky="w", pady=3)
-        tk.Label(outer, textvariable=suisse_var, anchor="w", justify="left", fg="#444444").grid(row=6, column=1, sticky="ew", padx=8, pady=3)
-        tk.Button(outer, text="Choisir…", command=choose_suisse, width=14).grid(row=6, column=2, sticky="e", pady=3)
-
-        summary_frame = tk.LabelFrame(outer, text="Analyse avant import", padx=6, pady=6)
-        summary_frame.grid(row=7, column=0, columnspan=3, sticky="nsew", pady=(10, 8))
-        summary_frame.grid_columnconfigure(0, weight=1)
-        summary_frame.grid_rowconfigure(0, weight=1)
-        summary = tk.Text(summary_frame, wrap="word", height=18, state="disabled", bg="#f7f7f7")
-        summary.grid(row=0, column=0, sticky="nsew")
-        scrollbar = ttk.Scrollbar(summary_frame, orient="vertical", command=summary.yview)
-        scrollbar.grid(row=0, column=1, sticky="ns")
-        summary.config(yscrollcommand=scrollbar.set)
-        set_summary("Renseignez les sources puis cliquez sur « Analyser / Prévisualiser ».\nAucune copie n'est effectuée pendant l'analyse.")
-
-        status_var = tk.StringVar(value="En attente de l'analyse.")
-        tk.Label(outer, textvariable=status_var, anchor="w", fg="#555555").grid(row=8, column=0, columnspan=3, sticky="ew")
-        progress_bar = ttk.Progressbar(outer, mode="determinate", maximum=1, value=0)
-        progress_bar.grid(row=9, column=0, columnspan=3, sticky="ew", pady=(4, 8))
-        buttons = tk.Frame(outer)
-        buttons.grid(row=10, column=0, columnspan=3, sticky="ew")
-        analyze_button = tk.Button(buttons, text="🔎 Analyser / Prévisualiser", command=analyze)
-        analyze_button.pack(side="left")
-        create_button = tk.Button(buttons, text="➕ Créer le bisse", command=create, bg="#1e8449", fg="white", state="disabled")
-        create_button.pack(side="right", padx=(6, 0))
-        tk.Button(buttons, text="Annuler", command=window.destroy).pack(side="right")
-
-        for variable in (name_var, parent_var, photos_var):
-            variable.trace_add("write", invalidate)
-        name_entry.focus_set()
-
-
-    def photo_files_for_automatic_preparation(self, photos_folder):
-        """Inventorie les JPG/JPEG/HEIC/HEIF du dossier photos actif."""
-        if not photos_folder or not os.path.isdir(photos_folder):
-            return []
-
-        valid_ext = (".jpg", ".jpeg", ".heic", ".heif")
-        files = []
-        try:
-            for filename in sorted(os.listdir(photos_folder), key=str.casefold):
-                path = os.path.join(photos_folder, filename)
-                if os.path.isfile(path) and filename.lower().endswith(valid_ext):
-                    files.append(os.path.abspath(path))
-        except Exception:
-            return []
-        return files
-
-    def photo_relpath_from_root(self, root_folder, path):
-        try:
-            return os.path.relpath(path, root_folder).replace("\\", "/")
-        except Exception:
-            return str(path).replace("\\", "/")
-
-    def normalize_photo_catalog_key(self, value):
-        value = str(value or "").replace("\\", "/").strip()
-        return value.casefold() if value else ""
-
-    def convert_heic_for_automatic_preparation(self, source_path, target_path):
-        """
-        Convertit un HEIC/HEIF seulement si son JPG de travail n'existe pas.
-
-        Un JPG existant n'est jamais reconverti automatiquement : il peut déjà
-        contenir des métadonnées ou des corrections faites dans Abisses.
-        """
-        if os.path.exists(target_path):
-            return False
-
-        os.makedirs(os.path.dirname(target_path), exist_ok=True)
-
-        image = Image.open(source_path)
-        exif_data = image.info.get("exif", b"")
-        if image.mode != "RGB":
-            image = image.convert("RGB")
-
-        temp_path = target_path + f".tmp_{uuid.uuid4().hex[:8]}"
-        try:
-            if exif_data:
-                image.save(
-                    temp_path,
-                    "JPEG",
-                    quality=100,
-                    subsampling=0,
-                    exif=exif_data
-                )
-            else:
-                image.save(
-                    temp_path,
-                    "JPEG",
-                    quality=100,
-                    subsampling=0
-                )
-            os.replace(temp_path, target_path)
-        finally:
-            if os.path.exists(temp_path):
-                try:
-                    os.remove(temp_path)
-                except Exception:
-                    pass
-
-        return True
-
-    def prepare_photo_foundation_for_folder(
-        self,
-        root_folder,
-        container,
-        photos_folder=None,
-        export_folder=None,
-        progress_callback=None,
-    ):
-        """
-        Réconcilie automatiquement les photos présentes avec les données internes.
-
-        Non destructif :
-        - aucune photo source n'est déplacée, renommée ou supprimée ;
-        - un JPG de travail existant n'est jamais reconverti ;
-        - les titres, descriptions, GPS, ordres et sélections existants gagnent ;
-        - les entrées dont le fichier manque restent conservées ;
-        - seules les informations manquantes sont complétées.
-        """
-        root_folder = os.path.abspath(root_folder)
-        photos_folder = os.path.abspath(
-            photos_folder
-            or (
-                os.path.join(root_folder, "Photos")
-                if os.path.isdir(os.path.join(root_folder, "Photos"))
-                else root_folder
-            )
-        )
-        export_folder = os.path.abspath(
-            export_folder or os.path.join(root_folder, "Export_JPG")
-        )
-
-        if not isinstance(container, dict):
-            raise ValueError("Conteneur de données photo invalide.")
-
-        container.setdefault("photos", [])
-        if not isinstance(container["photos"], list):
-            container["photos"] = []
-        entries = container["photos"]
-
-        before = json.dumps(container, ensure_ascii=False, sort_keys=True, default=str)
-
-        by_source = {}
-        by_image = {}
-        original_name_indices = {}
-
-        for idx, entry in enumerate(entries):
-            if not isinstance(entry, dict):
-                continue
-
-            source_key = self.normalize_photo_catalog_key(
-                entry.get("source_relative_path")
-            )
-            image_key = self.normalize_photo_catalog_key(
-                entry.get("image_relative_path")
-            )
-            original_key = str(entry.get("original_filename") or "").casefold()
-
-            if source_key:
-                by_source.setdefault(source_key, idx)
-            if image_key:
-                by_image.setdefault(image_key, idx)
-            if original_key:
-                original_name_indices.setdefault(original_key, []).append(idx)
-
-        # Protection contre deux HEIC/HEIF qui voudraient utiliser le même JPG.
-        claimed_working_paths = {}
-        for idx, entry in enumerate(entries):
-            if not isinstance(entry, dict):
-                continue
-            image_key = self.normalize_photo_catalog_key(
-                entry.get("image_relative_path")
-            )
-            source_key = self.normalize_photo_catalog_key(
-                entry.get("source_relative_path")
-            )
-            if image_key:
-                claimed_working_paths.setdefault(
-                    image_key,
-                    source_key or f"entry:{idx}"
-                )
-
-        source_files = self.photo_files_for_automatic_preparation(photos_folder)
-        total = max(1, len(source_files))
-
-        summary = {
-            "sources": len(source_files),
-            "new_entries": 0,
-            "converted": 0,
-            "metadata_completed": 0,
-            "gps_found": 0,
-            "errors": 0,
-            "catalogue_changed": False,
-        }
-
-        for pos, source_path in enumerate(source_files, start=1):
-            source_rel = self.photo_relpath_from_root(root_folder, source_path)
-            source_key = self.normalize_photo_catalog_key(source_rel)
-            source_name = os.path.basename(source_path)
-            ext = os.path.splitext(source_name)[1].lower()
-            is_heic = ext in (".heic", ".heif")
-            is_jpg = ext in (".jpg", ".jpeg")
-
-            entry_index = by_source.get(source_key)
-
-            # Après un renommage d'un JPG dans Photos/, image_relative_path est
-            # le meilleur identifiant et évite de créer un doublon.
-            if entry_index is None and is_jpg:
-                entry_index = by_image.get(source_key)
-
-            # Compatibilité anciens catalogues : repli sur original_filename
-            # uniquement si le nom est unique.
-            if entry_index is None:
-                candidates = original_name_indices.get(source_name.casefold(), [])
-                if len(candidates) == 1:
-                    entry_index = candidates[0]
-
-            if entry_index is None:
-                entry = {
-                    "filename": source_name,
-                    "original_filename": source_name,
-                    "source_relative_path": source_rel,
-                    "image_relative_path": source_rel,
-                    "status": "OK",
-                    "converted_from_heic": is_heic,
-                    "uses_original_jpg": is_jpg,
-                    "copied_from_jpg": False,
-                    "gps_sync": "NON_ENCORE_FAIT",
-                    "gps_source": None,
-                    "date_taken": None,
-                    "gps_coordinates": None,
-                    "title": "",
-                    "description": "",
-                    "platform_selected": False,
-                    "platform_order": 0,
-                    "platform_caption": "",
-                }
-                entries.append(entry)
-                entry_index = len(entries) - 1
-                by_source[source_key] = entry_index
-                original_name_indices.setdefault(
-                    source_name.casefold(), []
-                ).append(entry_index)
-                summary["new_entries"] += 1
-            else:
-                entry = entries[entry_index]
-                if not isinstance(entry, dict):
-                    entry = {}
-                    entries[entry_index] = entry
-
-            was_discarded = entry.get("status") == "SUPPRIMEE"
-
-            entry.setdefault("original_filename", source_name)
-            entry.setdefault("source_relative_path", source_rel)
-            entry.setdefault("platform_selected", False)
-            entry.setdefault("platform_order", 0)
-            entry.setdefault("platform_caption", "")
-            entry.setdefault("title", "")
-            entry.setdefault("description", "")
-            entry.setdefault("gps_sync", "NON_ENCORE_FAIT")
-            entry.setdefault("gps_source", None)
-            entry.setdefault("date_taken", None)
-            entry.setdefault("gps_coordinates", None)
-            entry.setdefault("copied_from_jpg", False)
-            entry.setdefault("converted_from_heic", is_heic)
-            entry.setdefault("uses_original_jpg", is_jpg)
-
-            # Si une image de travail déjà renommée existe, la conserver.
-            working_path = ""
-            existing_image_rel = str(entry.get("image_relative_path") or "")
-            if existing_image_rel:
-                existing_image_path = os.path.join(
-                    root_folder,
-                    existing_image_rel.replace("/", os.sep)
-                )
-                if (
-                    os.path.isfile(existing_image_path)
-                    and existing_image_path.lower().endswith((".jpg", ".jpeg"))
-                ):
-                    working_path = existing_image_path
-
-            try:
-                if is_heic:
-                    if not working_path:
-                        target_name = os.path.splitext(source_name)[0] + ".jpg"
-                        target_path = os.path.join(export_folder, target_name)
-                        target_rel = self.photo_relpath_from_root(
-                            root_folder, target_path
-                        )
-                        target_key = self.normalize_photo_catalog_key(target_rel)
-
-                        claimed_by = claimed_working_paths.get(target_key)
-                        if claimed_by and claimed_by != source_key:
-                            raise RuntimeError(
-                                "Collision de JPG de travail pour "
-                                f"{source_name} : {target_name}"
-                            )
-
-                        if self.convert_heic_for_automatic_preparation(
-                            source_path, target_path
-                        ):
-                            summary["converted"] += 1
-
-                        working_path = target_path
-                        claimed_working_paths[target_key] = source_key
-
-                elif is_jpg:
-                    # Les JPG/JPEG originaux sont utilisés directement.
-                    working_path = source_path
-
-                if not working_path or not os.path.isfile(working_path):
-                    raise FileNotFoundError(
-                        f"Image de travail introuvable pour {source_name}"
-                    )
-
-                working_rel = self.photo_relpath_from_root(
-                    root_folder, working_path
-                )
-
-                current_rel = str(entry.get("image_relative_path") or "")
-                current_abs = (
-                    os.path.join(
-                        root_folder,
-                        current_rel.replace("/", os.sep)
-                    )
-                    if current_rel else ""
-                )
-
-                # Ne remplace le chemin que s'il manque ou ne pointe pas vers
-                # un JPG/JPEG de travail valide. Un HEIC source existant ne doit
-                # donc pas empêcher l'inscription du JPG converti dans Export_JPG.
-                current_is_valid_working = (
-                    bool(current_rel)
-                    and os.path.isfile(current_abs)
-                    and current_abs.lower().endswith((".jpg", ".jpeg"))
-                )
-                if not current_is_valid_working:
-                    entry["image_relative_path"] = working_rel
-                    entry["filename"] = os.path.basename(working_path)
-                elif not entry.get("filename"):
-                    entry["filename"] = os.path.basename(working_path)
-
-                entry["converted_from_heic"] = bool(
-                    entry.get("converted_from_heic") or is_heic
-                )
-                entry["uses_original_jpg"] = bool(is_jpg)
-
-                metadata_changed = False
-
-                # Titres/descriptions : compléter seulement si vides.
-                text_meta = self.read_text_metadata_from_jpg(working_path)
-                if text_meta.get("ok"):
-                    meta_title = (text_meta.get("title") or "").strip()
-                    meta_description = (
-                        text_meta.get("description") or ""
-                    ).strip()
-
-                    if not (entry.get("title") or "").strip() and meta_title:
-                        entry["title"] = text_meta.get("title", "")
-                        metadata_changed = True
-                    if (
-                        not (entry.get("description") or "").strip()
-                        and meta_description
-                    ):
-                        entry["description"] = text_meta.get(
-                            "description", ""
-                        )
-                        metadata_changed = True
-
-                # Date : compléter même sans GPS.
-                if not entry.get("date_taken"):
-                    try:
-                        capture_dt = self.get_capture_datetime_for_sort(
-                            working_path, entry
-                        )
-                        if capture_dt != datetime.max:
-                            entry["date_taken"] = capture_dt.isoformat()
-                            metadata_changed = True
-                    except Exception:
-                        pass
-
-                # GPS EXIF : compléter seulement si le catalogue n'a pas déjà
-                # de coordonnées. Les corrections métier existantes gagnent.
-                if not entry.get("gps_coordinates"):
-                    gps_meta = self.read_gps_metadata_from_jpg(working_path)
-                    if gps_meta.get("ok"):
-                        entry["gps_coordinates"] = {
-                            "lat": gps_meta["lat"],
-                            "lon": gps_meta["lon"],
-                            "ele": gps_meta.get("ele"),
-                        }
-                        entry["gps_sync"] = "OK_METADATA"
-                        entry["gps_source"] = "JPG_EXIF"
-                        metadata_changed = True
-                        summary["gps_found"] += 1
-
-                if metadata_changed:
-                    summary["metadata_completed"] += 1
-
-                if (
-                    not was_discarded
-                    and entry.get("status") in (None, "", "ERREUR")
-                ):
-                    entry["status"] = "OK"
-                    entry.pop("error", None)
-
-            except Exception as exc:
-                summary["errors"] += 1
-                if not was_discarded:
-                    entry["status"] = "ERREUR"
-                    entry["error"] = str(exc)
-                self.log(
-                    f"⚠️ Préparation automatique photo : {source_name} · {exc}"
-                )
-
-            if callable(progress_callback):
-                try:
-                    progress_callback(pos, total, source_name)
-                except Exception:
-                    pass
-
-        after = json.dumps(
-            container,
-            ensure_ascii=False,
-            sort_keys=True,
-            default=str
-        )
-        changed = before != after
-
-        if changed:
-            container.setdefault("project", {})
-            container["project"]["updated_at"] = datetime.now().isoformat(
-                timespec="seconds"
-            )
-
-        summary["catalogue_changed"] = changed
-        return container, summary, changed
-
-    def write_active_catalog_automatic(self):
-        """
-        Sauvegarde silencieuse et atomique du socle photo automatique.
-        """
-        self.ensure_safe_before_save(interactive=False)
-        self.reset_active_catalog_paths_to_local()
-
-        atomic_write_json_file(
-            self.catalog_path,
-            self.catalog_container,
-            indent=4,
-            ensure_ascii=False
-        )
-
-        try:
-            self.write_portable_data_copy_for_active_project()
-        except Exception as exc:
-            self.log(
-                "⚠️ Copie Data portable impossible après préparation "
-                f"automatique : {exc}"
-            )
-
-
-    def ensure_photo_foundation_automatic(self):
-        """
-        Prépare automatiquement les photos à chaque ouverture d'un bisse.
-
-        Le catalogue reste interne et invisible. v60 montre simplement une
-        progression « Préparation des photos » afin que l'application ne donne
-        jamais l'impression d'être bloquée.
-        """
-        previous_status = ""
-        try:
-            previous_status = str(self.status_header.cget("text") or "")
-        except Exception:
-            pass
-
-        source_count = len(
-            self.photo_files_for_automatic_preparation(self.photos_folder)
-        )
-
-        try:
-            self.progress.configure(
-                mode="determinate",
-                maximum=max(1, source_count),
-                value=0
-            )
-            self.status_header.config(
-                text="Préparation des photos…",
-                fg="#2c3e50"
-            )
-            self.root.update_idletasks()
-        except Exception:
-            pass
-
-        def on_progress(position, total, _filename):
-            try:
-                self.progress.configure(maximum=max(1, total))
-                self.progress["value"] = position
-                self.status_header.config(
-                    text=(
-                        f"Préparation des photos… {position}/{total}"
-                        if total else "Préparation des photos…"
-                    ),
-                    fg="#2c3e50"
-                )
-                self.root.update_idletasks()
-            except Exception:
-                pass
-
-        try:
-            container = self.read_catalog_container()
-            prepared, summary, changed = self.prepare_photo_foundation_for_folder(
-                self.base_folder,
-                container,
-                photos_folder=self.photos_folder,
-                export_folder=self.export_folder,
-                progress_callback=on_progress,
-            )
-
-            self.catalog_container = prepared
-            self.catalog_data = prepared.get("photos", [])
-
-            if changed or not os.path.exists(self.catalog_path):
-                self.write_active_catalog_automatic()
-
-            if (
-                summary.get("new_entries")
-                or summary.get("converted")
-                or summary.get("metadata_completed")
-                or summary.get("errors")
-            ):
-                self.log(
-                    "📷 Préparation automatique : "
-                    f"{summary.get('sources', 0)} source(s), "
-                    f"{summary.get('new_entries', 0)} nouvelle(s), "
-                    f"{summary.get('converted', 0)} HEIC/HEIF convertie(s), "
-                    f"{summary.get('metadata_completed', 0)} métadonnée(s) "
-                    f"complétée(s), {summary.get('errors', 0)} erreur(s)."
-                )
-            return summary
-        finally:
-            try:
-                self.progress.configure(maximum=100)
-                self.progress["value"] = 0
-                if previous_status:
-                    self.status_header.config(text=previous_status)
-                self.root.update_idletasks()
-            except Exception:
-                pass
-
-
-
-    # ============================================================
-    # V60 — PARCOURS UTILISATEUR
-    # ============================================================
-
-    def show_photo_geolocation(self):
-        """Écran dédié à la géolocalisation des photos."""
-        if not self.base_folder:
-            messagebox.showwarning("Aucun bisse", "Ouvrez d'abord un bisse.")
-            return
-
-        try:
-            self.catalog_data = self.read_catalog()
-        except Exception as exc:
-            messagebox.showerror("Photos indisponibles", str(exc))
-            return
-
-        active = [
-            e for e in self.catalog_data
-            if isinstance(e, dict) and e.get("status") == "OK"
-        ]
-        geo = [e for e in active if e.get("gps_coordinates")]
-
-        self.clear_main_frame()
-        self.status_header.config(text="Géolocalisation", fg="#2e86c1")
-
-        outer = tk.Frame(self.main_frame, padx=18, pady=16)
-        outer.pack(fill="both", expand=True)
-        outer.grid_columnconfigure(0, weight=1)
-
-        top = tk.Frame(outer)
-        top.grid(row=0, column=0, sticky="ew", pady=(0, 14))
-        tk.Button(
-            top, text="↩️ Tableau de bord",
-            command=lambda: self.load_folder(self.base_folder)
-        ).pack(side="left")
-        tk.Label(
-            top, text="Géolocalisation", font=("Arial", 18, "bold")
-        ).pack(side="left", padx=14)
-
-        status = tk.LabelFrame(outer, text="Photos", padx=12, pady=10)
-        status.grid(row=1, column=0, sticky="ew", pady=(0, 12))
-        tk.Label(
-            status,
-            text=f"{len(geo)} / {len(active)} photos localisées" if active else "Aucune photo disponible.",
-            font=("Arial", 12, "bold"),
-            anchor="w"
-        ).pack(fill="x")
-        tk.Label(
-            status,
-            text=(
-                "Les coordonnées déjà présentes restent conservées pour les "
-                "photos situées hors des plages horaires des GPX."
-            ),
-            fg="#666666",
-            justify="left",
-            anchor="w"
-        ).pack(fill="x", pady=(4, 0))
-
-        sync = tk.LabelFrame(outer, text="Synchronisation", padx=12, pady=10)
-        sync.grid(row=2, column=0, sticky="ew")
-        sync.grid_columnconfigure(1, weight=1)
-
-        tk.Button(
-            sync,
-            text="🛰️ Choisir une ou plusieurs traces GPX",
-            command=self.select_gpx
-        ).grid(row=0, column=0, sticky="w", padx=(0, 10), pady=4)
-
-        self.lbl_gpx = tk.Label(
-            sync, text="Aucune trace sélectionnée", fg="#666666", anchor="w"
-        )
-        self.lbl_gpx.grid(row=0, column=1, sticky="ew")
-
-        self.btn_sync = tk.Button(
-            sync,
-            text="📍 Géolocaliser les photos",
-            command=self.run_sync,
-            bg="#27ae60",
-            fg="white",
-            height=2,
-            state="disabled"
-        )
-        self.btn_sync.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 4))
-
-        tk.Button(
-            outer,
-            text="✍️ Écrire les coordonnées actuelles dans les JPG",
-            command=self.write_catalog_gps_to_jpg_metadata
-        ).grid(row=3, column=0, sticky="ew", pady=(12, 0))
-
-    def show_trace_module(self):
-        """Porte d'entrée utilisateur « Cartographie », moteur GPX inchangé."""
-        self.show_gpx_workshop()
-        try:
-            if self.gpx_workshop_active:
-                self.status_header.config(
-                    text="Cartographie",
-                    fg="#d35400"
-                )
-        except Exception:
-            pass
-
-
-    def show_bisse_photos_module(self):
-        """Porte d'entrée utilisateur « Photos »."""
-        self.show_map_interface()
-        try:
-            if self.map_widget is not None:
-                self.status_header.config(
-                    text="Photos",
-                    fg="#2980b9"
-                )
-        except Exception:
-            pass
-
-
-
-
-    def capture_active_bisse_state(self):
-        return {
-            "base_folder": self.base_folder,
-            "photos_folder": self.photos_folder,
-            "manual_photos_folder": self.manual_photos_folder,
-            "export_folder": self.export_folder,
-            "gpx_folder": self.gpx_folder,
-            "catalog_path": self.catalog_path,
-            "local_catalog_path": getattr(self, "local_catalog_path", ""),
-            "current_project_id": getattr(self, "current_project_id", ""),
-            "current_project_dir": getattr(self, "current_project_dir", ""),
-            "current_project_catalog_path": getattr(self, "current_project_catalog_path", ""),
-            "catalog_data": self.catalog_data,
-            "catalog_container": self.catalog_container,
-        }
-
-    def restore_active_bisse_state(self, state):
-        for key, value in state.items():
-            setattr(self, key, value)
-
-
-
-    # ============================================================
-    # V61 — RENDU / PRÉVISUALISATION
-    # ============================================================
-
-    def write_bisses_renderer_to_folder(self, root):
-        """
-        Écrit dans root le même index.html, CSS et JavaScript que le générateur
-        de la plateforme Bisses fourni pour cette version.
-
-        data/ et media/ ne sont jamais supprimés ici.
-        """
-        os.makedirs(root, exist_ok=True)
-
-        files = {
-            "index.html": BISSES_RENDER_INDEX_HTML,
-            ".nojekyll": "",
-            os.path.join("assets", "css", "styles.css"): BISSES_RENDER_STYLES_CSS,
-            os.path.join("assets", "js", "app.js"): BISSES_RENDER_APP_JS,
-            "README.md": BISSES_RENDER_README,
-        }
-
-        for relative, content in files.items():
-            path = os.path.join(root, relative)
-            os.makedirs(os.path.dirname(path) or root, exist_ok=True)
-            with open(path, "w", encoding="utf-8") as handle:
-                handle.write(content)
-
-        os.makedirs(os.path.join(root, "data", "bisses"), exist_ok=True)
-        os.makedirs(os.path.join(root, "media"), exist_ok=True)
-
-    def stop_local_preview_server(self, cleanup=False):
-        server = getattr(self, "_bisses_preview_server", None)
-        thread = getattr(self, "_bisses_preview_thread", None)
-        root = getattr(self, "_bisses_preview_root", "")
-
-        self._bisses_preview_server = None
-        self._bisses_preview_thread = None
-        self._bisses_preview_root = ""
-
-        if server is not None:
-            try:
-                server.shutdown()
-            except Exception:
-                pass
-            try:
-                server.server_close()
-            except Exception:
-                pass
-
-        if thread is not None:
-            try:
-                thread.join(timeout=1.0)
-            except Exception:
-                pass
-
-        if cleanup and root and os.path.isdir(root):
-            try:
-                shutil.rmtree(root)
-            except Exception:
-                pass
-
-    def start_local_preview_server(self, preview_root):
-        """
-        Sert exclusivement le dossier temporaire sur l'interface loopback.
-
-        Aucun accès GitHub n'est nécessaire et aucune publication n'est lancée.
-        """
-        self.stop_local_preview_server(cleanup=True)
-
-        preview_root = os.path.abspath(preview_root)
-
-        class QuietPreviewHandler(http.server.SimpleHTTPRequestHandler):
-            def __init__(handler_self, *args, **kwargs):
-                super().__init__(
-                    *args,
-                    directory=preview_root,
-                    **kwargs
-                )
-
-            def log_message(handler_self, _format, *_args):
-                return
-
-        server = http.server.ThreadingHTTPServer(
-            ("127.0.0.1", 0),
-            QuietPreviewHandler
-        )
-        server.daemon_threads = True
-
-        thread = threading.Thread(
-            target=server.serve_forever,
-            name="AbissesPreviewServer",
-            daemon=True
-        )
-        thread.start()
-
-        self._bisses_preview_server = server
-        self._bisses_preview_thread = thread
-        self._bisses_preview_root = preview_root
-
-        host, port = server.server_address[:2]
-        url = f"http://127.0.0.1:{port}/"
-        self.log(f"👁 Prévisualisation locale : {url}")
-        webbrowser.open_new_tab(url)
-        return url
-
-    def build_render_preview_for_folders(self, folders):
-        """
-        Génère une prévisualisation temporaire avec le moteur Bisses.
-
-        V62 : l'opération est strictement en lecture seule pour les dossiers
-        de travail et pour Gestion_Bisses_Data.
-        """
-        unique_folders = []
-        seen = set()
-
-        for folder in folders or []:
-            if not folder:
-                continue
-
-            folder = os.path.abspath(folder)
-            key = os.path.normcase(folder)
-
-            if key in seen or not os.path.isdir(folder):
-                continue
-
-            seen.add(key)
-            unique_folders.append(folder)
-
-        if not unique_folders:
-            raise ValueError(
-                "Aucun dossier bisse accessible à prévisualiser."
-            )
-
-        preview_root = tempfile.mkdtemp(
-            prefix="abisses_bisses_preview_"
-        )
-        self.write_bisses_renderer_to_folder(preview_root)
-
-        saved_state = self.capture_active_bisse_state()
-        index_entries = []
-        errors = []
-
-        try:
-            for folder in unique_folders:
-                try:
-                    self.configure_paths_for_readonly_export(
-                        folder
-                    )
-                    result = (
-                        self.export_current_bisse_to_platform_root(
-                            preview_root
-                        )
-                    )
-                    index_entries.append(
-                        result["index_entry"]
-                    )
-                except Exception as exc:
-                    errors.append(
-                        f"{os.path.basename(folder) or folder} : {exc}"
-                    )
-        finally:
-            self.restore_active_bisse_state(saved_state)
-
-        if not index_entries:
-            shutil.rmtree(
-                preview_root,
-                ignore_errors=True
-            )
-            raise RuntimeError(
-                "Aucun bisse n'a pu être préparé pour la "
-                "prévisualisation.\n\n"
-                + "\n".join(errors[:8])
-            )
-
-        index_entries.sort(
-            key=lambda item: (
-                str(item.get("title") or "").casefold(),
-                str(item.get("id") or "")
-            )
-        )
-
-        data_root = os.path.join(
-            preview_root,
-            "data"
-        )
-        os.makedirs(data_root, exist_ok=True)
-
-        atomic_write_json_file(
-            os.path.join(
-                data_root,
-                "bisses_index.json"
-            ),
-            index_entries,
-            indent=2,
-            ensure_ascii=False
-        )
-
-        return preview_root, errors
-
-
-    def build_validation_preview_for_folders(self, folders):
-        """
-        Alias de compatibilité v60.
-        Le rendu utilisé est désormais le vrai moteur Bisses.
-        """
-        return self.build_render_preview_for_folders(folders)
-
-    def preview_current_bisse_web(self):
-        if not self.base_folder or not os.path.isdir(self.base_folder):
-            messagebox.showwarning(
-                "Rendu / Prévisualisation",
-                "Aucun bisse actif."
-            )
-            return
-
-        try:
-            root, errors = self.build_render_preview_for_folders(
-                [self.base_folder]
-            )
-            self.start_local_preview_server(root)
-
-            if errors:
-                messagebox.showwarning(
-                    "Prévisualisation partielle",
-                    "\n".join(errors[:8])
-                )
-        except Exception as exc:
-            messagebox.showerror(
-                "Prévisualisation impossible",
-                str(exc)
-            )
-
-    def preview_all_workspace_bisses_web(self):
-        folders = [
-            entry.get("folder")
-            for entry in self.get_workspace_entries()
-            if entry.get("folder")
-            and os.path.isdir(entry.get("folder"))
-        ]
-
-        if not folders:
-            messagebox.showwarning(
-                "Rendu / Prévisualisation",
-                "Aucun bisse accessible dans Mes bisses."
-            )
-            return
-
-        try:
-            root, errors = self.build_render_preview_for_folders(
-                folders
-            )
-            self.start_local_preview_server(root)
-
-            if errors:
-                messagebox.showwarning(
-                    "Prévisualisation partielle",
-                    (
-                        "Certains bisses n'ont pas pu être prévisualisés :\n\n"
-                        + "\n".join(errors[:8])
-                    )
-                )
-        except Exception as exc:
-            messagebox.showerror(
-                "Prévisualisation impossible",
-                str(exc)
-            )
-
-    def show_render_preview_module(self):
-        """
-        Rendu / Prévisualisation est utilisable sur tous les postes.
-
-        Publier reste affiché partout, mais ne fait rien tant qu'un dossier du
-        site Bisses n'a pas été renseigné manuellement dans Paramètres.
-        """
-        self.clear_main_frame()
-        self.status_header.config(
-            text="Rendu / Prévisualisation",
-            fg="#1f618d"
-        )
-
-        outer = tk.Frame(self.main_frame, padx=24, pady=22)
-        outer.pack(fill="both", expand=True)
-        outer.grid_columnconfigure(0, weight=1)
-
-        top = tk.Frame(outer)
-        top.grid(row=0, column=0, sticky="ew", pady=(0, 18))
-        top.grid_columnconfigure(1, weight=1)
-
-        tk.Button(
-            top,
-            text="↩️ Tableau de bord",
-            command=self.return_to_active_bisse_or_home
-        ).grid(row=0, column=0, sticky="w")
-
-        tk.Label(
-            top,
-            text="Rendu / Prévisualisation",
-            font=("Arial", 19, "bold")
-        ).grid(row=0, column=1, sticky="w", padx=14)
-
-        tk.Label(
-            outer,
-            text=(
-                "La prévisualisation utilise localement le même moteur de rendu "
-                "que le site Bisses. Elle ne publie rien et ne dépend pas de GitHub."
-            ),
-            justify="left",
-            anchor="w",
-            wraplength=1050,
-            fg="#555555"
-        ).grid(row=1, column=0, sticky="ew", pady=(0, 16))
-
-        actions = tk.Frame(outer)
-        actions.grid(row=2, column=0, sticky="ew")
-        for column in range(3):
-            actions.grid_columnconfigure(column, weight=1)
-
-        current_box = tk.LabelFrame(
-            actions,
-            text="Ce bisse",
-            padx=12,
-            pady=12
-        )
-        current_box.grid(
-            row=0,
-            column=0,
-            sticky="nsew",
-            padx=(0, 6)
-        )
-
-        tk.Label(
-            current_box,
-            text="Voir le bisse actif dans le rendu réel du site.",
-            justify="left",
-            anchor="w",
-            wraplength=330,
-            fg="#555555"
-        ).pack(fill="x", pady=(0, 10))
-
-        tk.Button(
-            current_box,
-            text="👁 Prévisualiser ce bisse",
-            command=self.preview_current_bisse_web,
-            bg="#2980b9",
-            fg="white",
-            height=2,
-            state=(
-                "normal"
-                if self.base_folder and os.path.isdir(self.base_folder)
-                else "disabled"
-            )
-        ).pack(fill="x")
-
-        all_box = tk.LabelFrame(
-            actions,
-            text="Mes bisses",
-            padx=12,
-            pady=12
-        )
-        all_box.grid(
-            row=0,
-            column=1,
-            sticky="nsew",
-            padx=6
-        )
-
-        tk.Label(
-            all_box,
-            text="Voir ensemble tous les bisses accessibles de Mes bisses.",
-            justify="left",
-            anchor="w",
-            wraplength=330,
-            fg="#555555"
-        ).pack(fill="x", pady=(0, 10))
-
-        tk.Button(
-            all_box,
-            text="👁 Prévisualiser Mes bisses",
-            command=self.preview_all_workspace_bisses_web,
-            bg="#6c3483",
-            fg="white",
-            height=2
-        ).pack(fill="x")
-
-        publish_box = tk.LabelFrame(
-            actions,
-            text="Publication",
-            padx=12,
-            pady=12
-        )
-        publish_box.grid(
-            row=0,
-            column=2,
-            sticky="nsew",
-            padx=(6, 0)
-        )
-
-        tk.Label(
-            publish_box,
-            text=(
-                "Utilise le dossier du site Bisses configuré dans Paramètres "
-                "sur cet ordinateur."
-            ),
-            justify="left",
-            anchor="w",
-            wraplength=330,
-            fg="#555555"
-        ).pack(fill="x", pady=(0, 10))
-
-        tk.Button(
-            publish_box,
-            text="🌐 Publier",
-            command=self.open_publication_if_configured,
-            bg="#1f618d",
-            fg="white",
-            height=2
-        ).pack(fill="x")
-
-    def show_validation_module(self):
-        """Alias de compatibilité : Validation devient Rendu / Prévisualisation."""
-        self.show_render_preview_module()
-
-
-
-
-
-
-
-
-
-
 
 
     # ============================================================
@@ -8570,19 +6206,11 @@ class BisseManagerApp:
 
     def write_workspace(self, workspace):
         path = self.get_workspace_path()
-        workspace["updated_at"] = datetime.now().isoformat(
-            timespec="seconds"
-        )
-        atomic_write_json_file(
-            path,
-            workspace,
-            indent=2,
-            ensure_ascii=False
-        )
-        self.log(
-            f"💾 Liste Mes bisses sauvegardée : {path}"
-        )
-
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        workspace["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(workspace, f, indent=2, ensure_ascii=False)
+        self.log(f"💾 Liste Mes bisses sauvegardée : {path}")
 
     def add_folder_to_workspace(self, folder):
         if not folder:
@@ -9841,271 +7469,400 @@ namespace GestionBissesFolderPicker
             messagebox.showerror("Audit impossible", str(exc))
 
     def show_workspace_home(self):
-        """Accueil v60 : choisir, importer, valider ou consulter la bibliothèque."""
+        """
+        Accueil compact : tout doit rester visible sans scroll vertical.
+
+        v43 : Mes bisses affiche les projets Data, même si leur dossier source
+        doit être relié sur cet ordinateur.
+        """
         self.clear_main_frame()
         self.status_header.config(text="Mes bisses", fg="#34495e")
 
         outer = tk.Frame(self.main_frame)
         outer.pack(fill="both", expand=True)
+
         outer.grid_columnconfigure(0, weight=1)
         outer.grid_rowconfigure(3, weight=1)
 
         header = tk.Frame(outer)
-        header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 6))
         header.grid_columnconfigure(1, weight=1)
 
         tk.Label(
-            header, text="🏠 Mes bisses", font=("Arial", 18, "bold")
+            header,
+            text="🏠 Mes bisses",
+            font=("Arial", 18, "bold")
         ).grid(row=0, column=0, sticky="w")
+
         tk.Label(
             header,
-            text="Choisir un bisse ou commencer un nouveau travail",
-            fg="#666666",
-            anchor="w"
-        ).grid(row=0, column=1, sticky="ew", padx=14)
+            text=f"Données : {self.app_data_folder}",
+            justify="left",
+            anchor="w",
+            fg="#666666"
+        ).grid(row=0, column=1, sticky="ew", padx=12)
+
         tk.Button(
-            header, text="🔄 Actualiser", command=self.show_workspace_home
+            header,
+            text="🔄 Actualiser",
+            command=self.show_workspace_home
         ).grid(row=0, column=2, sticky="e")
 
-        actions_top = tk.Frame(outer)
-        actions_top.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        action_area = tk.Frame(outer)
+        action_area.grid(row=1, column=0, sticky="ew", pady=(0, 6))
         for col in range(3):
-            actions_top.grid_columnconfigure(col, weight=1)
+            action_area.grid_columnconfigure(col, weight=1)
 
-        start = tk.LabelFrame(actions_top, text="Commencer", padx=8, pady=7)
-        start.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
-        start.grid_columnconfigure(0, weight=1)
-        start.grid_columnconfigure(1, weight=1)
+        work_actions = tk.LabelFrame(action_area, text="Mes bisses", padx=8, pady=6)
+        work_actions.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
+        work_actions.grid_columnconfigure(0, weight=1)
+        work_actions.grid_columnconfigure(1, weight=1)
+
         tk.Button(
-            start,
-            text="➕ Importer un nouveau bisse",
-            command=self.show_new_bisse_import_dialog,
-            bg="#1e8449",
-            fg="white"
-        ).grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 5))
-        tk.Button(
-            start,
+            work_actions,
             text="📂 Ouvrir un dossier bisse",
             command=self.select_base_folder,
             bg="#2c3e50",
             fg="white"
-        ).grid(row=1, column=0, sticky="ew", padx=(0, 3))
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 3))
+
         tk.Button(
-            start,
+            work_actions,
             text="📁 Ajouter plusieurs",
             command=self.add_multiple_bisse_folders_to_workspace_dialog
-        ).grid(row=1, column=1, sticky="ew", padx=(3, 0))
+        ).grid(row=0, column=1, sticky="ew", padx=(3, 0))
 
-        validation = tk.LabelFrame(actions_top, text="Rendu / Prévisualisation", padx=8, pady=7)
-        validation.grid(row=0, column=1, sticky="nsew", padx=4)
-        validation.grid_columnconfigure(0, weight=1)
+        publication_actions = tk.LabelFrame(action_area, text="Lot plateforme", padx=8, pady=6)
+        publication_actions.grid(row=0, column=1, sticky="nsew", padx=4)
+        publication_actions.grid_columnconfigure(0, weight=1)
+
         tk.Button(
-            validation,
-            text="👁 Rendu / Prévisualisation",
-            command=self.show_render_preview_module,
+            publication_actions,
+            text="🌐 Publication / export",
+            command=self.show_publication_module,
             bg="#1f618d",
             fg="white"
         ).grid(row=0, column=0, sticky="ew")
-        tk.Label(
-            validation,
-            text="Prévisualiser un bisse ou l’ensemble de Mes bisses.",
-            fg="#666666",
-            anchor="w"
-        ).grid(row=1, column=0, sticky="ew", pady=(5, 0))
 
-        library = tk.LabelFrame(actions_top, text="Bibliothèque", padx=8, pady=7)
-        library.grid(row=0, column=2, sticky="nsew", padx=(4, 0))
-        library.grid_columnconfigure(0, weight=1)
-        library.grid_columnconfigure(1, weight=1)
+        library_actions = tk.LabelFrame(action_area, text="Bibliothèque", padx=8, pady=6)
+        library_actions.grid(row=0, column=2, sticky="nsew", padx=(4, 0))
+        library_actions.grid_columnconfigure(0, weight=1)
+        library_actions.grid_columnconfigure(1, weight=1)
+
         tk.Button(
-            library,
+            library_actions,
             text="📚 Ouvrir",
             command=self.show_bisses_library_browser,
             bg="#6c3483",
             fg="white"
         ).grid(row=0, column=0, sticky="ew", padx=(0, 3))
+
         tk.Button(
-            library,
+            library_actions,
             text="🔄 Maj Excel/CSV",
             command=self.update_bisses_library_from_file_dialog
         ).grid(row=0, column=1, sticky="ew", padx=(3, 0))
 
         data_row = tk.Frame(outer)
-        data_row.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        data_row.grid(row=2, column=0, sticky="ew", pady=(0, 6))
         data_row.grid_columnconfigure(0, weight=1)
+
         tk.Label(
             data_row,
-            text="Les dossiers source restent liés à leurs projets Abisses.",
-            fg="#666666",
-            anchor="w"
+            text=(
+                "Les catalogues de travail sont maintenant conservés dans "
+                "Gestion_Bisses_Data/projects/. Les dossiers locaux restent des sources liées."
+            ),
+            justify="left",
+            anchor="w",
+            fg="#666666"
         ).grid(row=0, column=0, sticky="ew")
+
         tk.Button(
             data_row,
             text="📂 Données globales",
             command=self.open_app_data_folder
-        ).grid(row=0, column=1, sticky="e")
+        ).grid(row=0, column=1, sticky="e", padx=(8, 0))
 
         entries = self.get_workspace_entries()
+        entry_by_iid = {}
+
         center = tk.Frame(outer)
         center.grid(row=3, column=0, sticky="nsew")
         center.grid_rowconfigure(0, weight=1)
         center.grid_columnconfigure(0, weight=1)
 
         if not entries:
-            box = tk.LabelFrame(center, text="Aucun bisse dans Mes bisses")
-            box.grid(row=0, column=0, sticky="nsew")
+            empty = tk.LabelFrame(center, text="Aucun bisse dans la liste de travail", padx=14, pady=12)
+            empty.grid(row=0, column=0, sticky="nsew")
+            empty.grid_columnconfigure(0, weight=1)
+            empty.grid_rowconfigure(0, weight=1)
+
             tk.Label(
-                box,
-                text="Importez un nouveau bisse ou ouvrez un dossier existant.",
+                empty,
+                text=(
+                    "Ouvrez un dossier bisse ou copiez un dossier Gestion_Bisses_Data existant.\n"
+                    "Les projets portables apparaîtront ici."
+                ),
+                justify="center",
                 fg="#555555"
-            ).pack(expand=True)
-            return
+            ).grid(row=0, column=0)
+        else:
+            publication_folders = set()
+            try:
+                for item in self.read_publication_collection().get("bisses", []):
+                    folder = item.get("folder", "")
+                    if folder:
+                        publication_folders.add(os.path.abspath(folder))
+            except Exception:
+                publication_folders = set()
 
-        columns = ("title", "region", "commune", "photos", "source", "last_opened", "folder")
-        table = tk.Frame(center)
-        table.grid(row=0, column=0, sticky="nsew")
-        table.grid_rowconfigure(0, weight=1)
-        table.grid_columnconfigure(0, weight=1)
+            table_frame = tk.Frame(center)
+            table_frame.grid(row=0, column=0, sticky="nsew")
+            table_frame.grid_rowconfigure(0, weight=1)
+            table_frame.grid_columnconfigure(0, weight=1)
 
-        tree = ttk.Treeview(
-            table, columns=columns, show="headings", selectmode="extended"
-        )
-        labels = {
-            "title": "Bisse",
-            "region": "Région",
-            "commune": "Communes",
-            "photos": "Photos",
-            "source": "Dossier source",
-            "last_opened": "Dernière ouverture",
-            "folder": "Dossier"
-        }
-        widths = {
-            "title": 250,
-            "region": 130,
-            "commune": 180,
-            "photos": 80,
-            "source": 110,
-            "last_opened": 145,
-            "folder": 620
-        }
-        for col in columns:
-            tree.heading(col, text=labels[col])
-            tree.column(col, width=widths[col], anchor="w")
-        tree.column("photos", anchor="center")
-        tree.column("source", anchor="center")
-        tree.column("folder", minwidth=420, stretch=True)
+            columns = (
+                "title", "slug", "region", "commune",
+                "photos", "segments", "publication", "source", "status",
+                "last_opened", "folder"
+            )
+            tree = ttk.Treeview(
+                table_frame,
+                columns=columns,
+                show="headings",
+                selectmode="extended",
+                height=8
+            )
 
-        yscroll = ttk.Scrollbar(table, orient="vertical", command=tree.yview)
-        xscroll = ttk.Scrollbar(table, orient="horizontal", command=tree.xview)
-        tree.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
-        tree.grid(row=0, column=0, sticky="nsew")
-        yscroll.grid(row=0, column=1, sticky="ns")
-        xscroll.grid(row=1, column=0, sticky="ew")
+            headings = {
+                "title": "Bisse",
+                "slug": "Slug",
+                "region": "Région",
+                "commune": "Communes",
+                "photos": "Photos",
+                "segments": "Segments",
+                "publication": "Lot",
+                "source": "Dossier source",
+                "status": "Catalogue",
+                "last_opened": "Dernière ouverture",
+                "folder": "Dossier"
+            }
+            widths = {
+                "title": 210,
+                "slug": 140,
+                "region": 115,
+                "commune": 140,
+                "photos": 70,
+                "segments": 75,
+                "publication": 55,
+                "source": 115,
+                "status": 120,
+                "last_opened": 135,
+                "folder": 640
+            }
 
-        mapping = {}
-        for idx, entry in enumerate(entries):
-            iid = entry.get("project_id") or entry.get("id") or f"entry-{idx}"
-            if iid in mapping:
-                iid = f"{iid}-{idx}"
-            mapping[iid] = entry
-            folder = entry.get("folder", "")
-            source_ok = bool(entry.get("source_exists"))
-            tree.insert(
-                "", "end", iid=iid,
-                values=(
-                    entry.get("title", ""),
-                    entry.get("region", ""),
-                    entry.get("commune", ""),
-                    entry.get("photos_selected", 0),
-                    "✅" if source_ok else "🔗 à relier",
-                    entry.get("last_opened_at", ""),
-                    folder if source_ok else "(dossier source à relier)"
+            for col in columns:
+                tree.heading(col, text=headings[col])
+                tree.column(col, width=widths[col], anchor="w")
+
+            for col in ("photos", "segments", "publication", "source", "status"):
+                tree.column(col, anchor="center")
+
+            tree.column("folder", minwidth=500, stretch=True)
+
+            yscroll = ttk.Scrollbar(table_frame, orient="vertical", command=tree.yview)
+            xscroll = ttk.Scrollbar(table_frame, orient="horizontal", command=tree.xview)
+            tree.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+
+            tree.grid(row=0, column=0, sticky="nsew")
+            yscroll.grid(row=0, column=1, sticky="ns")
+            xscroll.grid(row=1, column=0, sticky="ew")
+
+            for entry in entries:
+                folder = entry.get("folder", "")
+                project_id = entry.get("project_id", "") or entry.get("id", "")
+                iid = project_id or folder or f"entry-{len(entry_by_iid)}"
+                if iid in entry_by_iid:
+                    iid = f"{iid}-{len(entry_by_iid)}"
+
+                source_ok = bool(entry.get("source_exists"))
+                in_publication = os.path.abspath(folder) in publication_folders if folder else False
+                entry_by_iid[iid] = entry
+
+                tree.insert(
+                    "",
+                    "end",
+                    iid=iid,
+                    values=(
+                        entry.get("title", ""),
+                        entry.get("id", ""),
+                        entry.get("region", ""),
+                        entry.get("commune", ""),
+                        entry.get("photos_selected", 0),
+                        entry.get("segments_count", 0),
+                        "✅" if in_publication else "—",
+                        "✅" if source_ok else "🔗 à relier",
+                        "✅" if entry.get("has_catalog") else "⚪",
+                        entry.get("last_opened_at", ""),
+                        folder if source_ok else "(dossier source à relier)"
+                    )
                 )
-            )
 
-        if tree.get_children():
-            tree.selection_set(tree.get_children()[0])
+            children = tree.get_children()
+            if children:
+                tree.selection_set(children[0])
+                tree.focus(children[0])
 
-        def selected():
-            result = []
-            for iid in tree.selection():
-                if iid in mapping:
-                    item = dict(mapping[iid])
-                    item["_iid"] = iid
-                    result.append(item)
-            return result
+            def selected_entries():
+                result = []
+                for iid in tree.selection():
+                    if iid not in entry_by_iid:
+                        continue
+                    entry = dict(entry_by_iid[iid])
+                    entry["_iid"] = iid
+                    if not entry.get("project_id"):
+                        resolved = self.resolve_project_id_for_workspace_entry(entry, iid)
+                        if resolved:
+                            entry["project_id"] = resolved
+                    result.append(entry)
+                return result
 
-        def open_selected():
-            items = selected()
-            if not items:
-                return
-            item = items[0]
-            folder = item.get("folder", "")
-            if folder and os.path.isdir(folder):
-                self.load_folder(folder)
-                return
-            project_id = self.resolve_project_id_for_workspace_entry(
-                item, item.get("_iid", "")
-            )
-            self.relink_project_to_folder_dialog(project_id)
+            def selected_existing_folders():
+                folders = []
+                for entry in selected_entries():
+                    folder = entry.get("folder", "")
+                    if folder and os.path.isdir(folder):
+                        folders.append(folder)
+                return folders
 
-        def relink_selected():
-            items = selected()
-            if not items:
-                return
-            project_id = self.resolve_project_id_for_workspace_entry(
-                items[0], items[0].get("_iid", "")
-            )
-            self.relink_project_to_folder_dialog(project_id)
+            def open_selected():
+                entries_sel = selected_entries()
+                if not entries_sel:
+                    messagebox.showwarning("Aucune sélection", "Sélectionnez un bisse à ouvrir.")
+                    return
 
-        def update_library():
-            folders = [
-                item.get("folder")
-                for item in selected()
-                if item.get("folder") and os.path.isdir(item.get("folder"))
-            ]
-            if folders:
+                entry = entries_sel[0]
+                folder = entry.get("folder", "")
+                if folder and os.path.isdir(folder):
+                    self.load_folder(folder)
+                    return
+
+                project_id = self.resolve_project_id_for_workspace_entry(entry, entry.get("_iid", ""))
+                if messagebox.askyesno(
+                    "Dossier source à relier",
+                    "Le dossier source de ce projet n'existe pas sur cet ordinateur.\n\nVoulez-vous le relier à un dossier local ?"
+                ):
+                    self.relink_project_to_folder_dialog(project_id)
+
+            def relink_selected():
+                entries_sel = selected_entries()
+                if not entries_sel:
+                    messagebox.showwarning("Aucune sélection", "Sélectionnez un projet à relier.")
+                    return
+
+                entry = entries_sel[0]
+                project_id = self.resolve_project_id_for_workspace_entry(entry, entry.get("_iid", ""))
+                self.relink_project_to_folder_dialog(project_id)
+
+            def remove_selected():
+                entries_sel = selected_entries()
+                if not entries_sel:
+                    messagebox.showwarning("Aucune sélection", "Sélectionnez un ou plusieurs bisses à retirer.")
+                    return
+                if messagebox.askyesno(
+                    "Retirer de Mes bisses",
+                    (
+                        f"Retirer {len(entries_sel)} bisse(s) de la liste de travail ?\n\n"
+                        "Les projets Data et les dossiers ne seront pas supprimés."
+                    )
+                ):
+                    for entry in entries_sel:
+                        self.remove_workspace_entry(entry.get("project_id", ""), entry.get("folder", ""))
+                    self.show_workspace_home()
+
+            def add_selected_to_publication():
+                folders = selected_existing_folders()
+                if not folders:
+                    messagebox.showwarning(
+                        "Dossier source à relier",
+                        "Aucun des bisses sélectionnés n'a de dossier source local disponible."
+                    )
+                    return
+                for folder in folders:
+                    self.add_folder_to_publication_collection(folder)
+                self.show_workspace_home()
+                messagebox.showinfo(
+                    "Lot plateforme",
+                    f"{len(folders)} bisse(s) inclus dans le lot plateforme."
+                )
+
+            def update_selected_from_library():
+                folders = selected_existing_folders()
+                if not folders:
+                    messagebox.showwarning(
+                        "Dossier source à relier",
+                        "Aucun des bisses sélectionnés n'a de dossier source local disponible."
+                    )
+                    return
                 self.show_update_selected_bisses_from_library_dialog(folders)
 
-        def remove_selected():
-            items = selected()
-            if not items:
-                return
-            if not messagebox.askyesno(
-                "Retirer de Mes bisses",
-                f"Retirer {len(items)} bisse(s) de la liste ?\n\nAucun dossier ne sera supprimé."
-            ):
-                return
-            for item in items:
-                self.remove_workspace_entry(
-                    item.get("project_id", ""), item.get("folder", "")
-                )
-            self.show_workspace_home()
+            tree.bind("<Double-1>", lambda _event: open_selected())
+            tree.bind(
+                "<Motion>",
+                lambda event, t=tree, mapping=entry_by_iid: self.show_workspace_folder_tooltip(event, t, mapping)
+            )
+            tree.bind("<Leave>", self.hide_text_tooltip)
+            tree.bind("<ButtonPress>", self.hide_text_tooltip)
 
-        tree.bind("<Double-1>", lambda _event: open_selected())
-        tree.bind(
-            "<Motion>",
-            lambda event, t=tree, m=mapping: self.show_workspace_folder_tooltip(event, t, m)
-        )
-        tree.bind("<Leave>", self.hide_text_tooltip)
+        actions = tk.LabelFrame(outer, text="Actions sur la sélection", padx=8, pady=6)
+        actions.grid(row=4, column=0, sticky="ew", pady=(6, 0))
 
-        row = tk.LabelFrame(outer, text="Actions sur la sélection", padx=8, pady=6)
-        row.grid(row=4, column=0, sticky="ew", pady=(6, 0))
+        if not entries:
+            tk.Label(
+                actions,
+                text="Aucun bisse sélectionnable pour le moment.",
+                fg="#666666"
+            ).pack(side="left")
+            return
+
         tk.Button(
-            row, text="📂 Ouvrir", command=open_selected, bg="#2c3e50", fg="white"
+            actions,
+            text="📂 Ouvrir la sélection",
+            command=open_selected,
+            bg="#2c3e50",
+            fg="white"
         ).pack(side="left")
+
         tk.Button(
-            row, text="🔗 Relier à un dossier local", command=relink_selected
-        ).pack(side="left", padx=6)
-        tk.Button(
-            row, text="📚 Mettre à jour la fiche", command=update_library
-        ).pack(side="left", padx=6)
-        tk.Button(
-            row, text="🗑️ Retirer", command=remove_selected
+            actions,
+            text="🔗 Relier à un dossier local",
+            command=relink_selected
         ).pack(side="left", padx=6)
 
+        tk.Button(
+            actions,
+            text="🌐 Inclure dans le lot",
+            command=add_selected_to_publication
+        ).pack(side="left", padx=6)
 
+        tk.Button(
+            actions,
+            text="📚 Maj infos bibliothèque",
+            command=update_selected_from_library
+        ).pack(side="left", padx=6)
 
+        tk.Button(
+            actions,
+            text="🗑️ Retirer",
+            command=remove_selected
+        ).pack(side="left", padx=6)
+
+        tk.Button(
+            actions,
+            text="Tout sélectionner",
+            command=lambda: tree.selection_set(tree.get_children())
+        ).pack(side="right")
 
     def get_entry_image_path(self, entry):
         """
@@ -11965,16 +9722,6 @@ namespace GestionBissesFolderPicker
         self.load_folder(folder)
 
     def load_folder(self, folder):
-        if not self.flush_current_photo_metadata_if_dirty():
-            messagebox.showerror(
-                "Photos",
-                (
-                    "Les modifications de la photo courante n'ont pas pu "
-                    "être sauvegardées. Le changement de dossier est annulé."
-                )
-            )
-            return
-
         self.base_folder = os.path.abspath(folder)
 
         try:
@@ -12017,15 +9764,6 @@ namespace GestionBissesFolderPicker
             self.catalog_path = self.local_catalog_path
             self.log(f"⚠️ Projet Data indisponible, utilisation du catalogue local : {exc}")
 
-        # v59 : ouvrir un bisse garantit silencieusement le socle photo.
-        # Une erreur sur une photo ne doit pas empêcher l'ouverture du dossier.
-        try:
-            self.ensure_photo_foundation_automatic()
-        except Exception as exc:
-            self.log(
-                f"⚠️ Préparation automatique des photos incomplète : {exc}"
-            )
-
         try:
             self.add_folder_to_workspace(self.base_folder)
         except Exception as exc:
@@ -12062,8 +9800,6 @@ namespace GestionBissesFolderPicker
             is_geo=is_geolocated
         )
 
-
-
     def folder_has_images(self, folder):
         if not folder or not os.path.exists(folder):
             return False
@@ -12076,365 +9812,356 @@ namespace GestionBissesFolderPicker
         )
 
     def show_contextual_interface(self, has_raw, has_export, has_cat, is_geo):
-        """Tableau de bord v61 : cinq étapes métier et trois accès rapides."""
+        """
+        Tableau de bord du dossier.
+
+        v41 prudente :
+        - le tableau de bord devient surtout un hub de synthèse et d'accès aux ateliers ;
+        - aucune fonction n'est supprimée ;
+        - les commandes techniques restent disponibles dans "Actions avancées / maintenance",
+          replié par défaut ;
+        - la logique GPX n'est pas changée ici, la détection automatique Fichiers GPX
+          reste prévue pour v42.
+        """
         self.clear_main_frame()
-        outer = self.make_scrollable_page(padx=4, pady=2)
+
+        outer = tk.Frame(self.main_frame)
+        outer.pack(fill="both", expand=True)
+        outer.grid_columnconfigure(0, weight=1)
+        outer.grid_rowconfigure(2, weight=1)
+
+        # ------------------------------------------------------------------
+        # Calculs d'état
+        # ------------------------------------------------------------------
+        photo_ok = 0
+        photo_discarded = 0
+        photo_geolocated = 0
+        photo_titles = 0
+        photo_descriptions = 0
+        platform_selected_count = 0
+        platform_missing_title = 0
+        platform_missing_description = 0
+
+        if has_cat:
+            try:
+                self.catalog_data = self.read_catalog()
+                for entry in self.catalog_data:
+                    status = entry.get("status")
+                    if status == "OK":
+                        photo_ok += 1
+                        if entry.get("gps_coordinates"):
+                            photo_geolocated += 1
+                        if (entry.get("title") or "").strip():
+                            photo_titles += 1
+                        if (entry.get("description") or "").strip():
+                            photo_descriptions += 1
+                        if entry.get("platform_selected"):
+                            platform_selected_count += 1
+                            if not (entry.get("title") or "").strip():
+                                platform_missing_title += 1
+                            if not (entry.get("description") or "").strip():
+                                platform_missing_description += 1
+                    elif status == "SUPPRIMEE":
+                        photo_discarded += 1
+            except Exception:
+                pass
+
+        trace_summary = "Atelier GPX disponible même sans catalogue photo."
+        workshop_sources = 0
+        workshop_segments = 0
+        categorized_segments = 0
+        exported_segments = 0
 
         try:
-            container = self.read_catalog_container()
+            self.read_catalog_container()
+            trace_summary = self.get_trace_summary_text()
+            workshop = self.get_gpx_workshop_state()
+            workshop_sources = len(workshop.get("sources", []))
+            workshop_segments = len(workshop.get("segments", []))
+            categorized_segments = sum(
+                1 for seg in workshop.get("segments", [])
+                if seg.get("category_id", "non_classe") != "non_classe"
+            )
+            traces = self.get_trace_sections()
+            exported_segments = len(traces.get("manual_segments", []))
+        except Exception as e:
+            trace_summary = f"Résumé des tracés indisponible : {e}"
+
+        bisse_info = {}
+        try:
+            bisse_info = self.read_catalog_container().get("bisse_info", {})
         except Exception:
-            container = self.empty_catalog_container()
+            bisse_info = {}
 
-        photos = [
-            entry for entry in container.get("photos", [])
-            if isinstance(entry, dict) and entry.get("status") == "OK"
-        ]
-        photo_count = len(photos)
-        geo_count = sum(
-            1 for entry in photos
-            if entry.get("gps_coordinates")
-        )
-        order_count = sum(
-            1 for entry in photos
-            if int(entry.get("photo_order") or 0) > 0
-        )
-        selected_count = sum(
-            1 for entry in photos
-            if entry.get("platform_selected")
-        )
+        platform_title = bisse_info.get("title") or os.path.basename(self.base_folder or "")
+        platform_slug = bisse_info.get("slug") or self.slugify(platform_title)
 
-        workshop = container.get("gpx_workshop", {}) or {}
-        cartography_started = bool(
-            workshop.get("sources")
-            or workshop.get("segments")
-            or (container.get("gpx_traces", {}) or {}).get("manual_segments")
-        )
-
-        info = container.get("bisse_info", {}) or {}
-        title = (
-            info.get("title")
-            or container.get("project", {}).get("title")
-            or os.path.basename(self.base_folder or "")
-            or "Bisse actif"
-        )
-        region = str(info.get("region") or "").strip()
-        commune = str(
-            info.get("communes")
-            or info.get("commune")
-            or ""
-        ).strip()
-
+        # ------------------------------------------------------------------
+        # En-tête synthétique
+        # ------------------------------------------------------------------
         header = tk.Frame(outer)
-        header.pack(fill="x", pady=(0, 12))
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         header.grid_columnconfigure(0, weight=1)
 
+        title_text = platform_title or "Bisse actif"
         tk.Label(
             header,
-            text=title,
-            font=("Arial", 20, "bold"),
+            text=f"📁 {title_text}",
+            font=("Arial", 17, "bold"),
             anchor="w"
         ).grid(row=0, column=0, sticky="ew")
-
-        subtitle = " · ".join(
-            value for value in (commune, region) if value
-        )
-        if subtitle:
-            tk.Label(
-                header,
-                text=subtitle,
-                fg="#666666",
-                anchor="w"
-            ).grid(row=1, column=0, sticky="ew")
 
         tk.Button(
             header,
             text="🏠 Mes bisses",
             command=self.show_workspace_home
-        ).grid(
-            row=0,
-            column=1,
-            rowspan=2,
-            sticky="e"
-        )
+        ).grid(row=0, column=1, sticky="e", padx=(8, 0))
 
-        content = tk.Frame(outer)
-        content.pack(fill="both", expand=True)
-        content.grid_columnconfigure(0, weight=3)
-        content.grid_columnconfigure(1, weight=1)
+        tk.Label(
+            header,
+            text=f"Dossier : {self.base_folder or '—'}",
+            justify="left",
+            anchor="w",
+            fg="#666666",
+            wraplength=1300
+        ).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(3, 0))
 
-        workflow = tk.LabelFrame(
-            content,
-            text="Parcours du bisse",
-            padx=12,
-            pady=10
-        )
-        workflow.grid(
-            row=0,
-            column=0,
-            sticky="nsew",
-            padx=(0, 6)
-        )
-        workflow.grid_columnconfigure(1, weight=1)
+        # ------------------------------------------------------------------
+        # Bandeau état court
+        # ------------------------------------------------------------------
+        status = tk.Frame(outer)
+        status.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        for col in range(4):
+            status.grid_columnconfigure(col, weight=1)
 
-        quick = tk.LabelFrame(
-            content,
-            text="Accès rapides",
-            padx=12,
-            pady=10
-        )
-        quick.grid(
-            row=0,
-            column=1,
-            sticky="nsew",
-            padx=(6, 0)
-        )
-        quick.grid_columnconfigure(0, weight=1)
-
-        def add_step(row, number, label, state, command, accent):
+        def status_card(col, title, lines, accent=None):
+            card = tk.LabelFrame(status, text=title, padx=8, pady=6)
+            card.grid(row=0, column=col, sticky="nsew", padx=(0 if col == 0 else 4, 0 if col == 3 else 4))
             tk.Label(
-                workflow,
-                text=str(number),
-                width=3,
-                height=2,
-                bg=accent,
-                fg="white",
-                font=("Arial", 12, "bold")
-            ).grid(
-                row=row,
-                column=0,
-                sticky="nsw",
-                padx=(0, 10),
-                pady=5
-            )
+                card,
+                text="\n".join(lines),
+                justify="left",
+                anchor="w",
+                fg=accent or "#333333",
+                wraplength=310
+            ).pack(fill="x")
 
-            body = tk.Frame(workflow)
-            body.grid(
-                row=row,
-                column=1,
-                sticky="ew",
-                pady=5
-            )
-            body.grid_columnconfigure(0, weight=1)
-
-            tk.Label(
-                body,
-                text=label,
-                font=("Arial", 12, "bold"),
-                anchor="w"
-            ).grid(row=0, column=0, sticky="ew")
-
-            tk.Label(
-                body,
-                text=state,
-                fg="#666666",
-                anchor="w"
-            ).grid(row=1, column=0, sticky="ew")
-
-            tk.Button(
-                workflow,
-                text="Ouvrir",
-                command=command,
-                width=12
-            ).grid(
-                row=row,
-                column=2,
-                sticky="e",
-                padx=(12, 0),
-                pady=5
-            )
-
-        add_step(
+        status_card(
             0,
+            "Dossier",
+            [
+                f"Photos source : {'oui' if has_raw else 'non'}",
+                f"Export JPG : {'oui' if has_export else 'non'}",
+                f"Catalogue : {'oui' if has_cat else 'non'}"
+            ]
+        )
+
+        status_card(
             1,
-            "Géolocalisation",
-            (
-                f"{geo_count}/{photo_count} photos localisées"
-                if photo_count else "Aucune photo"
-            ),
-            self.show_photo_geolocation,
-            "#2e86c1"
-        )
-
-        add_step(
-            1,
-            2,
-            "Ordre des photos",
-            (
-                "Ordre défini"
-                if photo_count and order_count == photo_count
-                else (
-                    f"Ordre défini pour {order_count}/{photo_count} photos"
-                    if photo_count else "Aucune photo"
-                )
-            ),
-            self.show_rename_interface,
-            "#8e44ad"
-        )
-
-        add_step(
-            2,
-            3,
-            "Cartographie",
-            (
-                "Travail commencé"
-                if cartography_started
-                else "À commencer"
-            ),
-            self.show_trace_module,
-            "#d35400"
-        )
-
-        add_step(
-            3,
-            4,
             "Photos",
-            (
-                f"{selected_count} photo(s) retenue(s)"
-                if selected_count
-                else "À travailler"
-            ),
-            self.show_bisse_photos_module,
-            "#117864"
+            [
+                f"Actives : {photo_ok}" if has_cat else "Actives : —",
+                f"GPS : {photo_geolocated}/{photo_ok}" if has_cat else "GPS : —",
+                f"Titre/desc. : {photo_titles}/{photo_descriptions}" if has_cat else "Titre/desc. : —"
+            ]
         )
 
-        add_step(
-            4,
-            5,
-            "Rendu / Prévisualisation",
-            "Disponible à tout moment",
-            self.show_render_preview_module,
-            "#1f618d"
+        status_card(
+            2,
+            "GPX",
+            [
+                f"Sources : {workshop_sources}",
+                f"Segments : {workshop_segments}",
+                f"Classés/exportés : {categorized_segments}/{exported_segments}"
+            ]
         )
+
+        status_card(
+            3,
+            "Plateforme",
+            [
+                f"Photos choisies : {platform_selected_count}",
+                f"Sans titre : {platform_missing_title}",
+                f"Sans description : {platform_missing_description}"
+            ],
+            accent="#7d3c98" if platform_missing_title or platform_missing_description else None
+        )
+
+        # ------------------------------------------------------------------
+        # Cartes principales : accès aux ateliers / modules
+        # ------------------------------------------------------------------
+        modules = tk.Frame(outer)
+        modules.grid(row=2, column=0, sticky="nsew")
+        modules.grid_columnconfigure(0, weight=1)
+        modules.grid_columnconfigure(1, weight=1)
+        modules.grid_columnconfigure(2, weight=1)
+        modules.grid_rowconfigure(0, weight=1)
+
+        photos_frame = tk.LabelFrame(modules, text="📷 Photos", padx=10, pady=8)
+        photos_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+
+        gpx_frame = tk.LabelFrame(modules, text="🧭 Tracés GPX", padx=10, pady=8)
+        gpx_frame.grid(row=0, column=1, sticky="nsew", padx=5)
+
+        info_frame = tk.LabelFrame(modules, text="📝 Fiche / publication", padx=10, pady=8)
+        info_frame.grid(row=0, column=2, sticky="nsew", padx=(5, 0))
+
+        # Photos : accès principal + amorçage si nécessaire.
+        tk.Label(
+            photos_frame,
+            text=(
+                f"{photo_ok} photo(s) active(s), {photo_geolocated} géolocalisée(s).\n"
+                "Travail courant : carte, visionneuse, titres, descriptions, sélection plateforme."
+                if has_cat else
+                "Aucun catalogue photo utilisable pour l’instant.\n"
+                "L’atelier Photos peut s’ouvrir en état vide, mais il faut créer ou compléter le catalogue pour travailler sur les images."
+            ),
+            justify="left",
+            anchor="w",
+            fg="#555555",
+            wraplength=410
+        ).pack(fill="x", pady=(0, 8))
 
         tk.Button(
-            quick,
-            text="📷 Photos",
-            command=self.show_bisse_photos_module,
+            photos_frame,
+            text="⚙️ Préparation photos",
+            command=self.show_photo_preparation_dialog,
+            bg="#2c3e50" if has_raw and not has_cat else "#ecf0f1",
+            fg="white" if has_raw and not has_cat else "black",
+            height=2 if has_raw and not has_cat else 1
+        ).pack(fill="x", pady=(0, 6))
+
+        tk.Button(
+            photos_frame,
+            text="🗺️ Ouvrir l’atelier Photos",
+            command=self.show_map_interface,
             bg="#2980b9",
             fg="white",
             height=2
-        ).grid(
-            row=0,
-            column=0,
-            sticky="ew",
-            pady=(0, 7)
-        )
+        ).pack(fill="x", pady=4)
+
+        # GPX : on garde seulement la porte d'entrée principale ici.
+        tk.Label(
+            gpx_frame,
+            text=(
+                f"{workshop_sources} source(s), {workshop_segments} segment(s), "
+                f"{categorized_segments} segment(s) classé(s).\n"
+                "Travail courant : import brut, sens amont → aval, segmentation, catégories, export."
+            ),
+            justify="left",
+            anchor="w",
+            fg="#555555",
+            wraplength=410
+        ).pack(fill="x", pady=(0, 8))
 
         tk.Button(
-            quick,
-            text="🗺️ Cartographie",
-            command=self.show_trace_module,
+            gpx_frame,
+            text="🧭 Ouvrir l’atelier Tracés GPX",
+            command=self.show_gpx_workshop,
             bg="#d35400",
             fg="white",
             height=2
-        ).grid(
-            row=1,
-            column=0,
-            sticky="ew",
-            pady=7
-        )
+        ).pack(fill="x", pady=4)
+
+        tk.Label(
+            gpx_frame,
+            text=trace_summary,
+            justify="left",
+            anchor="w",
+            fg="#666666",
+            wraplength=410
+        ).pack(fill="x", pady=(8, 0))
+
+        # Fiche / publication : portes d'entrée principales.
+        tk.Label(
+            info_frame,
+            text=(
+                f"Fiche : {platform_title or 'à compléter'}\n"
+                f"Slug : {platform_slug or '—'}\n"
+                f"Photos plateforme : {platform_selected_count}"
+            ),
+            justify="left",
+            anchor="w",
+            fg="#555555",
+            wraplength=410
+        ).pack(fill="x", pady=(0, 8))
 
         tk.Button(
-            quick,
-            text="👁 Rendu / Prévisualisation",
-            command=self.show_render_preview_module,
+            info_frame,
+            text="📝 Informations générales",
+            command=self.show_bisse_info_editor,
+            bg="#34495e",
+            fg="white",
+            height=2
+        ).pack(fill="x", pady=4)
+
+        tk.Button(
+            info_frame,
+            text="🌐 Publication / export",
+            command=self.show_publication_module,
             bg="#1f618d",
             fg="white",
             height=2
-        ).grid(
-            row=2,
-            column=0,
-            sticky="ew",
-            pady=7
+        ).pack(fill="x", pady=4)
+
+        # ------------------------------------------------------------------
+        # Maintenance : seule la maintenance transversale reste sur le dashboard.
+        # Les fonctions Photos et GPX ont été replacées dans leurs modules.
+        # ------------------------------------------------------------------
+        maintenance_shell = tk.Frame(outer)
+        maintenance_shell.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        maintenance_shell.grid_columnconfigure(0, weight=1)
+
+        maintenance_visible = tk.BooleanVar(value=False)
+        maintenance_content = tk.LabelFrame(
+            maintenance_shell,
+            text="Maintenance du dossier",
+            padx=10,
+            pady=8
         )
 
-        secondary = tk.LabelFrame(
-            quick,
-            text="Fiche",
-            padx=7,
-            pady=7
-        )
-        secondary.grid(
-            row=3,
-            column=0,
-            sticky="ew",
-            pady=(14, 4)
-        )
-        secondary.grid_columnconfigure(0, weight=1)
-
-        tk.Button(
-            secondary,
-            text="📝 Fiche du bisse",
-            command=self.show_bisse_info_editor
-        ).grid(
-            row=0,
-            column=0,
-            sticky="ew"
-        )
-
-        advanced_visible = tk.BooleanVar(value=False)
-        advanced_button = tk.Button(
-            quick,
-            text="▶ Outils avancés",
+        maintenance_button = tk.Button(
+            maintenance_shell,
+            text="▶ Maintenance du dossier",
             anchor="w"
         )
-        advanced_button.grid(
-            row=4,
-            column=0,
-            sticky="ew",
-            pady=(10, 4)
-        )
+        maintenance_button.grid(row=0, column=0, sticky="ew")
 
-        advanced = tk.Frame(quick)
-        advanced.grid_columnconfigure(0, weight=1)
-
-        def toggle_advanced():
-            if advanced_visible.get():
-                advanced.grid_remove()
-                advanced_button.config(text="▶ Outils avancés")
-                advanced_visible.set(False)
+        def toggle_maintenance():
+            if maintenance_visible.get():
+                maintenance_content.grid_remove()
+                maintenance_button.config(text="▶ Maintenance du dossier")
+                maintenance_visible.set(False)
             else:
-                advanced.grid(
-                    row=5,
-                    column=0,
-                    sticky="ew"
-                )
-                advanced_button.config(text="▼ Outils avancés")
-                advanced_visible.set(True)
+                maintenance_content.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+                maintenance_button.config(text="▼ Maintenance du dossier")
+                maintenance_visible.set(True)
 
-        advanced_button.config(command=toggle_advanced)
+        maintenance_button.config(command=toggle_maintenance)
 
         tk.Button(
-            advanced,
+            maintenance_content,
             text="✅ Vérifier la structure du dossier",
             command=self.check_local_folder_structure
-        ).grid(row=0, column=0, sticky="ew", pady=3)
+        ).pack(side="left", fill="x", expand=True, padx=(0, 6))
 
         tk.Button(
-            advanced,
-            text="🛡️ Audit des données",
+            maintenance_content,
+            text="🛡️ Audit Data",
             command=self.audit_data_integrity_dialog
-        ).grid(row=1, column=0, sticky="ew", pady=3)
-
-        tk.Button(
-            advanced,
-            text="🔄 Relancer la préparation des photos",
-            command=lambda: (
-                self.ensure_photo_foundation_automatic(),
-                self.load_folder(self.base_folder)
-            )
-        ).grid(row=2, column=0, sticky="ew", pady=3)
+        ).pack(side="left", fill="x", expand=True, padx=(0, 6))
 
         tk.Label(
-            outer,
-            text=self.base_folder,
-            fg="#888888",
+            maintenance_content,
+            text=(
+                "Les commandes Photos sont maintenant dans “Préparation photos”. "
+                "Les commandes GPX sont dans l’atelier GPX, onglet “Import / branches”."
+            ),
+            justify="left",
             anchor="w",
-            font=("Arial", 8)
-        ).pack(fill="x", pady=(10, 0))
-
-
-
+            fg="#666666",
+            wraplength=900
+        ).pack(side="left", fill="x", expand=True, padx=(6, 0))
 
     def check_local_folder_structure(self):
         """
@@ -12522,19 +10249,11 @@ namespace GestionBissesFolderPicker
 
     def write_bisses_library(self, library):
         path = self.get_bisses_library_path()
-        library["updated_at"] = datetime.now().isoformat(
-            timespec="seconds"
-        )
-        atomic_write_json_file(
-            path,
-            library,
-            indent=2,
-            ensure_ascii=False
-        )
-        self.log(
-            f"💾 Bibliothèque des bisses sauvegardée : {path}"
-        )
-
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        library["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(library, f, indent=2, ensure_ascii=False)
+        self.log(f"💾 Bibliothèque des bisses sauvegardée : {path}")
 
     def update_bisses_library_from_file(self, file_path):
         rows = self.read_inventory_table(file_path)
@@ -13301,59 +11020,6 @@ namespace GestionBissesFolderPicker
             self.catalog_path = self.local_catalog_path
             self.log(f"⚠️ Contexte Data non disponible pour export : {exc}")
 
-
-
-    # ============================================================
-    # V62 — CONTEXTE D'EXPORT STRICTEMENT EN LECTURE SEULE
-    # ============================================================
-
-    def configure_paths_for_readonly_export(self, folder):
-        """
-        Configure temporairement un bisse pour export/prévisualisation
-        sans créer, synchroniser ou sauvegarder aucune donnée métier.
-
-        Un catalogue local existant est exigé. La prévisualisation ne doit
-        jamais transformer une simple lecture en opération de préparation.
-        """
-        folder = os.path.abspath(folder)
-
-        if not os.path.isdir(folder):
-            raise FileNotFoundError(
-                f"Dossier bisse introuvable : {folder}"
-            )
-
-        local_catalog = os.path.join(folder, "catalogue.json")
-        if not os.path.isfile(local_catalog):
-            raise FileNotFoundError(
-                "Catalogue local manquant. Ouvrez d'abord ce bisse dans "
-                "Abisses afin de terminer sa préparation : "
-                f"{folder}"
-            )
-
-        self.base_folder = folder
-
-        candidate_photos = os.path.join(folder, "Photos")
-        self.photos_folder = (
-            candidate_photos
-            if os.path.isdir(candidate_photos)
-            else folder
-        )
-        self.manual_photos_folder = ""
-        self.export_folder = os.path.join(folder, "Export_JPG")
-        self.gpx_folder = os.path.join(folder, "Fichiers GPX")
-
-        self.local_catalog_path = local_catalog
-        self.catalog_path = local_catalog
-
-        # Aucune synchronisation Data/project.json ici.
-        self.current_project_id = ""
-        self.current_project_dir = ""
-        self.current_project_catalog_path = ""
-
-        self.catalog_container = None
-        self.catalog_data = []
-
-
     def get_default_collection_root(self):
         if self.base_folder:
             return os.path.dirname(os.path.abspath(self.base_folder))
@@ -13391,19 +11057,11 @@ namespace GestionBissesFolderPicker
 
     def write_publication_collection(self, collection):
         path = self.get_publication_collection_path()
-        collection["updated_at"] = datetime.now().isoformat(
-            timespec="seconds"
-        )
-        atomic_write_json_file(
-            path,
-            collection,
-            indent=2,
-            ensure_ascii=False
-        )
-        self.log(
-            f"💾 Collection de bisses sauvegardée : {path}"
-        )
-
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        collection["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(collection, f, indent=2, ensure_ascii=False)
+        self.log(f"💾 Collection de bisses sauvegardée : {path}")
 
     def get_bisse_summary_from_folder(self, folder):
         folder = os.path.abspath(folder)
@@ -13568,61 +11226,35 @@ namespace GestionBissesFolderPicker
 
     def export_current_bisse_to_platform_root(self, export_root):
         """
-        Exporte le bisse actuellement configuré dans export_root.
+        Exporte le dossier bisse actuellement configuré dans export_root.
+        Ne génère pas bisses_index.json : la fonction appelante décide si elle
+        exporte un seul bisse ou une collection.
 
-        V62 : lecture seule stricte vis-à-vis des données métier.
-        Aucun catalogue source n'est créé ou mis à jour par cette fonction.
+        v44 sécurité : l'export est en lecture seule vis-à-vis de catalogue.json.
+        Il ne met plus à jour platform_export dans le catalogue de travail.
         """
-        if not self.catalog_path or not os.path.isfile(self.catalog_path):
-            raise FileNotFoundError(
-                "Catalogue local introuvable pour l'export : "
-                f"{self.catalog_path or self.base_folder}"
-            )
-
+        self.ensure_catalog_file_exists()
         container = self.read_catalog_container()
 
-        if not self.catalogue_seems_compatible_with_folder(
-            container,
-            self.base_folder
-        ):
+        if not self.catalogue_seems_compatible_with_folder(container, self.base_folder):
             identity = self.catalog_identity(container)
             raise RuntimeError(
                 "Identité incohérente avant export : "
-                f"dossier={self.base_folder} / "
-                f"catalogue={identity.get('title') or identity.get('slug')}"
+                f"dossier={self.base_folder} / catalogue={identity.get('title') or identity.get('slug')}"
             )
 
-        # Travailler sur une copie mémoire évite même les mutations transitoires
-        # du conteneur chargé par setdefault.
-        container = copy.deepcopy(container)
-
-        info = container.setdefault(
-            "bisse_info",
-            self.default_bisse_info()
-        )
-        title = (
-            info.get("title")
-            or container.get("project", {}).get("title")
-            or os.path.basename(self.base_folder)
-        )
+        info = container.setdefault("bisse_info", self.default_bisse_info())
+        title = info.get("title") or container.get("project", {}).get("title") or os.path.basename(self.base_folder)
         slug = self.slugify(info.get("slug") or title)
         info["slug"] = slug
-
         if not info.get("title"):
             info["title"] = title
 
         data_root = os.path.join(export_root, "data")
-        bisse_data_dir = os.path.join(
-            data_root,
-            "bisses",
-            slug
-        )
-        media_dir = os.path.join(
-            export_root,
-            "media",
-            slug
-        )
+        bisse_data_dir = os.path.join(data_root, "bisses", slug)
+        media_dir = os.path.join(export_root, "media", slug)
 
+        # Nettoyage ciblé du bisse exporté, pas de tout l'export global.
         if os.path.isdir(bisse_data_dir):
             shutil.rmtree(bisse_data_dir)
         if os.path.isdir(media_dir):
@@ -13631,51 +11263,24 @@ namespace GestionBissesFolderPicker
         os.makedirs(bisse_data_dir, exist_ok=True)
         os.makedirs(media_dir, exist_ok=True)
 
-        exported_photos = self.export_platform_photos(
-            container,
-            media_dir,
-            slug
-        )
-        platform_catalogue = self.build_platform_catalogue(
-            container,
-            slug,
-            exported_photos
-        )
+        exported_photos = self.export_platform_photos(container, media_dir, slug)
+        platform_catalogue = self.build_platform_catalogue(container, slug, exported_photos)
         geojson = self.build_platform_geojson(container)
 
-        atomic_write_json_file(
-            os.path.join(
-                bisse_data_dir,
-                "catalogue.json"
-            ),
-            platform_catalogue,
-            indent=2,
-            ensure_ascii=False
-        )
-        atomic_write_json_file(
-            os.path.join(
-                bisse_data_dir,
-                "segments.geojson"
-            ),
-            geojson,
-            indent=2,
-            ensure_ascii=False
-        )
+        with open(os.path.join(bisse_data_dir, "catalogue.json"), "w", encoding="utf-8") as f:
+            json.dump(platform_catalogue, f, indent=2, ensure_ascii=False)
+
+        with open(os.path.join(bisse_data_dir, "segments.geojson"), "w", encoding="utf-8") as f:
+            json.dump(geojson, f, indent=2, ensure_ascii=False)
 
         return {
             "slug": slug,
             "catalogue": platform_catalogue,
             "geojson": geojson,
             "photos_count": len(exported_photos),
-            "segments_count": len(
-                geojson.get("features", [])
-            ),
-            "index_entry": self.build_bisse_index_entry(
-                slug,
-                platform_catalogue
-            )
+            "segments_count": len(geojson.get("features", [])),
+            "index_entry": self.build_bisse_index_entry(slug, platform_catalogue)
         }
-
 
     def export_for_platform(self):
         if not self.base_folder:
@@ -13687,15 +11292,8 @@ namespace GestionBissesFolderPicker
             result = self.export_current_bisse_to_platform_root(export_root)
             data_root = os.path.join(export_root, "data")
             os.makedirs(data_root, exist_ok=True)
-            atomic_write_json_file(
-                os.path.join(
-                    data_root,
-                    "bisses_index.json"
-                ),
-                [result["index_entry"]],
-                indent=2,
-                ensure_ascii=False
-            )
+            with open(os.path.join(data_root, "bisses_index.json"), "w", encoding="utf-8") as f:
+                json.dump([result["index_entry"]], f, indent=2, ensure_ascii=False)
         except Exception as exc:
             messagebox.showerror("Erreur export", f"Impossible d'exporter pour la plateforme :\n{exc}")
             return
@@ -13715,7 +11313,6 @@ namespace GestionBissesFolderPicker
                 "Vous pouvez copier data/ et media/ dans le dépôt GitHub Pages « Bisses »."
             )
         )
-
 
     def export_publication_collection(self):
         collection = self.read_publication_collection()
@@ -13778,7 +11375,7 @@ namespace GestionBissesFolderPicker
                     continue
 
                 try:
-                    self.configure_paths_for_readonly_export(folder)
+                    self.configure_paths_for_bisse_folder(folder)
                     result = self.export_current_bisse_to_platform_root(export_root)
                     index_entries.append(result["index_entry"])
                     exported += 1
@@ -13800,16 +11397,8 @@ namespace GestionBissesFolderPicker
             self.catalog_container = saved_state["catalog_container"]
 
         index_entries.sort(key=lambda e: (e.get("title", "").lower(), e.get("id", "")))
-        atomic_write_json_file(
-            os.path.join(
-                export_root,
-                "data",
-                "bisses_index.json"
-            ),
-            index_entries,
-            indent=2,
-            ensure_ascii=False
-        )
+        with open(os.path.join(export_root, "data", "bisses_index.json"), "w", encoding="utf-8") as f:
+            json.dump(index_entries, f, indent=2, ensure_ascii=False)
 
         self.last_platform_export_root = export_root
         self.refresh_publication_tree()
@@ -13829,221 +11418,63 @@ namespace GestionBissesFolderPicker
             )
         )
 
-
     def copy_last_export_to_github_repo(self):
-        """
-        Copie data/ et media/ dans le site Bisses configuré.
-
-        V62 : copie transactionnelle. Les nouveaux dossiers sont préparés
-        intégralement avant le remplacement des anciens. En cas d'échec,
-        les anciens dossiers sont restaurés.
-        """
-        export_root = (
-            self.last_platform_export_root
-            or os.path.join(
-                self.get_default_collection_root(),
-                "Export_Platform"
-            )
-        )
-
+        export_root = self.last_platform_export_root or os.path.join(self.get_default_collection_root(), "Export_Platform")
         data_src = os.path.join(export_root, "data")
         media_src = os.path.join(export_root, "media")
 
-        if (
-            not os.path.isdir(data_src)
-            or not os.path.isdir(media_src)
-        ):
+        if not os.path.isdir(data_src) or not os.path.isdir(media_src):
             messagebox.showwarning(
                 "Export absent",
-                (
-                    "Aucun export data/ + media/ complet "
-                    "n'a été trouvé.\n"
-                    "Lancez d'abord un export plateforme."
-                )
+                "Aucun export data/ + media/ complet n'a été trouvé. Lancez d'abord un export plateforme."
             )
             return
 
-        repo = self.get_bisses_site_folder_setting()
-
+        repo = filedialog.askdirectory(
+            title="Choisir le dossier du dépôt GitHub Pages Bisses",
+            initialdir=self.get_default_collection_root()
+        )
         if not repo:
-            self.publication_not_configured_message()
             return
 
-        if not os.path.isdir(repo):
-            messagebox.showerror(
-                "Publication",
+        # Petite vérification non bloquante.
+        looks_like_repo = os.path.exists(os.path.join(repo, "index.html")) or os.path.isdir(os.path.join(repo, ".git"))
+        if not looks_like_repo:
+            if not messagebox.askyesno(
+                "Dossier inhabituel",
                 (
-                    "Le dossier du site Bisses configuré sur "
-                    "cet ordinateur n'est pas accessible :\n\n"
-                    f"{repo}\n\n"
-                    "Corrigez ce chemin dans Paramètres."
+                    "Le dossier choisi ne ressemble pas clairement au dépôt Bisses "
+                    "(pas de index.html ni de .git détecté).\n\nContinuer quand même ?"
                 )
-            )
-            return
-
-        if not self.bisses_site_folder_looks_valid(repo):
-            messagebox.showerror(
-                "Publication",
-                (
-                    "Le dossier configuré ne ressemble plus "
-                    "au site Bisses :\n\n"
-                    f"{repo}\n\n"
-                    "Vérifiez le réglage dans Paramètres."
-                )
-            )
-            return
+            ):
+                return
 
         if not messagebox.askyesno(
-            "Publier dans le site Bisses",
+            "Copier vers Bisses",
             (
-                f"Publier dans :\n{repo}\n\n"
-                "Les dossiers data/ et media/ seront remplacés "
-                "de manière sécurisée.\n"
-                "index.html, assets/ et .nojekyll ne seront pas "
-                "touchés.\n\n"
+                f"Remplacer dans :\n{repo}\n\n"
+                "Les dossiers data/ et media/ seront remplacés.\n"
+                "index.html, assets/ et .nojekyll ne seront pas touchés.\n\n"
                 "Continuer ?"
             )
         ):
             return
 
-        token = uuid.uuid4().hex[:10]
-        names = ("data", "media")
-        stages = {}
-        backups = {}
-        installed = []
+        for name, src in (("data", data_src), ("media", media_src)):
+            dst = os.path.join(repo, name)
+            if os.path.isdir(dst):
+                shutil.rmtree(dst)
+            shutil.copytree(src, dst)
 
-        try:
-            # 1. Préparer les deux nouvelles copies sans toucher au dépôt.
-            for name in names:
-                src = os.path.join(export_root, name)
-                stage = os.path.join(
-                    repo,
-                    f".abisses_publish_stage_{name}_{token}"
-                )
-                backup = os.path.join(
-                    repo,
-                    f".abisses_publish_backup_{name}_{token}"
-                )
-
-                if os.path.exists(stage):
-                    shutil.rmtree(stage)
-                if os.path.exists(backup):
-                    shutil.rmtree(backup)
-
-                shutil.copytree(src, stage)
-
-                if not os.path.isdir(stage):
-                    raise RuntimeError(
-                        f"Copie temporaire incomplète : {name}"
-                    )
-
-                stages[name] = stage
-                backups[name] = backup
-
-            # 2. Basculer rapidement les dossiers après préparation complète.
-            for name in names:
-                dst = os.path.join(repo, name)
-                backup = backups[name]
-                stage = stages[name]
-
-                if os.path.exists(dst):
-                    os.replace(dst, backup)
-
-                try:
-                    os.replace(stage, dst)
-                except Exception:
-                    if (
-                        os.path.exists(backup)
-                        and not os.path.exists(dst)
-                    ):
-                        os.replace(backup, dst)
-                    raise
-
-                installed.append(name)
-
-            # 3. Tout est installé : les sauvegardes temporaires
-            # peuvent disparaître.
-            for name in names:
-                backup = backups[name]
-                if os.path.exists(backup):
-                    shutil.rmtree(backup)
-
-        except Exception as exc:
-            # Restaurer chaque dossier déjà basculé.
-            for name in reversed(installed):
-                dst = os.path.join(repo, name)
-                backup = backups.get(name, "")
-
-                try:
-                    if os.path.exists(dst):
-                        shutil.rmtree(dst)
-                    if backup and os.path.exists(backup):
-                        os.replace(backup, dst)
-                except Exception as rollback_exc:
-                    self.log(
-                        "❌ Restauration publication impossible "
-                        f"pour {name} : {rollback_exc}"
-                    )
-
-            # Restaurer également un backup éventuellement créé avant
-            # l'échec du remplacement du dossier courant.
-            for name in names:
-                dst = os.path.join(repo, name)
-                backup = backups.get(name, "")
-                if (
-                    backup
-                    and os.path.exists(backup)
-                    and not os.path.exists(dst)
-                ):
-                    try:
-                        os.replace(backup, dst)
-                    except Exception:
-                        pass
-
-            messagebox.showerror(
-                "Publication interrompue",
-                (
-                    "La copie vers le site Bisses a échoué.\n\n"
-                    "Abisses a tenté de restaurer les dossiers "
-                    "précédents.\n\n"
-                    f"Détail : {exc}"
-                )
-            )
-            self.log(
-                f"❌ Publication transactionnelle interrompue : {exc}"
-            )
-            return
-
-        finally:
-            for path in list(stages.values()) + list(backups.values()):
-                if path and os.path.exists(path):
-                    try:
-                        shutil.rmtree(path)
-                    except Exception:
-                        pass
-
-        self.log(
-            f"📤 Publication préparée dans le site Bisses : {repo}"
-        )
+        self.log(f"📤 Export copié vers le dépôt Bisses : {repo}")
         messagebox.showinfo(
-            "Publication préparée",
-            (
-                "Les dossiers data/ et media/ ont été remplacés "
-                "dans le site Bisses.\n\n"
-                "Le dépôt peut maintenant être vérifié puis envoyé "
-                "avec GitHub Desktop."
-            )
+            "Copie terminée",
+            "Les dossiers data/ et media/ ont été copiés dans le dépôt GitHub Pages Bisses."
         )
-
-
 
     def show_publication_module(self):
-        if not self.publication_is_configured_on_this_computer():
-            self.publication_not_configured_message()
-            return
-
         self.clear_main_frame()
-        self.status_header.config(text="Publication", fg="#1f618d")
+        self.status_header.config(text="Publication / Export plateforme Bisses", fg="#1f618d")
 
         outer = self.make_scrollable_page(padx=14, pady=12)
 
@@ -14064,13 +11495,13 @@ namespace GestionBissesFolderPicker
 
         tk.Label(
             toolbar,
-            text="🌐 Publication",
+            text="🌐 Publication / export plateforme",
             font=("Arial", 16, "bold")
         ).pack(side="left", padx=14)
 
         tk.Button(
             toolbar,
-            text="📤 Publier le dernier export",
+            text="📤 Copier dernier export vers GitHub Bisses",
             command=self.copy_last_export_to_github_repo,
             bg="#117864",
             fg="white"
@@ -14083,7 +11514,7 @@ namespace GestionBissesFolderPicker
             text=(
                 "Ce module gère l'export statique lu par GitHub Pages. "
                 "Il peut exporter le bisse ouvert ou une collection de plusieurs dossiers bisses, "
-                "puis copier data/ et media/ vers le dossier du site Bisses configuré dans Paramètres."
+                "puis faciliter la copie de data/ et media/ vers le dépôt local “Bisses”."
             ),
             justify="left",
             anchor="w",
@@ -14186,7 +11617,6 @@ namespace GestionBissesFolderPicker
         ).pack(side="left", padx=8)
 
         self.refresh_publication_tree()
-
 
     def show_gpx_sync_selector(self):
         """
@@ -14531,15 +11961,16 @@ namespace GestionBissesFolderPicker
             messagebox.showwarning(
                 "Renommage indisponible",
                 (
-                    "Aucune photo active n’est disponible.\n\n"
-                    "Ouvrez un bisse contenant des photos avant de définir leur ordre."
+                    "Aucune photo active n’est disponible dans le catalogue.\n\n"
+                    "Vous pouvez créer le catalogue photo depuis le tableau de bord "
+                    "ou continuer à travailler dans l’atelier GPX."
                 )
             )
             return
 
         self.stop_rename_map_watch()
         self.clear_main_frame()
-        self.status_header.config(text="Ordre des photos", fg="#8e44ad")
+        self.status_header.config(text="Module Renommer / déterminer l’ordre des photos", fg="#8e44ad")
 
         top = tk.Frame(self.main_frame)
         top.pack(fill="x", pady=(0, 6))
@@ -14563,7 +11994,7 @@ namespace GestionBissesFolderPicker
 
         controls = tk.LabelFrame(
             self.main_frame,
-            text="Ordre et renommage de travail",
+            text="Paramètres de renommage",
             padx=8,
             pady=6
         )
@@ -14600,7 +12031,7 @@ namespace GestionBissesFolderPicker
 
         tk.Button(
             controls,
-            text="✅ Appliquer l’ordre / renommage",
+            text="✅ Appliquer le renommage",
             command=self.apply_rename_plan,
             bg="#8e44ad",
             fg="white"
@@ -14732,7 +12163,6 @@ namespace GestionBissesFolderPicker
             )
         except Exception:
             pass
-
 
     def build_rename_plan(self):
         prefix = self.sanitize_filename_part(self.rename_prefix_var.get())
@@ -15906,7 +13336,7 @@ namespace GestionBissesFolderPicker
                 # Si l’atelier GPX est actuellement ouvert, rafraîchir aussi ses listes.
                 if self.gpx_source_tree:
                     self.refresh_gpx_source_tree()
-                    self.request_gpx_redraw()
+                    self.draw_gpx_workshop_map()
 
                 messagebox.showinfo(
                     "Renommage GPX terminé",
@@ -15950,7 +13380,6 @@ namespace GestionBissesFolderPicker
         self.root.wait_window(dialog)
 
 
-
     # ============================================================
     # ATELIER TRACÉS GPX : ORIENTATION, SEGMENTATION, FUSION,
     # CATÉGORIES LIBRES ET EXPORT
@@ -15966,16 +13395,7 @@ namespace GestionBissesFolderPicker
         workshop.setdefault("sources", [])
         workshop.setdefault("segments", [])
         workshop.setdefault("last_export_at", None)
-
-        # Les anciennes informations de direction ne jouent plus aucun rôle.
-        for source in workshop.get("sources", []):
-            if isinstance(source, dict):
-                source.pop("orientation_defined", None)
-                source.pop("orientation_label", None)
-                source.pop("upstream_endpoint", None)
-
         return workshop
-
 
     def save_gpx_workshop_state(self):
         workshop = self.get_gpx_workshop_state()
@@ -16072,9 +13492,8 @@ namespace GestionBissesFolderPicker
         self.save_gpx_workshop_state()
         self.refresh_gpx_source_tree()
         self.refresh_gpx_segment_tree()
-        self.request_gpx_redraw()
+        self.draw_gpx_workshop_map()
         self.gpx_workshop_status_var.set(f"↶ Annulé : {previous.get('reason') or 'dernière action'}")
-
 
     def redo_gpx_segment_action(self):
         if self.gpx_geometry_edit_active:
@@ -16104,9 +13523,8 @@ namespace GestionBissesFolderPicker
         self.save_gpx_workshop_state()
         self.refresh_gpx_source_tree()
         self.refresh_gpx_segment_tree()
-        self.request_gpx_redraw()
+        self.draw_gpx_workshop_map()
         self.gpx_workshop_status_var.set(f"↷ Rétabli : {future.get('reason') or 'dernière action'}")
-
 
     def parse_gpx_source_file(self, gpx_path):
         with open(gpx_path, "r", encoding="utf-8") as f:
@@ -16116,9 +13534,8 @@ namespace GestionBissesFolderPicker
         if not parts:
             raise ValueError("Le GPX ne contient aucun tracé exploitable.")
 
-        branch_order = len(
-            self.get_gpx_workshop_state().get("sources", [])
-        ) + 1
+        existing_sources = self.get_gpx_workshop_state().get("sources", [])
+        branch_order = len(existing_sources) + 1
 
         return {
             "id": uuid.uuid4().hex,
@@ -16127,10 +13544,12 @@ namespace GestionBissesFolderPicker
             "source_relative_path": self.relative_to_base(gpx_path),
             "imported_at": datetime.now().isoformat(timespec="seconds"),
             "parts": parts,
+            "orientation_defined": False,
+            "orientation_label": "À définir",
+            "upstream_endpoint": None,
             "branch_order": branch_order,
             "visible": True
         }
-
 
     def show_gpx_workshop(self):
         try:
@@ -16145,7 +13564,7 @@ namespace GestionBissesFolderPicker
         self.gpx_workshop_active = True
         self.reset_gpx_geometry_edit_session(redraw=False)
         self.status_header.config(
-            text="Cartographie · segmentation · classement · export",
+            text="Atelier Tracés GPX · orientation · segmentation · classement · export",
             fg="#d35400"
         )
 
@@ -16243,20 +13662,14 @@ namespace GestionBissesFolderPicker
         self.refresh_gpx_category_tree()
         self.refresh_gpx_category_combo()
         self.update_gpx_geometry_edit_entry_visibility()
-        self.request_gpx_redraw(
-            reason="ouverture Cartographie",
-            immediate=True
-        )
+        self.draw_gpx_workshop_map()
         self.fit_gpx_workshop_map_to_content()
         self.start_photo_layer_watch("gpx")
 
         self.gpx_workshop_status_var.set(
             "Importez les GPX sources, préparez les segments, puis utilisez les photos visibles ou discrètes comme repères de terrain."
         )
-        self.log("🗺️ Cartographie ouverte.")
-
-
-
+        self.log("🧭 Atelier Tracés GPX ouvert.")
 
     def build_gpx_workshop_map_panel(self, parent):
         top = tk.Frame(parent, bg="#eeeeee")
@@ -16295,7 +13708,8 @@ namespace GestionBissesFolderPicker
             fg="#555555"
         ).pack(fill="x", padx=8, pady=(0, 4))
 
-        # Barre contextuelle commune à la correction et à la création.
+        # Barre v52b entièrement contextuelle : le même emplacement sert à la
+        # correction, à la création et au choix final du sens A/B.
         self.gpx_geometry_edit_toolbar = tk.Frame(
             parent,
             bg="#fff3cd",
@@ -16356,6 +13770,34 @@ namespace GestionBissesFolderPicker
         )
         self.gpx_geometry_restore_button.pack(side="left", padx=2)
 
+        self.gpx_geometry_orientation_frame = tk.Frame(
+            self.gpx_geometry_edit_toolbar,
+            bg="#fff3cd"
+        )
+        tk.Label(
+            self.gpx_geometry_orientation_frame,
+            text="Quel point est en amont ?",
+            bg="#fff3cd",
+            fg="#6b4f00"
+        ).pack(side="left", padx=(0, 4))
+        tk.Button(
+            self.gpx_geometry_orientation_frame,
+            text="A",
+            width=4,
+            command=lambda: self.finish_gpx_segment_creation("A")
+        ).pack(side="left", padx=2)
+        tk.Button(
+            self.gpx_geometry_orientation_frame,
+            text="B",
+            width=4,
+            command=lambda: self.finish_gpx_segment_creation("B")
+        ).pack(side="left", padx=2)
+        tk.Button(
+            self.gpx_geometry_orientation_frame,
+            text="Retour au dessin",
+            command=self.return_to_gpx_segment_creation_drawing
+        ).pack(side="left", padx=(6, 2))
+
         self.gpx_geometry_quit_button = tk.Button(
             self.gpx_geometry_edit_toolbar,
             text="✕ Quitter",
@@ -16398,7 +13840,6 @@ namespace GestionBissesFolderPicker
         self.gpx_editor_map.add_left_click_map_command(self.handle_gpx_workshop_map_click)
 
         self.build_gpx_integrated_photo_viewer(self.gpx_photo_integrated_frame)
-
 
     def build_gpx_integrated_photo_viewer(self, parent):
         top = tk.Frame(parent, bg="#20252b", padx=8, pady=7)
@@ -16563,7 +14004,7 @@ namespace GestionBissesFolderPicker
             text=(
                 "Zone d’import des GPX sources. Chaque fichier importé devient une branche de travail. "
                 "Vous pouvez retirer une branche de l’atelier sans supprimer le fichier GPX du disque. "
-                "L’ordre géométrique du GPX est conservé tel quel."
+                "Définissez ensuite le sens amont → aval avant de préparer les segments."
             ),
             justify="left",
             anchor="w",
@@ -16571,7 +14012,7 @@ namespace GestionBissesFolderPicker
             fg="#555555"
         ).pack(fill="x", pady=(0, 6))
 
-        columns = ("visible", "ordre", "branche")
+        columns = ("visible", "ordre", "branche", "sens")
         self.gpx_source_tree = ttk.Treeview(
             parent,
             columns=columns,
@@ -16582,9 +14023,11 @@ namespace GestionBissesFolderPicker
         self.gpx_source_tree.heading("visible", text="👁")
         self.gpx_source_tree.heading("ordre", text="Ordre")
         self.gpx_source_tree.heading("branche", text="Branche / GPX")
+        self.gpx_source_tree.heading("sens", text="Sens")
         self.gpx_source_tree.column("visible", width=42, anchor="center")
         self.gpx_source_tree.column("ordre", width=55, anchor="center")
-        self.gpx_source_tree.column("branche", width=350)
+        self.gpx_source_tree.column("branche", width=230)
+        self.gpx_source_tree.column("sens", width=120)
         self.gpx_source_tree.pack(fill="x", pady=(0, 6))
         self.gpx_source_tree.bind("<<TreeviewSelect>>", self.on_gpx_source_selected)
         self.gpx_source_tree.bind("<Button-1>", self.on_gpx_source_tree_click)
@@ -16617,19 +14060,34 @@ namespace GestionBissesFolderPicker
             command=self.import_bisse_traces_from_gpx_folder
         ).pack(side="left", fill="x", expand=True, padx=(4, 0))
 
-        prep_row = tk.Frame(prep_frame)
-        prep_row.pack(fill="x", pady=3)
+        gpx_prep_row = tk.Frame(prep_frame)
+        gpx_prep_row.pack(fill="x", pady=3)
 
         tk.Button(
-            prep_row,
+            gpx_prep_row,
             text="✏️ Renommer les GPX du dossier",
             command=self.show_gpx_rename_dialog
         ).pack(side="left", fill="x", expand=True, padx=(0, 4))
 
         tk.Button(
-            prep_row,
+            gpx_prep_row,
             text="🗑️ Retirer la branche sélectionnée",
             command=self.remove_selected_gpx_source_from_workshop
+        ).pack(side="left", fill="x", expand=True, padx=(4, 0))
+
+        orientation_row = tk.Frame(parent)
+        orientation_row.pack(fill="x", pady=4)
+
+        tk.Button(
+            orientation_row,
+            text="A = amont",
+            command=lambda: self.set_selected_source_orientation("A")
+        ).pack(side="left", fill="x", expand=True, padx=(0, 4))
+
+        tk.Button(
+            orientation_row,
+            text="B = amont",
+            command=lambda: self.set_selected_source_orientation("B")
         ).pack(side="left", fill="x", expand=True, padx=(4, 0))
 
         order_row = tk.Frame(parent)
@@ -16656,6 +14114,16 @@ namespace GestionBissesFolderPicker
             command=self.show_all_gpx_sources
         ).pack(fill="x")
 
+        endpoint_row = tk.Frame(parent)
+        endpoint_row.pack(fill="x", pady=4)
+
+        self.gpx_endpoint_toggle_button = tk.Button(
+            endpoint_row,
+            text="🙈 Masquer les repères A / B",
+            command=self.toggle_gpx_endpoint_markers
+        )
+        self.gpx_endpoint_toggle_button.pack(fill="x")
+
         tk.Button(
             parent,
             text="✂️ Créer / recréer les segments depuis les branches importées",
@@ -16664,7 +14132,6 @@ namespace GestionBissesFolderPicker
             fg="white",
             height=2
         ).pack(fill="x", pady=(10, 4))
-
 
     def build_gpx_segments_tab(self, parent):
         tk.Label(
@@ -17228,29 +14695,25 @@ namespace GestionBissesFolderPicker
 
         self.save_gpx_workshop_state()
         self.refresh_gpx_source_tree()
-        self.request_gpx_redraw()
+        self.draw_gpx_workshop_map()
         self.fit_gpx_workshop_map_to_content()
 
         self.gpx_workshop_status_var.set(
             f"Import terminé : {imported} source(s), {skipped} déjà présente(s), {errors} erreur(s)."
         )
 
-
     def refresh_gpx_source_tree(self):
         if not self.gpx_source_tree:
             return
 
         self.gpx_source_tree.delete(*self.gpx_source_tree.get_children())
-
         sources = sorted(
             self.get_gpx_workshop_state().get("sources", []),
-            key=lambda source: (
-                source.get("branch_order", 10**9),
-                source.get("source_filename", "").lower()
-            )
+            key=lambda s: (s.get("branch_order", 10**9), s.get("source_filename", "").lower())
         )
 
         for source in sources:
+            sens = source.get("orientation_label", "À définir")
             self.gpx_source_tree.insert(
                 "",
                 "end",
@@ -17258,10 +14721,10 @@ namespace GestionBissesFolderPicker
                 values=(
                     "👁" if source.get("visible", True) else "🙈",
                     source.get("branch_order", ""),
-                    source.get("source_filename", "")
+                    source.get("source_filename", ""),
+                    sens
                 )
             )
-
 
     def refresh_gpx_segment_tree(self):
         if not self.gpx_segment_tree:
@@ -17420,7 +14883,7 @@ namespace GestionBissesFolderPicker
         self.refresh_gpx_segment_tree()
         if self.gpx_segment_tree:
             self.gpx_segment_tree.selection_set(ids)
-        self.request_gpx_redraw()
+        self.draw_gpx_workshop_map()
 
         if mode == "bicolor":
             self.gpx_workshop_status_var.set(
@@ -17428,7 +14891,6 @@ namespace GestionBissesFolderPicker
             )
         else:
             self.gpx_workshop_status_var.set(f"{changed} segment(s) repassé(s) en couleur simple.")
-
 
     def reset_selected_segments_to_single_color(self):
         self.gpx_display_mode_var.set("single")
@@ -17460,20 +14922,17 @@ namespace GestionBissesFolderPicker
         if not selection:
             self.gpx_workshop_selected_source_id = None
             self.gpx_workshop_selected_source_var.set("Aucune branche sélectionnée")
-            self.request_gpx_redraw(reason="sélection source")
+            self.draw_gpx_workshop_map()
             return
 
         source_id = selection[0]
         self.gpx_workshop_selected_source_id = source_id
         source = self.find_gpx_source(source_id)
-
         if source:
             self.gpx_workshop_selected_source_var.set(
-                f"Branche sélectionnée : {source.get('source_filename')}"
+                f"Branche sélectionnée : {source.get('source_filename')} · sens : {source.get('orientation_label', 'À définir')}"
             )
-
-        self.request_gpx_redraw(reason="sélection source")
-
+        self.draw_gpx_workshop_map()
 
     def on_gpx_segment_selected(self, _event=None):
         ids = self.get_selected_gpx_segment_ids()
@@ -17513,8 +14972,7 @@ namespace GestionBissesFolderPicker
         else:
             self.gpx_workshop_selected_segment_var.set(f"{len(ids)} segments sélectionnés")
         self.update_gpx_geometry_edit_entry_visibility()
-        self.request_gpx_redraw()
-
+        self.draw_gpx_workshop_map()
 
     def find_gpx_source(self, source_id):
         for source in self.get_gpx_workshop_state().get("sources", []):
@@ -17633,7 +15091,7 @@ namespace GestionBissesFolderPicker
         self.save_gpx_workshop_state()
         self.refresh_gpx_source_tree()
         self.refresh_gpx_segment_tree()
-        self.request_gpx_redraw()
+        self.draw_gpx_workshop_map()
 
         if dependent_segments:
             self.gpx_workshop_status_var.set(
@@ -17644,7 +15102,6 @@ namespace GestionBissesFolderPicker
             self.gpx_workshop_status_var.set(f"Branche retirée de l’atelier : {source_name}.")
 
         self.log(f"🗑️ Branche GPX retirée de l’atelier : {source_name}")
-
 
     def on_gpx_source_tree_click(self, event):
         if not self.gpx_source_tree:
@@ -17665,12 +15122,11 @@ namespace GestionBissesFolderPicker
                     self.gpx_source_tree.selection_set(item_id)
                 except Exception:
                     pass
-                self.request_gpx_redraw()
+                self.draw_gpx_workshop_map()
                 self.gpx_workshop_status_var.set(
                     f"Branche {'affichée' if source.get('visible', True) else 'masquée'} : {source.get('source_filename', '')}"
                 )
             return "break"
-
 
     def on_gpx_segment_tree_click(self, event):
         if not self.gpx_segment_tree:
@@ -17707,9 +15163,8 @@ namespace GestionBissesFolderPicker
                         self.gpx_segment_tree.selection_add(sid)
                 except Exception:
                     pass
-                self.request_gpx_redraw()
+                self.draw_gpx_workshop_map()
             return "break"
-
 
     def toggle_selected_gpx_source_visibility(self):
         if not self.gpx_source_tree:
@@ -17727,17 +15182,15 @@ namespace GestionBissesFolderPicker
         self.save_gpx_workshop_state()
         self.refresh_gpx_source_tree()
         self.gpx_source_tree.selection_set(source.get("id"))
-        self.request_gpx_redraw()
-
+        self.draw_gpx_workshop_map()
 
     def show_all_gpx_sources(self):
         for source in self.get_gpx_workshop_state().get("sources", []):
             source["visible"] = True
         self.save_gpx_workshop_state()
         self.refresh_gpx_source_tree()
-        self.request_gpx_redraw()
+        self.draw_gpx_workshop_map()
         self.gpx_workshop_status_var.set("Toutes les branches sont réaffichées.")
-
 
     def toggle_selected_gpx_segments_visibility(self):
         ids = self.get_selected_gpx_segment_ids()
@@ -17764,20 +15217,18 @@ namespace GestionBissesFolderPicker
                     self.gpx_segment_tree.selection_add(sid)
                 except Exception:
                     pass
-        self.request_gpx_redraw()
+        self.draw_gpx_workshop_map()
         self.gpx_workshop_status_var.set(
             "Segments sélectionnés réaffichés." if new_visible else "Segments sélectionnés masqués."
         )
-
 
     def show_all_gpx_segments(self):
         for segment in self.get_gpx_workshop_state().get("segments", []):
             segment["visible"] = True
         self.save_gpx_workshop_state()
         self.refresh_gpx_segment_tree()
-        self.request_gpx_redraw()
+        self.draw_gpx_workshop_map()
         self.gpx_workshop_status_var.set("Tous les segments sont réaffichés.")
-
 
     def isolate_selected_gpx_segments(self):
         ids = set(self.get_selected_gpx_segment_ids())
@@ -17796,9 +15247,8 @@ namespace GestionBissesFolderPicker
                     self.gpx_segment_tree.selection_add(sid)
                 except Exception:
                     pass
-        self.request_gpx_redraw()
+        self.draw_gpx_workshop_map()
         self.gpx_workshop_status_var.set("Sélection isolée sur la carte. Utilisez « Tout réafficher » pour revenir.")
-
 
     def fit_selected_gpx_segments(self):
         ids = set(self.get_selected_gpx_segment_ids())
@@ -17837,7 +15287,66 @@ namespace GestionBissesFolderPicker
 
         self.gpx_workshop_status_var.set("🎯 Sélection cadrée.")
 
+    def source_endpoint_positions(self, source):
+        parts = source.get("parts", [])
+        valid_parts = [part for part in parts if len(part) >= 2]
+        if not valid_parts:
+            return None, None
+        first = valid_parts[0][0]
+        last = valid_parts[-1][-1]
+        return (float(first[0]), float(first[1])), (float(last[0]), float(last[1]))
 
+    def set_selected_source_orientation(self, upstream_endpoint):
+        if self.gpx_geometry_edit_active:
+            self.gpx_workshop_status_var.set(
+                "Terminez ou quittez le mode géométrique avant de modifier le sens d’une branche."
+            )
+            return
+        source = self.find_gpx_source(self.gpx_workshop_selected_source_id)
+        if not source:
+            messagebox.showwarning("Aucune branche", "Sélectionnez d'abord une branche GPX.")
+            return
+
+        if upstream_endpoint not in ("A", "B"):
+            return
+
+        if self.get_gpx_workshop_state().get("segments"):
+            if not messagebox.askyesno(
+                "Segments déjà préparés",
+                (
+                    "Des segments existent déjà.\n\n"
+                    "Changer le sens de cette branche ne recalculera pas automatiquement les segments existants. "
+                    "Pour repartir proprement, utilisez ensuite « Préparer les segments depuis les branches orientées ».\n\n"
+                    "Continuer ?"
+                )
+            ):
+                return
+
+        if upstream_endpoint == "B":
+            reversed_parts = []
+            for part in reversed(source.get("parts", [])):
+                reversed_parts.append(list(reversed(part)))
+            source["parts"] = reversed_parts
+            source["orientation_label"] = "B = amont"
+            source["upstream_endpoint"] = "B"
+        else:
+            source["orientation_label"] = "A = amont"
+            source["upstream_endpoint"] = "A"
+
+        source["orientation_defined"] = True
+        # Une fois le sens déterminé, les repères A/B peuvent disparaître
+        # pour ne pas encombrer la carte. L'utilisateur peut les réafficher
+        # avec la case dédiée s'il veut contrôler une autre branche.
+        self.gpx_workshop_show_endpoints_var.set(False)
+
+        self.save_gpx_workshop_state()
+        self.refresh_gpx_source_tree()
+        if self.gpx_source_tree:
+            self.gpx_source_tree.selection_set(source.get("id"))
+        self.draw_gpx_workshop_map()
+        self.gpx_workshop_status_var.set(
+            f"Sens amont → aval défini pour {source.get('source_filename')} : {source.get('orientation_label')}."
+        )
 
     def move_selected_source_order(self, delta):
         if self.gpx_geometry_edit_active:
@@ -17902,11 +15411,10 @@ namespace GestionBissesFolderPicker
         self.refresh_gpx_source_tree()
         self.refresh_gpx_segment_tree()
         self.gpx_source_tree.selection_set(source.get("id"))
-        self.request_gpx_redraw()
+        self.draw_gpx_workshop_map()
         self.gpx_workshop_status_var.set(
             "Ordre des branches modifié. Cet ordre sert de référence pour la numérotation d’export entre branches."
         )
-
 
     def prepare_workshop_segments_from_sources(self):
         if self.gpx_geometry_edit_active:
@@ -17914,17 +15422,25 @@ namespace GestionBissesFolderPicker
                 "Terminez ou quittez la correction avant de recréer les segments."
             )
             return
-
         workshop = self.get_gpx_workshop_state()
         sources = sorted(
             workshop.get("sources", []),
-            key=lambda source: source.get("branch_order", 10**9)
+            key=lambda s: s.get("branch_order", 10**9)
         )
 
         if not sources:
+            messagebox.showwarning("Aucune branche", "Importez d'abord un ou plusieurs GPX sources.")
+            return
+
+        unoriented = [s for s in sources if not s.get("orientation_defined")]
+        if unoriented:
+            names = "\n".join(f"• {s.get('source_filename')}" for s in unoriented[:8])
             messagebox.showwarning(
-                "Aucune branche",
-                "Importez d'abord un ou plusieurs GPX sources."
+                "Sens à définir",
+                (
+                    "Définissez d'abord manuellement le sens amont → aval des branches suivantes :\n\n"
+                    f"{names}"
+                )
             )
             return
 
@@ -17933,14 +15449,13 @@ namespace GestionBissesFolderPicker
                 "Recréer les segments ?",
                 (
                     "Des segments existent déjà dans l’atelier.\n\n"
-                    "Les recréer depuis les branches importées effacera les coupes et fusions actuelles.\n\n"
+                    "Les recréer depuis les branches orientées effacera les coupes et fusions actuelles.\n\n"
                     "Continuer ?"
                 )
             ):
                 return
 
         segments = []
-
         for source in sources:
             for part_order, points in enumerate(source.get("parts", [])):
                 if len(points) < 2:
@@ -17968,14 +15483,11 @@ namespace GestionBissesFolderPicker
         workshop["segments"] = segments
         self.save_gpx_workshop_state()
         self.refresh_gpx_segment_tree()
-        self.request_gpx_redraw(reason="préparation segments")
+        self.draw_gpx_workshop_map()
         self.fit_gpx_workshop_map_to_content()
-
         self.gpx_workshop_status_var.set(
-            f"{len(segments)} segment(s) initial(aux) préparé(s). "
-            "Découpez, classez et fusionnez ensuite."
+            f"{len(segments)} segment(s) initial(aux) préparé(s). Découpez, classez et fusionnez ensuite."
         )
-
 
     def gpx_part_sort_key(self, part):
         return (
@@ -18038,10 +15550,84 @@ namespace GestionBissesFolderPicker
 
         self.clear_gpx_editor_photo_markers()
 
+    def get_gpx_endpoint_icon(self, label):
+        """
+        Crée une pastille A/B lisible : la lettre est dans la bulle,
+        pas affichée au-dessus du marqueur standard.
+        """
+        label = str(label).upper()
+        cache_key = label
+        if cache_key in self.gpx_endpoint_icon_cache:
+            return self.gpx_endpoint_icon_cache[cache_key]
+
+        size = 34
+        image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+
+        fill = "#f39c12" if label == "A" else "#8e44ad"
+        edge = "#7f4f00" if label == "A" else "#4a235a"
+
+        draw.ellipse((1, 1, size - 2, size - 2), fill="#ffffff", outline="#ffffff")
+        draw.ellipse((3, 3, size - 4, size - 4), fill=fill, outline=edge, width=2)
+
+        try:
+            font = ImageFont.truetype("arialbd.ttf", 15)
+        except Exception:
+            try:
+                font = ImageFont.truetype("arial.ttf", 15)
+            except Exception:
+                font = ImageFont.load_default()
+
+        bbox = draw.textbbox((0, 0), label, font=font)
+        text_w = bbox[2] - bbox[0]
+        text_h = bbox[3] - bbox[1]
+        text_x = (size - text_w) / 2
+        text_y = (size - text_h) / 2 - 1
+        draw.text((text_x, text_y), label, fill="#ffffff", font=font)
+
+        icon = ImageTk.PhotoImage(image)
+        self.gpx_endpoint_icon_cache[cache_key] = icon
+        return icon
+
+    def update_gpx_endpoint_toggle_button(self):
+        if not self.gpx_endpoint_toggle_button:
+            return
+
+        if self.gpx_workshop_show_endpoints_var.get():
+            self.gpx_endpoint_toggle_button.config(text="🙈 Masquer les repères A / B")
+        else:
+            self.gpx_endpoint_toggle_button.config(text="👁 Afficher les repères A / B")
+
+    def toggle_gpx_endpoint_markers(self):
+        self.gpx_workshop_show_endpoints_var.set(
+            not self.gpx_workshop_show_endpoints_var.get()
+        )
+        self.update_gpx_endpoint_toggle_button()
+        self.draw_gpx_workshop_map()
+        self.gpx_workshop_status_var.set(
+            "Repères A / B affichés."
+            if self.gpx_workshop_show_endpoints_var.get()
+            else "Repères A / B masqués."
+        )
 
 
+    def add_gpx_endpoint_marker(self, lat, lon, label):
+        if not self.gpx_editor_map:
+            return
 
+        try:
+            icon = self.get_gpx_endpoint_icon(label)
+            marker = self.gpx_editor_map.set_marker(
+                lat,
+                lon,
+                icon=icon,
+                icon_anchor="center"
+            )
+        except TypeError:
+            # Repli si une ancienne version de tkintermapview ne supporte pas icon.
+            marker = self.gpx_editor_map.set_marker(lat, lon, text=str(label))
 
+        self.gpx_editor_markers.append(marker)
 
     def is_gpx_source_visible(self, source_id):
         """
@@ -18252,6 +15838,7 @@ namespace GestionBissesFolderPicker
                 segment for segment in segments
                 if segment.get("visible", True)
             ]
+
             normal_segments = [
                 segment for segment in visible_segments
                 if segment.get("id") not in selected_segment_ids
@@ -18261,23 +15848,23 @@ namespace GestionBissesFolderPicker
                 if segment.get("id") in selected_segment_ids
             ]
 
+            # Les segments sélectionnés sont dessinés en dernier, donc au-dessus
+            # des autres sans changer leur couleur de catégorie.
             for segment in normal_segments + selected_segments:
                 selected = segment.get("id") in selected_segment_ids
                 displayed_segment = segment
-
                 if self.gpx_geometry_edit_active:
-                    displayed_segment = self.preview_gpx_geometry_segment(segment)
-
+                    displayed_segment = self.preview_gpx_geometry_segment(
+                        segment
+                    )
                 for part in displayed_segment.get("parts", []):
                     self.draw_gpx_segment_part_on_editor_map(
                         displayed_segment,
                         part,
                         selected=selected
                     )
-
         else:
             selected_source_id = self.gpx_workshop_selected_source_id
-
             for source in workshop.get("sources", []):
                 if not source.get("visible", True):
                     continue
@@ -18293,16 +15880,12 @@ namespace GestionBissesFolderPicker
                         for point in part
                         if point and len(point) >= 2
                     ]
-
                     if len(positions) < 2:
                         continue
 
                     positions = self.thin_positions_for_display(positions)
 
-                    for layer_color, width in (
-                        ("#ffffff", halo_width),
-                        (line_color, core_width)
-                    ):
+                    for layer_color, width in (("#ffffff", halo_width), (line_color, core_width)):
                         path = self.gpx_editor_map.set_path(
                             positions,
                             color=layer_color,
@@ -18310,17 +15893,26 @@ namespace GestionBissesFolderPicker
                         )
                         self.gpx_editor_paths.append(path)
 
+            source = self.find_gpx_source(selected_source_id)
+            if source and source.get("visible", True) and self.gpx_workshop_show_endpoints_var.get():
+                endpoint_a, endpoint_b = self.source_endpoint_positions(source)
+                if endpoint_a:
+                    self.add_gpx_endpoint_marker(endpoint_a[0], endpoint_a[1], "A")
+                if endpoint_b:
+                    self.add_gpx_endpoint_marker(endpoint_b[0], endpoint_b[1], "B")
+
         if (
             self.gpx_geometry_edit_active
             and self.gpx_geometry_edit_kind == "create"
         ):
             draft_segment = {
+                # Aucun identifiant volontairement : la ligne provisoire reste
+                # purement visuelle et ne reçoit aucun callback direct.
                 "id": None,
                 "category_id": "non_classe",
                 "visible": True,
                 "parts": copy.deepcopy(self.gpx_geometry_edit_draft_parts)
             }
-
             for part in draft_segment["parts"]:
                 self.draw_gpx_segment_part_on_editor_map(
                     draft_segment,
@@ -18328,99 +15920,31 @@ namespace GestionBissesFolderPicker
                     selected=True
                 )
 
-        if self.gpx_geometry_edit_active:
+            if self.gpx_geometry_creation_phase == "orientation":
+                points = self.gpx_geometry_creation_points()
+                if len(points) >= 2:
+                    self.add_gpx_endpoint_marker(
+                        float(points[0][0]),
+                        float(points[0][1]),
+                        "A"
+                    )
+                    self.add_gpx_endpoint_marker(
+                        float(points[-1][0]),
+                        float(points[-1][1]),
+                        "B"
+                    )
+
+        if (
+            self.gpx_geometry_edit_active
+            and self.gpx_geometry_creation_phase != "orientation"
+        ):
             self.draw_gpx_geometry_control_points()
 
+        self.update_gpx_endpoint_toggle_button()
+
+        # Synchronisation stricte de la case « Afficher les photos » après
+        # toute modification qui redessine la carte.
         self.sync_gpx_workshop_photo_markers()
-
-
-    def cancel_gpx_redraw_request(self):
-        after_id = getattr(self, "gpx_redraw_after_id", None)
-
-        if after_id:
-            try:
-                self.root.after_cancel(after_id)
-            except Exception:
-                pass
-
-        self.gpx_redraw_after_id = None
-        self.gpx_redraw_pending_reasons.clear()
-
-    def request_gpx_redraw(self, reason="", immediate=False):
-        """Fusionne les demandes rapprochées en un seul redessin Cartographie."""
-        if reason:
-            self.gpx_redraw_pending_reasons.add(str(reason))
-
-        if not self.gpx_editor_map:
-            return
-
-        if immediate:
-            self.cancel_gpx_redraw_request()
-
-            if self.gpx_redraw_in_progress:
-                return
-
-            self.gpx_redraw_in_progress = True
-
-            try:
-                self.draw_gpx_workshop_map()
-            finally:
-                self.gpx_redraw_in_progress = False
-
-            return
-
-        if self.gpx_redraw_after_id:
-            return
-
-        try:
-            self.gpx_redraw_after_id = self.root.after_idle(
-                self.flush_gpx_redraw_request
-            )
-        except Exception:
-            self.gpx_redraw_after_id = None
-
-            if not self.gpx_redraw_in_progress:
-                self.gpx_redraw_in_progress = True
-
-                try:
-                    self.draw_gpx_workshop_map()
-                finally:
-                    self.gpx_redraw_in_progress = False
-
-    def flush_gpx_redraw_request(self):
-        self.gpx_redraw_after_id = None
-
-        if not self.gpx_editor_map:
-            self.gpx_redraw_pending_reasons.clear()
-            return
-
-        if self.gpx_redraw_in_progress:
-            self.request_gpx_redraw(reason="redraw différé")
-            return
-
-        self.gpx_redraw_pending_reasons.clear()
-        self.gpx_redraw_in_progress = True
-
-        try:
-            self.draw_gpx_workshop_map()
-        finally:
-            self.gpx_redraw_in_progress = False
-
-    def refresh_gpx_geometry_control_points_for_view(self):
-        """
-        Au déplacement/zoom de la carte, seuls les points de contrôle visibles
-        sont recalculés. Les tracés complets ne sont pas reconstruits.
-        """
-        if (
-            not self.gpx_geometry_edit_active
-            or not self.gpx_editor_map
-        ):
-            return
-
-        self.clear_gpx_geometry_control_markers()
-        self.draw_gpx_geometry_control_points()
-
-
 
     def select_gpx_segment_by_id(self, segment_id):
         if self.gpx_geometry_edit_active:
@@ -18712,40 +16236,61 @@ namespace GestionBissesFolderPicker
         return None
 
     def handle_global_undo_key(self, _event=None):
+        """
+        Raccourci contextuel et non intrusif :
+        - les champs texte conservent leur propre Ctrl+Z ;
+        - la correction géométrique utilise son historique local ;
+        - l'atelier GPX normal utilise l'historique des segments.
+        """
         if self.focus_is_text_editor():
             return None
 
         if self.gpx_geometry_edit_active:
+            if (
+                self.gpx_geometry_edit_kind == "create"
+                and self.gpx_geometry_creation_phase == "orientation"
+            ):
+                self.gpx_workshop_status_var.set(
+                    "Utilisez « Retour au dessin » avant d’annuler un point."
+                )
+                return "break"
             self.undo_gpx_geometry_edit()
             return "break"
 
         if self.gpx_workshop_active:
             if self.gpx_workshop_click_mode == "cut":
                 self.cancel_gpx_cut_mode(silent=True)
-
             self.undo_gpx_segment_action()
             return "break"
 
         return None
 
-
     def handle_global_redo_key(self, _event=None):
+        """
+        Ctrl+Y (et Ctrl+Maj+Z) suit le même routage que Ctrl+Z.
+        """
         if self.focus_is_text_editor():
             return None
 
         if self.gpx_geometry_edit_active:
+            if (
+                self.gpx_geometry_edit_kind == "create"
+                and self.gpx_geometry_creation_phase == "orientation"
+            ):
+                self.gpx_workshop_status_var.set(
+                    "Utilisez « Retour au dessin » avant de rétablir un point."
+                )
+                return "break"
             self.redo_gpx_geometry_edit()
             return "break"
 
         if self.gpx_workshop_active:
             if self.gpx_workshop_click_mode == "cut":
                 self.cancel_gpx_cut_mode(silent=True)
-
             self.redo_gpx_segment_action()
             return "break"
 
         return None
-
 
     def handle_global_escape_key(self, _event=None):
         if self.gpx_geometry_edit_active:
@@ -18861,26 +16406,44 @@ namespace GestionBissesFolderPicker
                 pass
 
     def show_gpx_geometry_drawing_controls(self):
+        if self.gpx_geometry_orientation_frame:
+            try:
+                self.gpx_geometry_orientation_frame.pack_forget()
+            except Exception:
+                pass
         if self.gpx_geometry_tools_frame:
             try:
                 if not self.gpx_geometry_tools_frame.winfo_manager():
                     self.gpx_geometry_tools_frame.pack(side="left")
             except Exception:
                 pass
-
         if self.gpx_geometry_save_button:
             try:
                 if not self.gpx_geometry_save_button.winfo_manager():
                     options = {"side": "right", "padx": 2}
-
                     if self.gpx_geometry_quit_button:
                         options["before"] = self.gpx_geometry_quit_button
-
                     self.gpx_geometry_save_button.pack(**options)
             except Exception:
                 pass
 
-
+    def show_gpx_geometry_orientation_controls(self):
+        if self.gpx_geometry_tools_frame:
+            try:
+                self.gpx_geometry_tools_frame.pack_forget()
+            except Exception:
+                pass
+        if self.gpx_geometry_save_button:
+            try:
+                self.gpx_geometry_save_button.pack_forget()
+            except Exception:
+                pass
+        if self.gpx_geometry_orientation_frame:
+            try:
+                if not self.gpx_geometry_orientation_frame.winfo_manager():
+                    self.gpx_geometry_orientation_frame.pack(side="left")
+            except Exception:
+                pass
 
     def gpx_geometry_creation_points(self, parts=None):
         source_parts = (
@@ -18914,6 +16477,7 @@ namespace GestionBissesFolderPicker
         self.gpx_geometry_edit_kind = "create"
         self.gpx_geometry_edit_segment_id = None
         self.gpx_geometry_create_anchor_segment_id = anchor_id
+        self.gpx_geometry_creation_phase = "drawing"
         self.gpx_geometry_creation_snap_count = 0
         self.gpx_geometry_edit_draft_parts = [draft_part]
         self.gpx_geometry_edit_session_original_parts = [
@@ -18956,7 +16520,7 @@ namespace GestionBissesFolderPicker
         self.update_gpx_geometry_edit_entry_visibility()
         self.update_gpx_geometry_dirty_indicator()
         self.start_gpx_geometry_edit_view_watch()
-        self.request_gpx_redraw()
+        self.draw_gpx_workshop_map()
         anchor_note = (
             " · la nouvelle branche sera placée après le segment sélectionné"
             if anchor_id
@@ -18966,8 +16530,6 @@ namespace GestionBissesFolderPicker
             "Création active · cliquez de point en point pour dessiner "
             f"le segment{anchor_note} · Ctrl+Z / Ctrl+Y."
         )
-
-
 
     def cancel_gpx_segment_creation(self):
         if (
@@ -18988,7 +16550,10 @@ namespace GestionBissesFolderPicker
         return True
 
     def handle_gpx_segment_creation_add_click(self, coords):
-        if self.gpx_geometry_edit_kind != "create":
+        if (
+            self.gpx_geometry_edit_kind != "create"
+            or self.gpx_geometry_creation_phase != "drawing"
+        ):
             return
 
         points = self.gpx_geometry_creation_points()
@@ -19026,7 +16591,7 @@ namespace GestionBissesFolderPicker
         self.gpx_geometry_edit_selected_point = None
         self.gpx_geometry_edit_dirty = True
         self.update_gpx_geometry_dirty_indicator()
-        self.request_gpx_redraw()
+        self.draw_gpx_workshop_map()
         action = (
             "inséré dans le tracé"
             if insert_index < len(points) - 1
@@ -19035,8 +16600,6 @@ namespace GestionBissesFolderPicker
         self.gpx_workshop_status_var.set(
             f"Point {action} · création non enregistrée."
         )
-
-
 
     def snapped_gpx_creation_parts(self, tolerance_m=2.0):
         parts = copy.deepcopy(self.gpx_geometry_edit_draft_parts)
@@ -19070,7 +16633,67 @@ namespace GestionBissesFolderPicker
 
         return parts, snapped
 
+    def begin_gpx_segment_creation_orientation(self):
+        if (
+            not self.gpx_geometry_edit_active
+            or self.gpx_geometry_edit_kind != "create"
+        ):
+            return
+        if self.gpx_geometry_creation_phase == "orientation":
+            return
 
+        valid, error = self.validate_gpx_geometry_parts(
+            self.gpx_geometry_edit_draft_parts
+        )
+        if not valid:
+            messagebox.showwarning(
+                "Segment incomplet",
+                "Dessinez au moins deux points distincts avant de terminer.\n\n"
+                f"{error}"
+            )
+            return
+
+        snapped_parts, snap_count = self.snapped_gpx_creation_parts()
+        if snap_count:
+            self.snapshot_gpx_geometry_draft()
+            self.gpx_geometry_edit_draft_parts = snapped_parts
+        self.gpx_geometry_creation_snap_count = snap_count
+        self.gpx_geometry_creation_phase = "orientation"
+        self.gpx_geometry_edit_selected_point = None
+        self.gpx_geometry_toolbar_title_var.set("↕ Sens")
+        self.show_gpx_geometry_orientation_controls()
+        self.clear_gpx_geometry_control_markers()
+        self.draw_gpx_workshop_map()
+        snap_note = (
+            f" · {snap_count} extrémité(s) raccordée(s) exactement"
+            if snap_count
+            else ""
+        )
+        self.gpx_workshop_status_var.set(
+            "Choisissez le point amont : A conserve le dessin, "
+            f"B inverse son ordre{snap_note}."
+        )
+
+    def return_to_gpx_segment_creation_drawing(self):
+        if (
+            self.gpx_geometry_edit_kind != "create"
+            or self.gpx_geometry_creation_phase != "orientation"
+        ):
+            return
+
+        self.gpx_geometry_creation_phase = "drawing"
+        self.gpx_geometry_toolbar_title_var.set("＋ Création")
+        self.show_gpx_geometry_drawing_controls()
+        if self.gpx_geometry_restore_button:
+            try:
+                self.gpx_geometry_restore_button.pack_forget()
+            except Exception:
+                pass
+        self.update_gpx_geometry_dirty_indicator()
+        self.draw_gpx_workshop_map()
+        self.gpx_workshop_status_var.set(
+            "Création active · poursuivez le dessin ou corrigez ses points."
+        )
 
     def next_gpx_manual_source_label(self):
         existing = {
@@ -19103,8 +16726,15 @@ namespace GestionBissesFolderPicker
         ]
         return max(positions) + 1 if positions else len(ordered_sources)
 
-    def build_gpx_segment_creation_state(self):
+    def build_gpx_segment_creation_state(self, upstream_label):
+        if upstream_label not in {"A", "B"}:
+            return None, None, None, "Le choix du point amont est invalide."
+
         parts = copy.deepcopy(self.gpx_geometry_edit_draft_parts)
+        if upstream_label == "B":
+            parts = list(reversed(parts))
+            for part in parts:
+                part["points"] = list(reversed(part.get("points", [])))
 
         valid, error = self.validate_gpx_geometry_parts(parts)
         if not valid:
@@ -19118,14 +16748,13 @@ namespace GestionBissesFolderPicker
                 source.get("source_filename", "").lower()
             )
         )
-
         insert_index = self.gpx_creation_insert_index(ordered_sources)
         source_id = uuid.uuid4().hex
         segment_id = uuid.uuid4().hex
         label = self.next_gpx_manual_source_label()
         timestamp = datetime.now().isoformat(timespec="seconds")
 
-        new_source = {
+        source = {
             "id": source_id,
             "label": label,
             "source_filename": label,
@@ -19136,11 +16765,13 @@ namespace GestionBissesFolderPicker
                 copy.deepcopy(part.get("points", []))
                 for part in parts
             ],
+            "orientation_defined": True,
+            "orientation_label": f"{upstream_label} = amont",
+            "upstream_endpoint": upstream_label,
             "branch_order": insert_index + 1,
             "visible": True
         }
-
-        ordered_sources.insert(insert_index, new_source)
+        ordered_sources.insert(insert_index, source)
 
         branch_order_by_source = {}
         for order, item in enumerate(ordered_sources, start=1):
@@ -19148,11 +16779,11 @@ namespace GestionBissesFolderPicker
             branch_order_by_source[item.get("id")] = order
 
         new_segments = copy.deepcopy(workshop.get("segments", []))
-
         for segment in new_segments:
             for part in segment.get("parts", []):
-                source_order = branch_order_by_source.get(part.get("source_id"))
-
+                source_order = branch_order_by_source.get(
+                    part.get("source_id")
+                )
                 if source_order is not None:
                     part["branch_order"] = source_order
                 else:
@@ -19164,7 +16795,6 @@ namespace GestionBissesFolderPicker
                         pass
 
         segment_parts = []
-
         for part_order, part in enumerate(parts):
             segment_parts.append({
                 "source_id": source_id,
@@ -19177,49 +16807,28 @@ namespace GestionBissesFolderPicker
                 "points": copy.deepcopy(part.get("points", []))
             })
 
-        new_segments.append({
+        segment = {
             "id": segment_id,
             "category_id": "non_classe",
             "visible": True,
             "parts": segment_parts,
             "created_at": timestamp,
             "created_manually": True
-        })
-
+        }
+        new_segments.append(segment)
         return ordered_sources, new_segments, segment_id, ""
 
-
-    def finish_gpx_segment_creation(self):
+    def finish_gpx_segment_creation(self, upstream_label):
         if (
             not self.gpx_geometry_edit_active
             or self.gpx_geometry_edit_kind != "create"
+            or self.gpx_geometry_creation_phase != "orientation"
         ):
             return
 
-        valid, error = self.validate_gpx_geometry_parts(
-            self.gpx_geometry_edit_draft_parts
-        )
-        if not valid:
-            messagebox.showwarning(
-                "Segment incomplet",
-                "Dessinez au moins deux points distincts avant d'enregistrer.\n\n"
-                f"{error}"
-            )
-            return
-
-        # Le raccordement prudent est conservé, sans phase de direction.
-        snapped_parts, snap_count = self.snapped_gpx_creation_parts()
-
-        if snap_count:
-            self.snapshot_gpx_geometry_draft()
-            self.gpx_geometry_edit_draft_parts = snapped_parts
-
-        self.gpx_geometry_creation_snap_count = snap_count
-
         sources, segments, segment_id, error = (
-            self.build_gpx_segment_creation_state()
+            self.build_gpx_segment_creation_state(upstream_label)
         )
-
         if sources is None:
             messagebox.showerror("Création impossible", error)
             return
@@ -19228,7 +16837,6 @@ namespace GestionBissesFolderPicker
             self.gpx_geometry_edit_draft_parts,
             self.gpx_geometry_edit_quality_baseline
         )
-
         if warnings:
             if not messagebox.askyesno(
                 "Contrôle du tracé",
@@ -19242,16 +16850,17 @@ namespace GestionBissesFolderPicker
                 return
 
         workshop = self.get_gpx_workshop_state()
+        # Le plan a été construit sur des copies profondes : les listes
+        # vivantes peuvent donc servir directement de point de retour sans
+        # multiplier inutilement en mémoire les gros GPX sources.
         previous_sources = workshop.get("sources", [])
         previous_segments = workshop.get("segments", [])
         previous_undo_stack = list(self.gpx_workshop_undo_stack)
         previous_redo_stack = list(self.gpx_workshop_redo_stack)
-
         self.snapshot_gpx_segments(
             "Création manuelle d’un segment",
             include_sources=True
         )
-
         workshop["sources"] = sources
         workshop["segments"] = segments
 
@@ -19262,7 +16871,6 @@ namespace GestionBissesFolderPicker
             workshop["segments"] = previous_segments
             self.gpx_workshop_undo_stack = previous_undo_stack
             self.gpx_workshop_redo_stack = previous_redo_stack
-
             messagebox.showerror(
                 "Enregistrement impossible",
                 "Le nouveau segment n’a pas été créé.\n\n"
@@ -19275,34 +16883,30 @@ namespace GestionBissesFolderPicker
             return
 
         snap_count = self.gpx_geometry_creation_snap_count
-
         self.reset_gpx_geometry_edit_session(redraw=False)
         self.refresh_gpx_source_tree()
         self.refresh_gpx_segment_tree()
-
         if self.gpx_segment_tree:
             try:
                 self.gpx_segment_tree.selection_set(segment_id)
                 self.gpx_segment_tree.focus(segment_id)
             except Exception:
                 pass
-
         self.on_gpx_segment_selected()
-        self.request_gpx_redraw(reason="segment créé")
-
+        self.draw_gpx_workshop_map()
         snap_note = (
             f" · {snap_count} extrémité(s) raccordée(s)"
             if snap_count
             else ""
         )
-
         self.gpx_workshop_status_var.set(
-            "✓ Segment créé · catégorie : Non classé"
-            f"{snap_note}."
+            "✓ Segment créé · catégorie : Non classé "
+            f"· {upstream_label} défini comme amont{snap_note}."
         )
-
-        self.log(f"＋ Segment manuel créé : {segment_id[:8]}")
-
+        self.log(
+            f"＋ Segment manuel créé : {segment_id[:8]} "
+            f"· {upstream_label} = amont"
+        )
 
     def update_gpx_geometry_edit_entry_visibility(self):
         frame = self.gpx_geometry_edit_entry_frame
@@ -19379,7 +16983,6 @@ namespace GestionBissesFolderPicker
                 return
 
             center = self.get_gpx_map_center()
-
             signature = (
                 self.get_map_zoom_value(self.gpx_editor_map),
                 round(center[0], 5) if center else None,
@@ -19387,11 +16990,10 @@ namespace GestionBissesFolderPicker
                 int(self.gpx_editor_map.winfo_width()),
                 int(self.gpx_editor_map.winfo_height()),
             )
-
             if signature != self.gpx_geometry_edit_last_view_signature:
                 self.gpx_geometry_edit_last_view_signature = signature
                 self.gpx_geometry_edit_last_zoom = signature[0]
-                self.refresh_gpx_geometry_control_points_for_view()
+                self.draw_gpx_workshop_map()
 
             try:
                 self.gpx_geometry_edit_zoom_after_id = self.root.after(350, tick)
@@ -19402,8 +17004,6 @@ namespace GestionBissesFolderPicker
             self.gpx_geometry_edit_zoom_after_id = self.root.after(200, tick)
         except Exception:
             self.gpx_geometry_edit_zoom_after_id = None
-
-
 
     def update_gpx_geometry_dirty_indicator(self):
         """
@@ -19466,6 +17066,7 @@ namespace GestionBissesFolderPicker
         self.gpx_geometry_edit_kind = None
         self.gpx_geometry_edit_segment_id = None
         self.gpx_geometry_create_anchor_segment_id = None
+        self.gpx_geometry_creation_phase = None
         self.gpx_geometry_creation_snap_count = 0
         self.gpx_geometry_edit_draft_parts = []
         self.gpx_geometry_edit_session_original_parts = []
@@ -19495,9 +17096,7 @@ namespace GestionBissesFolderPicker
         self.update_gpx_geometry_edit_entry_visibility()
 
         if redraw and self.gpx_editor_map:
-            self.request_gpx_redraw()
-
-
+            self.draw_gpx_workshop_map()
 
     def start_gpx_geometry_edit(self):
         if self.gpx_geometry_edit_active:
@@ -19528,6 +17127,7 @@ namespace GestionBissesFolderPicker
         self.gpx_geometry_edit_kind = "edit"
         self.gpx_geometry_edit_segment_id = ids[0]
         self.gpx_geometry_create_anchor_segment_id = None
+        self.gpx_geometry_creation_phase = None
         self.gpx_geometry_edit_draft_parts = parts
         self.gpx_geometry_edit_session_original_parts = copy.deepcopy(parts)
         self.gpx_geometry_edit_history = []
@@ -19561,12 +17161,10 @@ namespace GestionBissesFolderPicker
         self.update_gpx_geometry_edit_entry_visibility()
         self.update_gpx_geometry_dirty_indicator()
         self.start_gpx_geometry_edit_view_watch()
-        self.request_gpx_redraw()
+        self.draw_gpx_workshop_map()
         self.gpx_workshop_status_var.set(
             "Correction active · Déplacer : cliquez un point, puis sa nouvelle position · Ctrl+Z / Ctrl+Y."
         )
-
-
 
     def quit_gpx_geometry_edit(self):
         if not self.gpx_geometry_edit_active:
@@ -19590,10 +17188,8 @@ namespace GestionBissesFolderPicker
 
     def validate_gpx_geometry_mode(self):
         if self.gpx_geometry_edit_kind == "create":
-            return self.finish_gpx_segment_creation()
-
+            return self.begin_gpx_segment_creation_orientation()
         return self.save_gpx_geometry_edit()
-
 
     def on_gpx_geometry_edit_tool_changed(self):
         if not self.gpx_geometry_edit_active:
@@ -19606,7 +17202,7 @@ namespace GestionBissesFolderPicker
             "add": "Ajouter : cliquez près du tracé à l’endroit du nouveau point.",
             "delete": "Supprimer : cliquez sur le point à retirer.",
         }
-        self.request_gpx_redraw()
+        self.draw_gpx_workshop_map()
         prefix = (
             "Création active"
             if self.gpx_geometry_edit_kind == "create"
@@ -19620,7 +17216,6 @@ namespace GestionBissesFolderPicker
         else:
             detail = messages.get(tool, "")
         self.gpx_workshop_status_var.set(f"{prefix} · {detail}")
-
 
     def snapshot_gpx_geometry_draft(self):
         self.gpx_geometry_edit_history.append(
@@ -19645,9 +17240,8 @@ namespace GestionBissesFolderPicker
         self.restore_gpx_geometry_edit_state(
             self.gpx_geometry_edit_history.pop()
         )
-        self.request_gpx_redraw()
+        self.draw_gpx_workshop_map()
         self.gpx_workshop_status_var.set("↶ Dernière correction annulée.")
-
 
     def redo_gpx_geometry_edit(self):
         if not self.gpx_geometry_edit_active:
@@ -19664,9 +17258,8 @@ namespace GestionBissesFolderPicker
         self.restore_gpx_geometry_edit_state(
             self.gpx_geometry_edit_redo_history.pop()
         )
-        self.request_gpx_redraw()
+        self.draw_gpx_workshop_map()
         self.gpx_workshop_status_var.set("↷ Dernière correction rétablie.")
-
 
     def restore_gpx_geometry_original(self):
         if not self.gpx_geometry_edit_active:
@@ -19700,11 +17293,10 @@ namespace GestionBissesFolderPicker
             != self.gpx_geometry_edit_session_original_parts
         )
         self.update_gpx_geometry_dirty_indicator()
-        self.request_gpx_redraw()
+        self.draw_gpx_workshop_map()
         self.gpx_workshop_status_var.set(
             "Tracé original chargé dans l’aperçu · cliquez « Enregistrer » pour valider."
         )
-
 
     def gpx_geometry_edit_min_zoom(self):
         return 17
@@ -20155,6 +17747,12 @@ namespace GestionBissesFolderPicker
     def handle_gpx_geometry_edit_click(self, coords):
         if not self.gpx_geometry_edit_active:
             return
+        if self.gpx_geometry_creation_phase == "orientation":
+            self.gpx_workshop_status_var.set(
+                "Choisissez A ou B dans le bandeau, ou revenez au dessin."
+            )
+            return
+
         zoom = self.get_map_zoom_value(self.gpx_editor_map)
         if zoom is not None and zoom < self.gpx_geometry_edit_min_zoom():
             self.gpx_workshop_status_var.set(
@@ -20176,7 +17774,7 @@ namespace GestionBissesFolderPicker
                     )
                     return
                 self.gpx_geometry_edit_selected_point = key
-                self.request_gpx_redraw()
+                self.draw_gpx_workshop_map()
                 self.gpx_workshop_status_var.set(
                     "Point sélectionné · cliquez maintenant à sa nouvelle position."
                 )
@@ -20200,7 +17798,7 @@ namespace GestionBissesFolderPicker
                 point_index
             ):
                 self.gpx_geometry_edit_selected_point = None
-                self.request_gpx_redraw()
+                self.draw_gpx_workshop_map()
                 self.gpx_workshop_status_var.set("Déplacement annulé.")
                 return
 
@@ -20240,7 +17838,7 @@ namespace GestionBissesFolderPicker
                         )
                         if decision is None:
                             self.gpx_geometry_edit_selected_point = None
-                            self.request_gpx_redraw()
+                            self.draw_gpx_workshop_map()
                             self.gpx_workshop_status_var.set(
                                 "Déplacement annulé."
                             )
@@ -20269,7 +17867,7 @@ namespace GestionBissesFolderPicker
                 or bool(self.gpx_geometry_edit_linked_endpoint_updates)
             )
             self.update_gpx_geometry_dirty_indicator()
-            self.request_gpx_redraw()
+            self.draw_gpx_workshop_map()
             if existing_group is not None:
                 linked_count = len(existing_group.get("targets", []))
             else:
@@ -20322,7 +17920,7 @@ namespace GestionBissesFolderPicker
                 or bool(self.gpx_geometry_edit_linked_endpoint_updates)
             )
             self.update_gpx_geometry_dirty_indicator()
-            self.request_gpx_redraw()
+            self.draw_gpx_workshop_map()
             self.gpx_workshop_status_var.set("Point ajouté · correction non enregistrée.")
             return
 
@@ -20390,7 +17988,7 @@ namespace GestionBissesFolderPicker
                 or bool(self.gpx_geometry_edit_linked_endpoint_updates)
             )
             self.update_gpx_geometry_dirty_indicator()
-            self.request_gpx_redraw()
+            self.draw_gpx_workshop_map()
             pending_label = (
                 "création"
                 if self.gpx_geometry_edit_kind == "create"
@@ -20399,8 +17997,6 @@ namespace GestionBissesFolderPicker
             self.gpx_workshop_status_var.set(
                 f"Point supprimé · {pending_label} non enregistrée."
             )
-
-
 
     def validate_gpx_geometry_parts(self, parts):
         if not parts:
@@ -20624,7 +18220,7 @@ namespace GestionBissesFolderPicker
         if self.gpx_segment_tree:
             self.gpx_segment_tree.selection_set(segment.get("id"))
             self.gpx_segment_tree.focus(segment.get("id"))
-        self.request_gpx_redraw()
+        self.draw_gpx_workshop_map()
         if restored:
             status = "✓ Tracé restauré et enregistré."
         else:
@@ -20643,7 +18239,6 @@ namespace GestionBissesFolderPicker
                 if linked_count else ""
             )
         )
-
 
     def handle_gpx_workshop_map_click(self, coords):
         if self.consume_photo_map_click_guard("gpx"):
@@ -20947,12 +18542,11 @@ namespace GestionBissesFolderPicker
 
         self.save_gpx_workshop_state()
         self.refresh_gpx_segment_tree()
-        self.request_gpx_redraw()
+        self.draw_gpx_workshop_map()
         self.gpx_workshop_click_mode = None
         self.gpx_workshop_pending_segment_id = None
         self.exit_gpx_segment_edit_photo_mode()
         self.gpx_workshop_status_var.set("✂️ Segment découpé au point précis.")
-
 
     def point_distance_m(self, a, b):
         return self.haversine_distance_m(float(a[0]), float(a[1]), float(b[0]), float(b[1]))
@@ -21128,7 +18722,7 @@ namespace GestionBissesFolderPicker
         if self.gpx_segment_tree:
             self.gpx_segment_tree.selection_set(merged_segment.get("id"))
             self.gpx_segment_tree.focus(merged_segment.get("id"))
-        self.request_gpx_redraw()
+        self.draw_gpx_workshop_map()
 
         if len(merged_parts) == 1:
             continuity = "Les parties jointives ont été recollées en une trace continue."
@@ -21141,7 +18735,6 @@ namespace GestionBissesFolderPicker
             status = f"Segments fusionnés. {continuity}"
 
         self.gpx_workshop_status_var.set(status)
-
 
     def split_selected_discontinuous_segment(self):
         if self.gpx_geometry_edit_active:
@@ -21198,11 +18791,10 @@ namespace GestionBissesFolderPicker
 
         self.save_gpx_workshop_state()
         self.refresh_gpx_segment_tree()
-        self.request_gpx_redraw()
+        self.draw_gpx_workshop_map()
         self.gpx_workshop_status_var.set(
             f"Segment discontinu dissocié en {len(new_segments)} segment(s)."
         )
-
 
     def delete_selected_gpx_segments(self):
         if self.gpx_geometry_edit_active:
@@ -21228,9 +18820,8 @@ namespace GestionBissesFolderPicker
         ]
         self.save_gpx_workshop_state()
         self.refresh_gpx_segment_tree()
-        self.request_gpx_redraw()
+        self.draw_gpx_workshop_map()
         self.gpx_workshop_status_var.set(f"{len(ids)} segment(s) retiré(s) de l’atelier.")
-
 
     def apply_category_to_selected_segments(self):
         if self.gpx_geometry_edit_active:
@@ -21259,11 +18850,10 @@ namespace GestionBissesFolderPicker
         self.refresh_gpx_segment_tree()
         if self.gpx_segment_tree:
             self.gpx_segment_tree.selection_set(ids)
-        self.request_gpx_redraw()
+        self.draw_gpx_workshop_map()
         self.gpx_workshop_status_var.set(
             f"{changed} segment(s) classé(s) : {category.get('label', '—')}."
         )
-
 
     def add_gpx_category(self):
         """
@@ -21372,7 +18962,7 @@ namespace GestionBissesFolderPicker
         workshop["last_export_at"] = datetime.now().isoformat(timespec="seconds")
         self.save_gpx_workshop_state()
 
-        self.request_gpx_redraw()
+        self.draw_gpx_workshop_map()
         messagebox.showinfo(
             "Export terminé",
             (
@@ -21383,7 +18973,6 @@ namespace GestionBissesFolderPicker
         self.gpx_workshop_status_var.set(
             f"Export terminé : {len(exported_trace_records)} tronçon(s) GPX."
         )
-
 
     def write_workshop_segment_to_gpx(self, target_path, segment, category):
         gpx = gpxpy.gpx.GPX()
@@ -21458,7 +19047,6 @@ namespace GestionBissesFolderPicker
             "lat": None,
             "lon": None,
             "ele": None,
-            "gps_datetime_utc": None,
             "error": ""
         }
 
@@ -21510,83 +19098,15 @@ namespace GestionBissesFolderPicker
                 if alt_ref_value == 1:
                     ele = -ele
 
-            gps_datetime_utc = None
-            date_stamp = gps.get(
-                piexif.GPSIFD.GPSDateStamp
-            )
-            time_stamp = gps.get(
-                piexif.GPSIFD.GPSTimeStamp
-            )
-
-            if date_stamp and time_stamp:
-                try:
-                    if isinstance(
-                        date_stamp,
-                        bytes
-                    ):
-                        date_text = (
-                            date_stamp.decode(
-                                "ascii",
-                                errors="ignore"
-                            )
-                        )
-                    else:
-                        date_text = str(
-                            date_stamp
-                        )
-
-                    date_obj = datetime.strptime(
-                        date_text,
-                        "%Y:%m:%d"
-                    ).date()
-
-                    hours = int(
-                        round(
-                            self.rational_to_float(
-                                time_stamp[0]
-                            )
-                        )
-                    )
-                    minutes = int(
-                        round(
-                            self.rational_to_float(
-                                time_stamp[1]
-                            )
-                        )
-                    )
-                    seconds = int(
-                        round(
-                            self.rational_to_float(
-                                time_stamp[2]
-                            )
-                        )
-                    )
-
-                    gps_datetime_utc = datetime(
-                        date_obj.year,
-                        date_obj.month,
-                        date_obj.day,
-                        hours,
-                        minutes,
-                        seconds,
-                        tzinfo=timezone.utc
-                    )
-                except Exception:
-                    gps_datetime_utc = None
-
             result["ok"] = True
             result["lat"] = lat
             result["lon"] = lon
             result["ele"] = ele
-            result[
-                "gps_datetime_utc"
-            ] = gps_datetime_utc
             return result
 
         except Exception as e:
             result["error"] = str(e)
             return result
-
 
     def import_gps_from_existing_metadata(self):
         if not os.path.exists(self.catalog_path):
@@ -21738,224 +19258,72 @@ namespace GestionBissesFolderPicker
         except Exception:
             return None
 
-    def write_gps_metadata_to_jpg(
-        self,
-        image_path,
-        lat,
-        lon,
-        ele=None,
-        gps_datetime=None
-    ):
+    def write_gps_metadata_to_jpg(self, image_path, lat, lon, ele=None, gps_datetime=None):
         """
-        Écrit les coordonnées GPS dans le JPG seulement si les valeurs EXIF
-        présentes sont différentes.
-        """
-        if (
-            not image_path
-            or not os.path.exists(image_path)
-        ):
-            return {
-                "ok": False,
-                "changed": False,
-                "error": "Image introuvable"
-            }
+        Écrit les coordonnées GPS dans les métadonnées EXIF d'un JPG/JPEG.
 
-        if not image_path.lower().endswith(
-            (".jpg", ".jpeg")
-        ):
-            return {
-                "ok": False,
-                "changed": False,
-                "error": (
-                    "Le fichier n'est pas un JPG/JPEG"
-                )
-            }
+        Ne s'applique volontairement pas aux HEIC/HEIF : le logiciel écrit dans
+        les JPG utilisés pour le travail, soit les JPG originaux, soit les JPG
+        convertis dans Export_JPG.
+        """
+        if not image_path or not os.path.exists(image_path):
+            return {"ok": False, "error": "Image introuvable"}
+
+        if not image_path.lower().endswith((".jpg", ".jpeg")):
+            return {"ok": False, "error": "Le fichier n'est pas un JPG/JPEG"}
 
         if lat is None or lon is None:
-            return {
-                "ok": False,
-                "changed": False,
-                "error": "Coordonnées manquantes"
-            }
+            return {"ok": False, "error": "Coordonnées manquantes"}
 
         try:
             lat = float(lat)
             lon = float(lon)
 
-            if not (
-                -90 <= lat <= 90
-                and -180 <= lon <= 180
-            ):
-                return {
-                    "ok": False,
-                    "changed": False,
-                    "error": "Coordonnées hors limites"
-                }
-
-            target_ele = None
-            if ele is not None:
-                try:
-                    target_ele = float(ele)
-                except Exception:
-                    target_ele = None
-
-            target_dt = self.parse_iso_datetime_to_utc(
-                gps_datetime
-            )
-
-            current = self.read_gps_metadata_from_jpg(
-                image_path
-            )
-
-            if current.get("ok"):
-                same_lat = abs(
-                    float(current["lat"]) - lat
-                ) <= 1e-7
-                same_lon = abs(
-                    float(current["lon"]) - lon
-                ) <= 1e-7
-
-                if target_ele is None:
-                    same_ele = True
-                elif current.get("ele") is None:
-                    same_ele = False
-                else:
-                    same_ele = abs(
-                        float(current["ele"])
-                        - target_ele
-                    ) <= 0.05
-
-                if target_dt is None:
-                    same_time = True
-                else:
-                    existing_dt = current.get(
-                        "gps_datetime_utc"
-                    )
-                    same_time = (
-                        existing_dt is not None
-                        and abs(
-                            (
-                                existing_dt
-                                - target_dt
-                            ).total_seconds()
-                        )
-                        <= 1.0
-                    )
-
-                if (
-                    same_lat
-                    and same_lon
-                    and same_ele
-                    and same_time
-                ):
-                    return {
-                        "ok": True,
-                        "changed": False,
-                        "error": ""
-                    }
+            if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+                return {"ok": False, "error": "Coordonnées hors limites"}
 
             try:
-                exif_dict = piexif.load(
-                    image_path
-                )
+                exif_dict = piexif.load(image_path)
             except Exception:
-                exif_dict = {
-                    "0th": {},
-                    "Exif": {},
-                    "GPS": {},
-                    "1st": {},
-                    "thumbnail": None,
-                }
+                exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
 
-            gps_ifd = exif_dict.setdefault(
-                "GPS",
-                {}
-            )
+            gps_ifd = exif_dict.setdefault("GPS", {})
 
-            gps_ifd[
-                piexif.GPSIFD.GPSVersionID
-            ] = (2, 3, 0, 0)
+            gps_ifd[piexif.GPSIFD.GPSVersionID] = (2, 3, 0, 0)
 
-            gps_ifd[
-                piexif.GPSIFD.GPSLatitudeRef
-            ] = (
-                b"N"
-                if lat >= 0
-                else b"S"
-            )
-            gps_ifd[
-                piexif.GPSIFD.GPSLatitude
-            ] = self.decimal_to_gps_dms_rational(
-                lat
-            )
+            gps_ifd[piexif.GPSIFD.GPSLatitudeRef] = b"N" if lat >= 0 else b"S"
+            gps_ifd[piexif.GPSIFD.GPSLatitude] = self.decimal_to_gps_dms_rational(lat)
 
-            gps_ifd[
-                piexif.GPSIFD.GPSLongitudeRef
-            ] = (
-                b"E"
-                if lon >= 0
-                else b"W"
-            )
-            gps_ifd[
-                piexif.GPSIFD.GPSLongitude
-            ] = self.decimal_to_gps_dms_rational(
-                lon
-            )
+            gps_ifd[piexif.GPSIFD.GPSLongitudeRef] = b"E" if lon >= 0 else b"W"
+            gps_ifd[piexif.GPSIFD.GPSLongitude] = self.decimal_to_gps_dms_rational(lon)
 
-            if target_ele is not None:
-                gps_ifd[
-                    piexif.GPSIFD.GPSAltitudeRef
-                ] = (
-                    1
-                    if target_ele < 0
-                    else 0
-                )
-                gps_ifd[
-                    piexif.GPSIFD.GPSAltitude
-                ] = self.float_to_rational(
-                    abs(target_ele),
-                    precision=100
+            if ele is not None:
+                try:
+                    ele_value = float(ele)
+                    gps_ifd[piexif.GPSIFD.GPSAltitudeRef] = 1 if ele_value < 0 else 0
+                    gps_ifd[piexif.GPSIFD.GPSAltitude] = self.float_to_rational(abs(ele_value), precision=100)
+                except Exception:
+                    pass
+
+            gps_ifd[piexif.GPSIFD.GPSMapDatum] = b"WGS-84"
+
+            dt_utc = self.parse_iso_datetime_to_utc(gps_datetime)
+
+            if dt_utc:
+                gps_ifd[piexif.GPSIFD.GPSDateStamp] = dt_utc.strftime("%Y:%m:%d").encode("ascii")
+                gps_ifd[piexif.GPSIFD.GPSTimeStamp] = (
+                    (dt_utc.hour, 1),
+                    (dt_utc.minute, 1),
+                    (dt_utc.second, 1)
                 )
 
-            gps_ifd[
-                piexif.GPSIFD.GPSMapDatum
-            ] = b"WGS-84"
+            exif_bytes = piexif.dump(exif_dict)
+            piexif.insert(exif_bytes, image_path)
 
-            if target_dt:
-                gps_ifd[
-                    piexif.GPSIFD.GPSDateStamp
-                ] = target_dt.strftime(
-                    "%Y:%m:%d"
-                ).encode("ascii")
-                gps_ifd[
-                    piexif.GPSIFD.GPSTimeStamp
-                ] = (
-                    (target_dt.hour, 1),
-                    (target_dt.minute, 1),
-                    (target_dt.second, 1),
-                )
+            return {"ok": True, "error": ""}
 
-            exif_bytes = piexif.dump(
-                exif_dict
-            )
-            piexif.insert(
-                exif_bytes,
-                image_path
-            )
-
-            return {
-                "ok": True,
-                "changed": True,
-                "error": ""
-            }
-
-        except Exception as exc:
-            return {
-                "ok": False,
-                "changed": False,
-                "error": str(exc)
-            }
-
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
 
     def write_catalog_gps_to_jpg_metadata(
         self,
@@ -22050,14 +19418,11 @@ namespace GestionBissesFolderPicker
                 gps_datetime=gps_datetime
             )
 
-            if result.get("ok") and result.get("changed"):
+            if result.get("ok"):
                 written_count += 1
                 entry["gps_written_to_jpg_exif"] = True
                 entry["gps_written_to_jpg_exif_at"] = datetime.now().isoformat(timespec="seconds")
                 self.log(f"✅ GPS écrit dans EXIF : {filename}")
-            elif result.get("ok"):
-                skipped_count += 1
-                self.log(f"⚪ GPS déjà identique dans EXIF : {filename}")
             else:
                 error_count += 1
                 entry["gps_written_to_jpg_exif"] = False
@@ -22067,17 +19432,13 @@ namespace GestionBissesFolderPicker
             self.progress["value"] = ((i + 1) / total) * 100
             self.root.update_idletasks()
 
-        # Pas d'écriture catalogue si tous les JPG étaient déjà identiques.
-        if written_count or error_count:
-            try:
-                if not isinstance(self.catalog_container, dict):
-                    self.catalog_container = self.read_catalog_container()
-                self.save_catalog()
-            except Exception as e:
-                self.log(
-                    "⚠️ Les JPG ont été traités, mais le catalogue "
-                    f"n'a pas pu être mis à jour : {e}"
-                )
+        # On sauvegarde les petits indicateurs gps_written_to_jpg_exif dans le catalogue.
+        try:
+            if not isinstance(self.catalog_container, dict):
+                self.catalog_container = self.read_catalog_container()
+            self.save_catalog()
+        except Exception as e:
+            self.log(f"⚠️ Les JPG ont été traités, mais le catalogue n'a pas pu être mis à jour : {e}")
 
         self.log("-" * 40)
         self.log("✅ Écriture GPS EXIF terminée")
@@ -22090,11 +19451,9 @@ namespace GestionBissesFolderPicker
             (
                 "Écriture des coordonnées GPS dans les JPG terminée.\n\n"
                 f"GPS écrits : {written_count}\n"
-                f"Déjà identiques : {skipped_count}\n"
                 f"Erreurs : {error_count}"
             )
         )
-
 
     def offer_write_gps_to_jpg_after_sync(self, synced_count, sync_run_id=None):
         """
@@ -23120,10 +20479,7 @@ namespace GestionBissesFolderPicker
 
     def show_empty_photo_workshop(self):
         self.clear_main_frame()
-        self.status_header.config(
-            text="Photos du bisse · à compléter",
-            fg="#2980b9"
-        )
+        self.status_header.config(text="Atelier Photos · état vide / à compléter", fg="#2980b9")
 
         panel = tk.Frame(self.main_frame, padx=24, pady=24)
         panel.pack(fill="both", expand=True)
@@ -23136,34 +20492,27 @@ namespace GestionBissesFolderPicker
 
         tk.Label(
             panel,
-            text="Photos du bisse",
+            text="Atelier Photos",
             font=("Arial", 18, "bold")
         ).pack(anchor="w", pady=(0, 8))
 
+        has_catalog = os.path.exists(self.catalog_path)
         has_images = self.folder_has_images(self.photos_folder)
 
-        try:
-            catalog = self.read_catalog()
-        except Exception:
-            catalog = []
-
-        if not has_images:
+        if not has_catalog:
             message = (
-                "Aucune photographie source n’a été trouvée pour ce bisse.\n"
-                "Choisissez un dossier photos ou ajoutez les images au dossier "
-                "du bisse."
+                "Aucun catalogue photo n’existe encore pour ce dossier.\n"
+                "Vous pouvez déjà travailler dans l’atelier GPX, ou créer le catalogue photo quand les images sont prêtes."
             )
-        elif not catalog:
+        elif not has_images:
             message = (
-                "Les photos n’ont pas pu être préparées automatiquement.\n"
-                "Revenez au tableau de bord pour relancer l’ouverture du bisse."
+                "Le catalogue existe, mais aucun dossier photo actif contenant des images n’a été trouvé.\n"
+                "Choisissez un dossier photos ou ajoutez des images au dossier du bisse."
             )
         else:
             message = (
-                "Les photos sont prêtes, mais aucune position GPS exploitable "
-                "n’est encore disponible pour la carte.\n"
-                "La prochaine étape est la synchronisation avec une ou plusieurs "
-                "traces GPX."
+                "Des photos existent, mais aucune photo géolocalisée n’est actuellement disponible pour la carte.\n"
+                "Vous pouvez lire les coordonnées GPS déjà inscrites dans les JPG ou synchroniser les photos avec une ou plusieurs traces GPX."
             )
 
         tk.Label(
@@ -23178,25 +20527,49 @@ namespace GestionBissesFolderPicker
         actions = tk.Frame(panel)
         actions.pack(anchor="w", fill="x")
 
-        if not has_images:
+        tk.Button(
+            actions,
+            text="📂 Choisir manuellement le dossier photos",
+            command=self.choose_manual_photos_folder
+        ).pack(fill="x", pady=4)
+
+        if has_images:
             tk.Button(
                 actions,
-                text="📂 Choisir manuellement le dossier photos",
-                command=self.choose_manual_photos_folder
+                text="🚀 Créer / recréer le catalogue photo",
+                command=self.run_conversion,
+                bg="#2c3e50",
+                fg="white"
             ).pack(fill="x", pady=4)
 
-        if catalog:
+        if has_catalog:
             tk.Button(
                 actions,
-                text="📍 Géolocaliser les photos",
-                command=self.show_photo_geolocation,
+                text="📷 Lire GPS des JPG",
+                command=self.import_gps_from_existing_metadata,
+                bg="#16a085",
+                fg="white"
+            ).pack(fill="x", pady=4)
+
+            tk.Button(
+                actions,
+                text="🛰️ Géolocaliser avec une ou plusieurs traces GPX",
+                command=self.show_gpx_sync_selector,
                 bg="#27ae60",
                 fg="white"
             ).pack(fill="x", pady=4)
 
             tk.Button(
                 actions,
-                text="🔢 Ordre des photos",
+                text="✍️ Écrire GPS du catalogue dans les JPG",
+                command=self.write_catalog_gps_to_jpg_metadata,
+                bg="#2980b9",
+                fg="white"
+            ).pack(fill="x", pady=4)
+
+            tk.Button(
+                actions,
+                text="🔤 Renommer / déterminer l’ordre des photos",
                 command=self.show_rename_interface,
                 bg="#8e44ad",
                 fg="white"
@@ -23204,52 +20577,40 @@ namespace GestionBissesFolderPicker
 
         tk.Button(
             actions,
-            text="🧭 Tracé du bisse",
+            text="🧭 Ouvrir l’atelier GPX",
             command=self.show_gpx_workshop,
             bg="#d35400",
             fg="white"
         ).pack(fill="x", pady=(14, 4))
 
 
-
-
     def show_photo_preparation_dialog(self):
         """
-        Étape de préparation photo visible.
+        Regroupe les fonctions de préparation photos hors du tableau de bord.
 
-        v59 : création/complétion des données internes, conversion HEIC/HEIF
-        et lecture des métadonnées sont automatiques à l'ouverture du bisse.
-        Cette fenêtre ne montre plus ces opérations techniques.
+        Cette fenêtre accueille les commandes techniques liées aux photos :
+        choix du dossier, catalogue, GPS, géolocalisation et renommage.
+        La visionneuse reste ainsi centrée sur l'édition des métadonnées.
         """
         if not self.base_folder:
-            messagebox.showwarning(
-                "Aucun dossier",
-                "Ouvrez d'abord un dossier bisse."
-            )
+            messagebox.showwarning("Aucun dossier", "Ouvrez d'abord un dossier bisse.")
             return
 
         has_images = self.folder_has_images(self.photos_folder)
+        has_catalog = os.path.exists(self.catalog_path)
+        is_geolocated = False
 
-        try:
-            catalog = self.read_catalog()
-        except Exception:
-            catalog = []
-
-        photo_count = sum(
-            1 for entry in catalog
-            if isinstance(entry, dict) and entry.get("status") == "OK"
-        )
-        is_geolocated = any(
-            str(entry.get("gps_sync", "")).startswith("OK")
-            or bool(entry.get("gps_coordinates"))
-            for entry in catalog
-            if isinstance(entry, dict)
-        )
+        if has_catalog:
+            try:
+                catalog = self.read_catalog()
+                is_geolocated = any(str(entry.get("gps_sync", "")).startswith("OK") for entry in catalog)
+            except Exception:
+                is_geolocated = False
 
         window = tk.Toplevel(self.root)
-        window.title("Outils photos")
-        window.geometry("520x350")
-        window.minsize(460, 310)
+        window.title("Préparation photos")
+        window.geometry("520x430")
+        window.minsize(460, 360)
         window.transient(self.root)
 
         frame = tk.Frame(window, padx=14, pady=12)
@@ -23258,30 +20619,28 @@ namespace GestionBissesFolderPicker
 
         tk.Label(
             frame,
-            text="Outils photos",
+            text="Préparation photos",
             font=("Arial", 15, "bold"),
             anchor="w"
         ).grid(row=0, column=0, sticky="ew", pady=(0, 8))
 
+        status_lines = [
+            f"Dossier photos actif : {self.photos_folder or '—'}",
+            f"Images détectées : {'oui' if has_images else 'non'}",
+            f"Catalogue : {'oui' if has_catalog else 'non'}",
+            f"Géolocalisation catalogue : {'oui' if is_geolocated else 'non'}"
+        ]
+
         tk.Label(
             frame,
-            text=(
-                f"Photos prêtes : {photo_count}\n"
-                f"Coordonnées GPS disponibles : "
-                f"{'oui' if is_geolocated else 'non'}"
-            ),
+            text="\n".join(status_lines),
             justify="left",
             anchor="w",
             fg="#555555",
             wraplength=470
         ).grid(row=1, column=0, sticky="ew", pady=(0, 12))
 
-        actions = tk.LabelFrame(
-            frame,
-            text="Étape de travail",
-            padx=10,
-            pady=8
-        )
+        actions = tk.LabelFrame(frame, text="Actions", padx=10, pady=8)
         actions.grid(row=2, column=0, sticky="ew")
         actions.grid_columnconfigure(0, weight=1)
 
@@ -23294,63 +20653,76 @@ namespace GestionBissesFolderPicker
                 callback()
             return wrapped
 
-        row = 0
-
-        if not has_images:
-            tk.Button(
-                actions,
-                text="📂 Choisir le dossier photos",
-                command=close_then(self.choose_manual_photos_folder)
-            ).grid(row=row, column=0, sticky="ew", pady=3)
-            row += 1
-
-        gps_state = "normal" if photo_count > 0 else "disabled"
+        tk.Button(
+            actions,
+            text="📂 Choisir le dossier photos",
+            command=close_then(self.choose_manual_photos_folder)
+        ).grid(row=0, column=0, sticky="ew", pady=3)
 
         tk.Button(
             actions,
-            text="📍 Géolocalisation des photos",
-            command=close_then(
-                self.show_resync_interface
-                if is_geolocated
-                else self.show_gpx_sync_selector
-            ),
+            text="🚀 Créer / recréer le catalogue photo",
+            command=close_then(self.run_conversion),
+            bg="#2c3e50",
+            fg="white"
+        ).grid(row=1, column=0, sticky="ew", pady=3)
+
+        gps_state = "normal" if has_catalog else "disabled"
+        tk.Button(
+            actions,
+            text="📷 Lire GPS des JPG",
+            command=close_then(self.import_gps_from_existing_metadata),
+            bg="#16a085",
+            fg="white",
+            state=gps_state
+        ).grid(row=2, column=0, sticky="ew", pady=3)
+
+        tk.Button(
+            actions,
+            text="🛰️ Géolocaliser / resynchroniser avec une ou plusieurs traces GPX",
+            command=close_then(self.show_resync_interface if is_geolocated else self.show_gpx_sync_selector),
             bg="#27ae60",
             fg="white",
             state=gps_state
-        ).grid(row=row, column=0, sticky="ew", pady=3)
-        row += 1
+        ).grid(row=3, column=0, sticky="ew", pady=3)
 
         tk.Button(
             actions,
-            text="✍️ Écrire les coordonnées GPS dans les JPG",
+            text="✍️ Écrire GPS du catalogue dans les JPG",
             command=close_then(self.write_catalog_gps_to_jpg_metadata),
             bg="#2980b9",
             fg="white",
             state=gps_state
-        ).grid(row=row, column=0, sticky="ew", pady=3)
-        row += 1
+        ).grid(row=4, column=0, sticky="ew", pady=3)
 
         tk.Button(
             actions,
-            text="🔢 Ordre des photos",
+            text="🔤 Renommer / déterminer l’ordre des photos",
             command=close_then(self.show_rename_interface),
             bg="#8e44ad",
             fg="white",
             state=gps_state
-        ).grid(row=row, column=0, sticky="ew", pady=3)
+        ).grid(row=5, column=0, sticky="ew", pady=3)
+
+        tk.Label(
+            frame,
+            text=(
+                "Cette fenêtre remplace les anciennes commandes photos placées provisoirement "
+                "dans les options avancées du tableau de bord."
+            ),
+            justify="left",
+            anchor="w",
+            fg="#666666",
+            wraplength=470
+        ).grid(row=3, column=0, sticky="ew", pady=(12, 0))
 
         tk.Button(
             frame,
             text="Fermer",
             command=window.destroy
-        ).grid(row=3, column=0, sticky="e", pady=(12, 0))
-
-
+        ).grid(row=4, column=0, sticky="e", pady=(12, 0))
 
     def show_map_interface(self):
-        if not self.flush_current_photo_metadata_if_dirty():
-            return
-
         photos = self.load_geolocated_photos()
 
         if not photos:
@@ -23362,7 +20734,7 @@ namespace GestionBissesFolderPicker
         self.gpx_workshop_active = False
 
         self.clear_main_frame()
-        self.status_header.config(text="Photos", fg="#2980b9")
+        self.status_header.config(text="Atelier Photos · carte · visionneuse · métadonnées", fg="#2980b9")
 
         toolbar = tk.Frame(self.main_frame)
         toolbar.pack(fill="x", pady=(0, 8))
@@ -23373,43 +20745,27 @@ namespace GestionBissesFolderPicker
         tk.Button(
             row_a,
             text="↩️ Tableau de bord",
-            command=lambda: self.leave_photo_context(
-                lambda: self.load_folder(self.base_folder)
-            )
+            command=lambda: self.load_folder(self.base_folder)
         ).pack(side="left", padx=(0, 4))
 
         tk.Button(
             row_a,
             text="📂 Dossier",
-            command=lambda: self.leave_photo_context(
-                self.select_base_folder
-            )
+            command=self.select_base_folder
         ).pack(side="left", padx=4)
 
         tk.Button(
             row_a,
-            text="🗺️ Cartographie",
-            command=lambda: self.leave_photo_context(
-                self.show_gpx_workshop
-            ),
+            text="🧭 Atelier GPX",
+            command=self.show_gpx_workshop,
             bg="#d35400",
             fg="white"
         ).pack(side="left", padx=4)
 
         tk.Button(
             row_a,
-            text="📍 Géolocalisation",
-            command=lambda: self.leave_photo_context(
-                self.show_photo_geolocation
-            )
-        ).pack(side="left", padx=4)
-
-        tk.Button(
-            row_a,
-            text="🔢 Ordre des photos",
-            command=lambda: self.leave_photo_context(
-                self.show_rename_interface
-            )
+            text="⚙️ Préparation photos",
+            command=self.show_photo_preparation_dialog
         ).pack(side="left", padx=4)
 
         self.photo_panels_button = tk.Menubutton(
@@ -23572,9 +20928,6 @@ namespace GestionBissesFolderPicker
         self.start_photo_layer_watch("photo")
 
         self.log(f"🗺️ Atelier Photos ouvert avec {len(photos)} photo(s).")
-
-
-
 
     def build_map_panel(self, parent):
         header = tk.Frame(parent, bg="#eeeeee")
@@ -23848,28 +21201,13 @@ namespace GestionBissesFolderPicker
         self.viewer_canvas = tk.Canvas(canvas_frame, bg="#222222", highlightthickness=0, takefocus=1)
         self.viewer_canvas.pack(side="left", fill="both", expand=True)
 
-        v_scroll = tk.Scrollbar(
-            canvas_frame,
-            orient="vertical",
-            command=self.viewer_scroll_y
-        )
+        v_scroll = tk.Scrollbar(canvas_frame, orient="vertical", command=self.viewer_canvas.yview)
         v_scroll.pack(side="right", fill="y")
 
-        h_scroll = tk.Scrollbar(
-            parent,
-            orient="horizontal",
-            command=self.viewer_scroll_x
-        )
+        h_scroll = tk.Scrollbar(parent, orient="horizontal", command=self.viewer_canvas.xview)
         h_scroll.pack(fill="x")
 
-        self.viewer_canvas.configure(
-            yscrollcommand=v_scroll.set,
-            xscrollcommand=h_scroll.set
-        )
-        self.viewer_canvas.bind(
-            "<Configure>",
-            lambda _event: self.viewer_schedule_render()
-        )
+        self.viewer_canvas.configure(yscrollcommand=v_scroll.set, xscrollcommand=h_scroll.set)
 
         self.viewer_canvas.bind("<MouseWheel>", self.viewer_mousewheel)
         self.viewer_canvas.bind("<ButtonPress-1>", self.viewer_canvas_click_start_pan)
@@ -23878,7 +21216,6 @@ namespace GestionBissesFolderPicker
         self.viewer_canvas.bind("<Right>", self.handle_photo_navigation_key)
         self.viewer_canvas.bind("<Button-4>", lambda event: self.viewer_change_zoom(1.10))
         self.viewer_canvas.bind("<Button-5>", lambda event: self.viewer_change_zoom(0.90))
-
 
     def build_metadata_panel(self, parent):
         """
@@ -23990,103 +21327,6 @@ namespace GestionBissesFolderPicker
             wraplength=300,
             justify="left"
         ).grid(row=2, column=0, sticky="ew", pady=(6, 0))
-
-
-
-    # ============================================================
-    # V63 — MÉTADONNÉES PHOTO SANS ÉCRITURES INUTILES
-    # ============================================================
-
-    def current_photo_editor_values(self):
-        """
-        Renvoie les quatre valeurs réellement éditables dans le panneau Photos.
-        """
-        if (
-            self.photo_title_entry is None
-            or self.photo_desc_text is None
-        ):
-            return None
-
-        try:
-            title = self.photo_title_entry.get().strip()
-            description = self.photo_desc_text.get(
-                "1.0",
-                tk.END
-            ).strip()
-            selected = bool(
-                self.platform_selected_var.get()
-            )
-            try:
-                order = int(
-                    self.platform_order_var.get()
-                )
-            except Exception:
-                order = 0
-
-            return {
-                "title": title,
-                "description": description,
-                "platform_selected": selected,
-                "platform_order": order,
-            }
-        except Exception:
-            return None
-
-    def set_current_photo_metadata_baseline(self):
-        values = self.current_photo_editor_values()
-        self.photo_metadata_baseline = (
-            copy.deepcopy(values)
-            if values is not None
-            else None
-        )
-
-    def current_photo_metadata_is_dirty(self):
-        if self.current_photo is None:
-            return False
-
-        current = self.current_photo_editor_values()
-        baseline = self.photo_metadata_baseline
-
-        if current is None or baseline is None:
-            return False
-
-        return current != baseline
-
-    def flush_current_photo_metadata_if_dirty(self):
-        """
-        Sauvegarde uniquement si un champ du panneau a réellement changé.
-
-        Retourne True si l'on peut poursuivre la navigation, False en cas
-        d'échec de sauvegarde.
-        """
-        if (
-            self.current_photo is None
-            or not self.current_photo_metadata_is_dirty()
-        ):
-            return True
-
-        result = self.save_current_photo_metadata(
-            silent=True,
-            only_if_changed=True
-        )
-        return bool(result)
-
-    def leave_photo_context(self, callback):
-        """
-        Utilitaire pour les boutons du module Photos.
-        """
-        if not self.flush_current_photo_metadata_if_dirty():
-            messagebox.showerror(
-                "Photos",
-                (
-                    "Les modifications de la photo courante n'ont pas pu "
-                    "être sauvegardées. Le changement de module est annulé."
-                )
-            )
-            return
-
-        callback()
-
 
     def set_swisstopo_layer(self, layer_name):
         if not self.map_widget:
@@ -24875,23 +22115,8 @@ namespace GestionBissesFolderPicker
         self.map_widget.set_zoom(zoom)
 
     def select_photo_on_map(self, photo, center_map=True):
-        # v63 : une simple navigation n'écrit plus ni JPG ni catalogue.
-        # Une sauvegarde silencieuse n'est déclenchée que si un champ du
-        # panneau de la photo courante a réellement changé.
-        if (
-            self.current_photo is not None
-            and self.current_photo is not photo
-            and self.photo_title_entry is not None
-        ):
-            if not self.flush_current_photo_metadata_if_dirty():
-                messagebox.showerror(
-                    "Photos",
-                    (
-                        "Impossible de sauvegarder les modifications de la "
-                        "photo courante. La navigation est annulée."
-                    )
-                )
-                return
+        if self.current_photo is not None and self.photo_title_entry is not None:
+            self.save_current_photo_metadata(silent=True)
 
         self.current_photo = photo
         self.refresh_map_markers()
@@ -24911,165 +22136,78 @@ namespace GestionBissesFolderPicker
         ele = photo.get("ele")
         image_path = photo.get("image_path", "")
 
-        self.photo_index_var.set(
-            f"Photo {current_index} / {total}"
-        )
+        self.photo_index_var.set(f"Photo {current_index} / {total}")
 
         filename_lines = []
         if filename:
-            filename_lines.append(
-                f"Fichier : {filename}"
-            )
-        if (
-            original_filename
-            and original_filename != filename
-        ):
-            filename_lines.append(
-                f"Original : {original_filename}"
-            )
+            filename_lines.append(f"Fichier : {filename}")
+        if original_filename and original_filename != filename:
+            filename_lines.append(f"Original : {original_filename}")
         if metadata_source:
-            filename_lines.append(
-                "Métadonnées texte lues depuis : "
-                f"{metadata_source}"
-            )
+            filename_lines.append(f"Métadonnées texte lues depuis : {metadata_source}")
 
-        self.photo_filename_var.set(
-            "\n".join(filename_lines)
-        )
+        self.photo_filename_var.set("\n".join(filename_lines))
 
         meta_lines = []
 
         if date_taken:
-            meta_lines.append(
-                f"Date : {date_taken}"
-            )
+            meta_lines.append(f"Date : {date_taken}")
 
         if gps_source:
-            meta_lines.append(
-                f"Source GPS : {gps_source}"
-            )
+            meta_lines.append(f"Source GPS : {gps_source}")
 
         if ele is not None:
             try:
-                meta_lines.append(
-                    f"Altitude : {float(ele):.1f} m"
-                )
+                meta_lines.append(f"Altitude : {float(ele):.1f} m")
             except Exception:
-                meta_lines.append(
-                    f"Altitude : {ele}"
-                )
+                meta_lines.append(f"Altitude : {ele}")
 
-        self.photo_meta_var.set(
-            "\n".join(meta_lines)
-        )
+        self.photo_meta_var.set("\n".join(meta_lines))
 
         if lat is not None and lon is not None:
-            self.photo_coords_var.set(
-                "Coordonnées :\n"
-                f"{lat:.6f}, {lon:.6f}"
-            )
+            self.photo_coords_var.set(f"Coordonnées :\n{lat:.6f}, {lon:.6f}")
         else:
             self.photo_coords_var.set("")
 
-        if hasattr(
-            self,
-            "photo_technical_summary_var"
-        ):
-            summary_parts = [
-                f"Photo {current_index} / {total}"
-            ]
+        if hasattr(self, "photo_technical_summary_var"):
+            summary_parts = [f"Photo {current_index} / {total}"]
             if date_taken:
                 try:
-                    summary_parts.append(
-                        str(date_taken).split("T")[0]
-                    )
+                    # Affichage court si date ISO complète.
+                    summary_parts.append(str(date_taken).split("T")[0])
                 except Exception:
-                    summary_parts.append(
-                        str(date_taken)
-                    )
-
-            summary_parts.append(
-                (
-                    "GPS OK"
-                    if lat is not None
-                    and lon is not None
-                    else "GPS —"
-                )
-            )
-
+                    summary_parts.append(str(date_taken))
+            summary_parts.append("GPS OK" if lat is not None and lon is not None else "GPS —")
             if ele is not None:
                 try:
-                    summary_parts.append(
-                        f"{float(ele):.0f} m"
-                    )
+                    summary_parts.append(f"{float(ele):.0f} m")
                 except Exception:
                     pass
+            self.photo_technical_summary_var.set(" · ".join(summary_parts))
 
-            self.photo_technical_summary_var.set(
-                " · ".join(summary_parts)
-            )
+        self.photo_title_entry.delete(0, tk.END)
+        self.photo_title_entry.insert(0, title)
 
-        self.photo_title_entry.delete(
-            0,
-            tk.END
-        )
-        self.photo_title_entry.insert(
-            0,
-            title
-        )
+        self.photo_desc_text.delete("1.0", tk.END)
+        self.photo_desc_text.insert("1.0", description)
 
-        self.photo_desc_text.delete(
-            "1.0",
-            tk.END
-        )
-        self.photo_desc_text.insert(
-            "1.0",
-            description
-        )
-
-        self.platform_selected_var.set(
-            bool(
-                photo.get(
-                    "platform_selected",
-                    False
-                )
-            )
-        )
-
+        self.platform_selected_var.set(bool(photo.get("platform_selected", False)))
         try:
-            self.platform_order_var.set(
-                int(
-                    photo.get(
-                        "platform_order"
-                    )
-                    or 0
-                )
-            )
+            self.platform_order_var.set(int(photo.get("platform_order") or 0))
         except Exception:
             self.platform_order_var.set(0)
 
         self.photo_status_var.set("")
-        self.set_current_photo_metadata_baseline()
 
-        self.load_photo_in_viewer(
-            image_path
-        )
+        self.load_photo_in_viewer(image_path)
 
         if center_map:
-            self.center_map_on_photo_if_needed(
-                self.map_widget,
-                lat,
-                lon
-            )
+            self.center_map_on_photo_if_needed(self.map_widget, lat, lon)
 
         try:
-            self.root.after(
-                20,
-                self.restore_photo_navigation_focus
-            )
+            self.root.after(20, self.restore_photo_navigation_focus)
         except Exception:
             pass
-
 
     def load_photo_in_viewer(self, image_path):
         self.viewer_original_image = None
@@ -25086,13 +22224,6 @@ namespace GestionBissesFolderPicker
             img = ImageOps.exif_transpose(img)
             self.viewer_original_image = img.copy()
 
-            if self.viewer_canvas is not None:
-                try:
-                    self.viewer_canvas.xview_moveto(0)
-                    self.viewer_canvas.yview_moveto(0)
-                except Exception:
-                    pass
-
             filename = os.path.basename(image_path)
             w, h = self.viewer_original_image.size
             self.viewer_info_var.set(f"{filename} · {w} × {h}px")
@@ -25104,247 +22235,34 @@ namespace GestionBissesFolderPicker
             if self.viewer_canvas:
                 self.viewer_canvas.delete("all")
 
-
-
-
-    def viewer_schedule_render(self, delay=18):
-        if (
-            self.viewer_canvas is None
-            or self.viewer_original_image is None
-        ):
+    def viewer_render_image(self):
+        if self.viewer_original_image is None or self.viewer_canvas is None:
             return
 
-        if self.viewer_render_after_id:
-            try:
-                self.root.after_cancel(
-                    self.viewer_render_after_id
-                )
-            except Exception:
-                pass
+        original_w, original_h = self.viewer_original_image.size
 
-        self.viewer_render_after_id = self.root.after(
-            delay,
-            self.viewer_render_image
+        new_w = max(1, int(original_w * self.viewer_zoom))
+        new_h = max(1, int(original_h * self.viewer_zoom))
+
+        img = self.viewer_original_image.resize(
+            (new_w, new_h),
+            Image.Resampling.LANCZOS
         )
 
-    def viewer_scroll_x(self, *args):
-        if self.viewer_canvas is None:
-            return
-        self.viewer_canvas.xview(*args)
-        self.viewer_schedule_render()
+        self.viewer_display_image = ImageTk.PhotoImage(img)
 
-    def viewer_scroll_y(self, *args):
-        if self.viewer_canvas is None:
-            return
-        self.viewer_canvas.yview(*args)
-        self.viewer_schedule_render()
-
-
-    def viewer_render_image(self):
-        """
-        Rend uniquement la portion visible de l'image.
-
-        Le scrollregion représente toujours l'image complète au zoom demandé,
-        mais Pillow ne fabrique plus une image intermédiaire géante à 400,
-        600 ou 800 %.
-        """
-        self.viewer_render_after_id = None
-
-        if (
-            self.viewer_original_image is None
-            or self.viewer_canvas is None
-        ):
-            return
-
-        try:
-            self.viewer_canvas.update_idletasks()
-
-            original_w, original_h = (
-                self.viewer_original_image.size
-            )
-            zoom = max(
-                0.05,
-                min(
-                    8.0,
-                    float(self.viewer_zoom)
-                )
-            )
-
-            full_w = max(
-                1,
-                int(round(original_w * zoom))
-            )
-            full_h = max(
-                1,
-                int(round(original_h * zoom))
-            )
-
-            self.viewer_canvas.config(
-                scrollregion=(
-                    0,
-                    0,
-                    full_w,
-                    full_h
-                )
-            )
-
-            canvas_w = max(
-                1,
-                int(
-                    self.viewer_canvas.winfo_width()
-                )
-            )
-            canvas_h = max(
-                1,
-                int(
-                    self.viewer_canvas.winfo_height()
-                )
-            )
-
-            left = max(
-                0,
-                float(
-                    self.viewer_canvas.canvasx(0)
-                )
-            )
-            top = max(
-                0,
-                float(
-                    self.viewer_canvas.canvasy(0)
-                )
-            )
-
-            margin = max(
-                0,
-                int(
-                    self.viewer_render_margin_px
-                )
-            )
-
-            sx0 = max(
-                0,
-                int(left) - margin
-            )
-            sy0 = max(
-                0,
-                int(top) - margin
-            )
-            sx1 = min(
-                full_w,
-                int(left + canvas_w) + margin
-            )
-            sy1 = min(
-                full_h,
-                int(top + canvas_h) + margin
-            )
-
-            # Conversion de la fenêtre affichée vers les coordonnées de
-            # l'image originale.
-            ox0 = max(
-                0,
-                int(math.floor(sx0 / zoom))
-            )
-            oy0 = max(
-                0,
-                int(math.floor(sy0 / zoom))
-            )
-            ox1 = min(
-                original_w,
-                int(math.ceil(sx1 / zoom))
-            )
-            oy1 = min(
-                original_h,
-                int(math.ceil(sy1 / zoom))
-            )
-
-            if ox1 <= ox0 or oy1 <= oy0:
-                return
-
-            crop = self.viewer_original_image.crop(
-                (
-                    ox0,
-                    oy0,
-                    ox1,
-                    oy1
-                )
-            )
-
-            draw_x = int(
-                round(ox0 * zoom)
-            )
-            draw_y = int(
-                round(oy0 * zoom)
-            )
-            draw_w = max(
-                1,
-                int(
-                    round(
-                        (ox1 - ox0)
-                        * zoom
-                    )
-                )
-            )
-            draw_h = max(
-                1,
-                int(
-                    round(
-                        (oy1 - oy0)
-                        * zoom
-                    )
-                )
-            )
-
-            if crop.size != (
-                draw_w,
-                draw_h
-            ):
-                crop = crop.resize(
-                    (draw_w, draw_h),
-                    Image.Resampling.LANCZOS
-                )
-
-            self.viewer_display_image = (
-                ImageTk.PhotoImage(crop)
-            )
-
-            self.viewer_canvas.delete(
-                "all"
-            )
-            self.viewer_image_on_canvas = (
-                self.viewer_canvas.create_image(
-                    draw_x,
-                    draw_y,
-                    anchor="nw",
-                    image=self.viewer_display_image
-                )
-            )
-
-            self.viewer_zoom_var.set(
-                f"Zoom : {zoom * 100:.0f} %"
-            )
-
-        except Exception as exc:
-            self.viewer_info_var.set(
-                f"Aperçu impossible : {exc}"
-            )
-
+        self.viewer_canvas.delete("all")
+        self.viewer_canvas.create_image(0, 0, anchor="nw", image=self.viewer_display_image)
+        self.viewer_canvas.config(scrollregion=(0, 0, new_w, new_h))
+        self.viewer_zoom_var.set(f"Zoom : {self.viewer_zoom * 100:.0f} %")
 
     def viewer_change_zoom(self, factor):
         if self.viewer_original_image is None:
             return
 
         self.viewer_zoom *= factor
-        self.viewer_zoom = max(
-            0.05,
-            min(
-                8.0,
-                self.viewer_zoom
-            )
-        )
-        self.viewer_schedule_render(
-            delay=0
-        )
-
+        self.viewer_zoom = max(0.05, min(8.0, self.viewer_zoom))
+        self.viewer_render_image()
 
     def viewer_fit_to_panel(self):
         if self.viewer_original_image is None or self.viewer_canvas is None:
@@ -25378,26 +22296,11 @@ namespace GestionBissesFolderPicker
 
         if event.state & 0x0004:
             if event.delta > 0:
-                self.viewer_change_zoom(
-                    1.15
-                )
+                self.viewer_change_zoom(1.15)
             else:
-                self.viewer_change_zoom(
-                    0.87
-                )
+                self.viewer_change_zoom(0.87)
         else:
-            self.viewer_canvas.yview_scroll(
-                int(
-                    -1
-                    * (
-                        event.delta
-                        / 120
-                    )
-                ),
-                "units"
-            )
-            self.viewer_schedule_render()
-
+            self.viewer_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
     def viewer_start_pan(self, event):
         if self.viewer_canvas:
@@ -25405,13 +22308,7 @@ namespace GestionBissesFolderPicker
 
     def viewer_do_pan(self, event):
         if self.viewer_canvas:
-            self.viewer_canvas.scan_dragto(
-                event.x,
-                event.y,
-                gain=1
-            )
-            self.viewer_schedule_render()
-
+            self.viewer_canvas.scan_dragto(event.x, event.y, gain=1)
 
     # ============================================================
     # MÉTADONNÉES TEXTE JPG
@@ -25554,112 +22451,52 @@ namespace GestionBissesFolderPicker
             result["error"] = str(e)
             return result
 
-    def write_text_metadata_to_jpg(
-        self,
-        image_path,
-        title,
-        description
-    ):
-        if (
-            not image_path
-            or not os.path.exists(image_path)
-        ):
+    def write_text_metadata_to_jpg(self, image_path, title, description):
+        if not image_path or not os.path.exists(image_path):
             return False, "Image introuvable"
 
-        if not image_path.lower().endswith(
-            (".jpg", ".jpeg")
-        ):
+        if not image_path.lower().endswith((".jpg", ".jpeg")):
             return False, "Le fichier n'est pas un JPG"
-
-        title = title or ""
-        description = description or ""
-
-        # v63 : comparaison avant écriture.
-        current = self.read_text_metadata_from_jpg(
-            image_path
-        )
-        if (
-            current.get("ok")
-            and (current.get("title") or "") == title
-            and (
-                current.get("description") or ""
-            ) == description
-        ):
-            return True, "Métadonnées JPG déjà identiques"
 
         try:
             try:
-                exif_dict = piexif.load(
-                    image_path
-                )
+                exif_dict = piexif.load(image_path)
             except Exception:
                 exif_dict = {
                     "0th": {},
                     "Exif": {},
                     "GPS": {},
                     "1st": {},
-                    "thumbnail": None,
+                    "thumbnail": None
                 }
 
+            title = title or ""
+            description = description or ""
+
             if title:
-                exif_dict["0th"][
-                    piexif.ImageIFD.XPTitle
-                ] = self.encode_windows_xp_field(
-                    title
-                )
+                exif_dict["0th"][piexif.ImageIFD.XPTitle] = self.encode_windows_xp_field(title)
             else:
-                exif_dict["0th"].pop(
-                    piexif.ImageIFD.XPTitle,
-                    None
-                )
+                exif_dict["0th"].pop(piexif.ImageIFD.XPTitle, None)
 
             if description:
-                exif_dict["0th"][
-                    piexif.ImageIFD.XPComment
-                ] = self.encode_windows_xp_field(
-                    description
-                )
+                exif_dict["0th"][piexif.ImageIFD.XPComment] = self.encode_windows_xp_field(description)
             else:
-                exif_dict["0th"].pop(
-                    piexif.ImageIFD.XPComment,
-                    None
-                )
+                exif_dict["0th"].pop(piexif.ImageIFD.XPComment, None)
 
             if description:
-                user_comment_prefix = (
-                    b"UNICODE\x00"
-                )
-                user_comment_text = (
-                    description.encode(
-                        "utf-16be",
-                        errors="replace"
-                    )
-                )
-                exif_dict["Exif"][
-                    piexif.ExifIFD.UserComment
-                ] = (
-                    user_comment_prefix
-                    + user_comment_text
-                )
+                user_comment_prefix = b"UNICODE\x00"
+                user_comment_text = description.encode("utf-16be", errors="replace")
+                exif_dict["Exif"][piexif.ExifIFD.UserComment] = user_comment_prefix + user_comment_text
             else:
-                exif_dict["Exif"].pop(
-                    piexif.ExifIFD.UserComment,
-                    None
-                )
+                exif_dict["Exif"].pop(piexif.ExifIFD.UserComment, None)
 
-            exif_bytes = piexif.dump(
-                exif_dict
-            )
-            piexif.insert(
-                exif_bytes,
-                image_path
-            )
+            exif_bytes = piexif.dump(exif_dict)
+            piexif.insert(exif_bytes, image_path)
 
             return True, "Métadonnées JPG écrites"
 
-        except Exception as exc:
-            return False, str(exc)
-
+        except Exception as e:
+            return False, str(e)
 
     def diagnose_current_photo_metadata(self):
         if self.current_photo is None:
@@ -25709,445 +22546,114 @@ namespace GestionBissesFolderPicker
             "🔎 Diagnostic écrit dans le journal."
         )
 
-    def save_current_photo_metadata(
-        self,
-        silent=False,
-        only_if_changed=True
-    ):
-        if self.photo_metadata_save_in_progress:
-            return True
-
+    def save_current_photo_metadata(self, silent=False):
         if self.current_photo is None:
             if not silent:
-                messagebox.showwarning(
-                    "Aucune photo",
-                    "Aucune photo sélectionnée."
-                )
-            return False
+                messagebox.showwarning("Aucune photo", "Aucune photo sélectionnée.")
+            return
 
-        if (
-            self.photo_title_entry is None
-            or self.photo_desc_text is None
-        ):
-            return False
+        if self.photo_title_entry is None or self.photo_desc_text is None:
+            return
 
-        catalog_index = self.current_photo.get(
-            "catalog_index"
-        )
+        catalog_index = self.current_photo.get("catalog_index")
 
         if catalog_index is None:
             if not silent:
-                messagebox.showerror(
-                    "Erreur",
-                    "Index catalogue introuvable."
-                )
-            return False
+                messagebox.showerror("Erreur", "Index catalogue introuvable.")
+            return
 
-        requested = self.current_photo_editor_values()
-        if requested is None:
-            return False
-
-        baseline = (
-            self.photo_metadata_baseline
-            or {
-                "title": self.current_photo.get(
-                    "title",
-                    ""
-                ),
-                "description": self.current_photo.get(
-                    "description",
-                    ""
-                ),
-                "platform_selected": bool(
-                    self.current_photo.get(
-                        "platform_selected",
-                        False
-                    )
-                ),
-                "platform_order": int(
-                    self.current_photo.get(
-                        "platform_order"
-                    )
-                    or 0
-                ),
-            }
-        )
-
-        ui_changed = requested != baseline
-
-        # En navigation silencieuse, aucune synchronisation de convenance :
-        # pas de changement utilisateur = aucune écriture.
-        if silent and only_if_changed and not ui_changed:
-            return True
-
-        # Le catalogue doit déjà être en mémoire pendant l'Atelier Photos.
-        # Une relecture disque n'est utilisée qu'en réparation d'un état
-        # exceptionnel.
-        if (
-            not isinstance(
-                self.catalog_data,
-                list
-            )
-            or catalog_index
-            >= len(self.catalog_data)
-        ):
-            try:
-                self.catalog_data = (
-                    self.read_catalog()
-                )
-            except Exception as exc:
-                self.log(
-                    "❌ Relecture catalogue de secours "
-                    f"impossible : {exc}"
-                )
-                return False
-
-        if catalog_index >= len(
-            self.catalog_data
-        ):
-            if not silent:
-                messagebox.showerror(
-                    "Erreur",
-                    "Index catalogue invalide."
-                )
-            return False
-
-        entry = self.catalog_data[
-            catalog_index
-        ]
-
-        catalog_diff = (
-            (entry.get("title") or "")
-            != requested["title"]
-            or (
-                entry.get("description")
-                or ""
-            )
-            != requested["description"]
-            or bool(
-                entry.get(
-                    "platform_selected",
-                    False
-                )
-            )
-            != requested[
-                "platform_selected"
-            ]
-            or int(
-                entry.get(
-                    "platform_order"
-                )
-                or 0
-            )
-            != requested[
-                "platform_order"
-            ]
-        )
-
-        if (
-            only_if_changed
-            and not ui_changed
-            and not catalog_diff
-        ):
-            if not silent:
-                self.photo_status_var.set(
-                    "Aucune modification à sauvegarder."
-                )
-            return True
-
-        text_changed = (
-            requested["title"]
-            != baseline.get(
-                "title",
-                ""
-            )
-            or requested["description"]
-            != baseline.get(
-                "description",
-                ""
-            )
-        )
-
-        actual_title = requested["title"]
-        actual_description = requested[
-            "description"
-        ]
-        jpg_ok = True
-        jpg_message = (
-            "Métadonnées JPG inchangées"
-        )
-        jpg_meta = {
-            "ok": False,
-            "title": (
-                self.current_photo.get(
-                    "jpg_title",
-                    ""
-                )
-            ),
-            "description": (
-                self.current_photo.get(
-                    "jpg_description",
-                    ""
-                )
-            ),
-        }
-
-        self.photo_metadata_save_in_progress = True
+        requested_title = self.photo_title_entry.get().strip()
+        requested_description = self.photo_desc_text.get("1.0", tk.END).strip()
 
         try:
-            # Le fichier image n'est touché que si titre ou description
-            # ont réellement changé dans l'interface.
-            if text_changed:
-                image_path = self.current_photo.get(
-                    "image_path",
-                    ""
-                )
-
-                jpg_ok, jpg_message = (
-                    self.write_text_metadata_to_jpg(
-                        image_path,
-                        requested["title"],
-                        requested["description"]
-                    )
-                )
-
-                if (
-                    jpg_ok
-                    and jpg_message
-                    == "Métadonnées JPG déjà identiques"
-                ):
-                    jpg_meta = {
-                        "ok": True,
-                        "title": requested[
-                            "title"
-                        ],
-                        "description": requested[
-                            "description"
-                        ],
-                    }
-                else:
-                    jpg_meta = (
-                        self.read_text_metadata_from_jpg(
-                            image_path
-                        )
-                    )
-
-                if jpg_meta.get("ok"):
-                    actual_title = (
-                        jpg_meta.get(
-                            "title",
-                            ""
-                        )
-                    )
-                    actual_description = (
-                        jpg_meta.get(
-                            "description",
-                            ""
-                        )
-                    )
-
-            entry["title"] = actual_title
-            entry["description"] = (
-                actual_description
-            )
-            entry[
-                "platform_selected"
-            ] = requested[
-                "platform_selected"
-            ]
-            entry[
-                "platform_order"
-            ] = requested[
-                "platform_order"
-            ]
-
-            self.save_catalog(
-                interactive=not silent
+            image_path = self.current_photo.get("image_path", "")
+            jpg_ok, jpg_message = self.write_text_metadata_to_jpg(
+                image_path,
+                requested_title,
+                requested_description
             )
 
-            self.current_photo[
-                "title"
-            ] = actual_title
-            self.current_photo[
-                "description"
-            ] = actual_description
-            self.current_photo[
-                "catalog_title"
-            ] = actual_title
-            self.current_photo[
-                "catalog_description"
-            ] = actual_description
-            self.current_photo[
-                "platform_selected"
-            ] = requested[
-                "platform_selected"
-            ]
-            self.current_photo[
-                "platform_order"
-            ] = requested[
-                "platform_order"
-            ]
+            jpg_meta = self.read_text_metadata_from_jpg(image_path)
 
-            if text_changed:
-                self.current_photo[
-                    "jpg_title"
-                ] = (
-                    jpg_meta.get(
-                        "title",
-                        ""
-                    )
-                    if jpg_meta.get("ok")
-                    else ""
-                )
-                self.current_photo[
-                    "jpg_description"
-                ] = (
-                    jpg_meta.get(
-                        "description",
-                        ""
-                    )
-                    if jpg_meta.get("ok")
-                    else ""
-                )
-                self.current_photo[
-                    "metadata_source"
-                ] = (
-                    "JPG"
-                    if jpg_ok
-                    and jpg_meta.get("ok")
-                    else "catalogue.json"
-                )
+            if jpg_meta.get("ok"):
+                actual_title = jpg_meta.get("title", "")
+                actual_description = jpg_meta.get("description", "")
+            else:
+                actual_title = requested_title
+                actual_description = requested_description
+
+            self.catalog_data = self.read_catalog()
+
+            if catalog_index >= len(self.catalog_data):
+                if not silent:
+                    messagebox.showerror("Erreur", "Index catalogue invalide.")
+                return
+
+            platform_selected = bool(self.platform_selected_var.get())
+            try:
+                platform_order = int(self.platform_order_var.get())
+            except Exception:
+                platform_order = 0
+
+            self.catalog_data[catalog_index]["title"] = actual_title
+            self.catalog_data[catalog_index]["description"] = actual_description
+            self.catalog_data[catalog_index]["platform_selected"] = platform_selected
+            self.catalog_data[catalog_index]["platform_order"] = platform_order
+
+            self.save_catalog()
+
+            self.current_photo["title"] = actual_title
+            self.current_photo["description"] = actual_description
+            self.current_photo["jpg_title"] = jpg_meta.get("title", "")
+            self.current_photo["jpg_description"] = jpg_meta.get("description", "")
+            self.current_photo["catalog_title"] = actual_title
+            self.current_photo["catalog_description"] = actual_description
+            self.current_photo["metadata_source"] = "JPG" if jpg_ok else "catalogue.json"
+            self.current_photo["platform_selected"] = platform_selected
+            self.current_photo["platform_order"] = platform_order
 
             for photo in self.geolocated_photos:
-                if (
-                    photo.get(
-                        "catalog_index"
-                    )
-                    != catalog_index
-                ):
-                    continue
+                if photo.get("catalog_index") == catalog_index:
+                    photo["title"] = actual_title
+                    photo["description"] = actual_description
+                    photo["jpg_title"] = jpg_meta.get("title", "")
+                    photo["jpg_description"] = jpg_meta.get("description", "")
+                    photo["catalog_title"] = actual_title
+                    photo["catalog_description"] = actual_description
+                    photo["metadata_source"] = "JPG" if jpg_ok else "catalogue.json"
+                    photo["platform_selected"] = platform_selected
+                    photo["platform_order"] = platform_order
+                    break
 
-                photo[
-                    "title"
-                ] = actual_title
-                photo[
-                    "description"
-                ] = actual_description
-                photo[
-                    "catalog_title"
-                ] = actual_title
-                photo[
-                    "catalog_description"
-                ] = actual_description
-                photo[
-                    "platform_selected"
-                ] = requested[
-                    "platform_selected"
-                ]
-                photo[
-                    "platform_order"
-                ] = requested[
-                    "platform_order"
-                ]
+            self.photo_title_entry.delete(0, tk.END)
+            self.photo_title_entry.insert(0, actual_title)
 
-                if text_changed:
-                    photo[
-                        "jpg_title"
-                    ] = self.current_photo.get(
-                        "jpg_title",
-                        ""
-                    )
-                    photo[
-                        "jpg_description"
-                    ] = self.current_photo.get(
-                        "jpg_description",
-                        ""
-                    )
-                    photo[
-                        "metadata_source"
-                    ] = self.current_photo.get(
-                        "metadata_source",
-                        ""
-                    )
-
-                break
-
-            self.photo_title_entry.delete(
-                0,
-                tk.END
-            )
-            self.photo_title_entry.insert(
-                0,
-                actual_title
-            )
-
-            self.photo_desc_text.delete(
-                "1.0",
-                tk.END
-            )
-            self.photo_desc_text.insert(
-                "1.0",
-                actual_description
-            )
-
-            self.set_current_photo_metadata_baseline()
+            self.photo_desc_text.delete("1.0", tk.END)
+            self.photo_desc_text.insert("1.0", actual_description)
 
             if not silent:
-                if text_changed:
-                    if (
-                        jpg_ok
-                        and jpg_message
-                        == "Métadonnées JPG déjà identiques"
-                    ):
-                        self.photo_status_var.set(
-                            "✅ Catalogue sauvegardé ; "
-                            "le JPG contenait déjà ces métadonnées."
-                        )
-                    elif (
-                        jpg_ok
-                        and jpg_meta.get("ok")
-                    ):
-                        self.photo_status_var.set(
-                            "✅ Métadonnées JPG et catalogue sauvegardées."
-                        )
-                    elif jpg_ok:
-                        self.photo_status_var.set(
-                            "⚠️ JPG écrit, mais relecture JPG incomplète. "
-                            "Catalogue mis à jour."
-                        )
-                    else:
-                        self.photo_status_var.set(
-                            "⚠️ Catalogue sauvegardé, mais JPG non modifié : "
-                            f"{jpg_message}"
-                        )
+                if jpg_ok and jpg_meta.get("ok"):
+                    self.photo_status_var.set(
+                        "✅ Sauvegardé dans le JPG, relu depuis le JPG, puis synchronisé avec le catalogue."
+                    )
+                    self.log(f"💾 Métadonnées JPG + catalogue sauvegardées : {self.current_photo.get('filename')}")
+                elif jpg_ok:
+                    self.photo_status_var.set(
+                        "⚠️ JPG écrit, mais relecture JPG incomplète. Catalogue mis à jour avec les valeurs demandées."
+                    )
+                    self.log(f"⚠️ JPG écrit mais relecture incomplète : {self.current_photo.get('filename')}")
                 else:
                     self.photo_status_var.set(
-                        "✅ Sélection / ordre plateforme sauvegardés."
+                        f"⚠️ Catalogue sauvegardé, mais JPG non modifié : {jpg_message}"
+                    )
+                    self.log(
+                        f"⚠️ Métadonnées catalogue OK, JPG non modifié pour {self.current_photo.get('filename')} : {jpg_message}"
                     )
 
-            self.log(
-                "💾 Photo sauvegardée uniquement après modification : "
-                f"{self.current_photo.get('filename')}"
-            )
-
-            return True
-
-        except Exception as exc:
+        except Exception as e:
             if not silent:
-                messagebox.showerror(
-                    "Erreur",
-                    str(exc)
-                )
-
-            self.log(
-                "❌ Erreur sauvegarde métadonnées : "
-                f"{exc}"
-            )
-            return False
-
-        finally:
-            self.photo_metadata_save_in_progress = False
-
+                messagebox.showerror("Erreur", str(e))
+            self.log(f"❌ Erreur sauvegarde métadonnées : {e}")
 
     def discard_current_photo(self):
         """
@@ -26192,14 +22698,10 @@ namespace GestionBissesFolderPicker
             return
 
         try:
-            # Sauvegarde uniquement si l'utilisateur a réellement modifié
-            # le panneau avant d'écarter la photo.
-            if not self.flush_current_photo_metadata_if_dirty():
-                messagebox.showerror(
-                    "Erreur",
-                    "Les modifications de la photo n'ont pas pu être sauvegardées."
-                )
-                return
+            # Sauvegarde silencieuse des métadonnées en cours avant déplacement.
+            self.save_current_photo_metadata(silent=True)
+
+            self.catalog_data = self.read_catalog()
 
             if catalog_index >= len(self.catalog_data):
                 messagebox.showerror("Erreur", "Index catalogue invalide.")
@@ -26271,7 +22773,6 @@ namespace GestionBissesFolderPicker
         except Exception as e:
             messagebox.showerror("Erreur", str(e))
             self.log(f"❌ Erreur lors de l'écartement de la photo : {e}")
-
 
     def center_on_current_photo(self):
         if self.current_photo is None or not self.map_widget:
@@ -26369,98 +22870,19 @@ namespace GestionBissesFolderPicker
 
 
 def run_packaged_self_test():
-    """
-    Contrôle sans interface utilisé par les installateurs et par la
-    consolidation v62.
-    """
+    """Contrôle sans interface utilisé par la fabrication des installateurs."""
     ZoneInfo("Europe/Zurich")
-
-    test_image = Image.new(
-        "RGB",
-        (2, 2),
-        "white"
-    )
+    test_image = Image.new("RGB", (2, 2), "white")
     if test_image.size != (2, 2):
-        raise RuntimeError(
-            "Pillow ne fonctionne pas correctement."
-        )
-
+        raise RuntimeError("Pillow ne fonctionne pas correctement.")
     if not APP_VERSION:
-        raise RuntimeError(
-            "La version d'Abisses est introuvable."
-        )
-
-    digest = hashlib.sha256(
-        b"Abisses"
-    ).hexdigest()
-    if len(digest) != 64:
-        raise RuntimeError(
-            "hashlib SHA-256 ne fonctionne pas."
-        )
-
-    with tempfile.TemporaryDirectory(
-        prefix="abisses_selftest_"
-    ) as temp_dir:
-        target = os.path.join(
-            temp_dir,
-            "atomic.json"
-        )
-        payload = {
-            "application": "Abisses",
-            "atomic": True,
-            "items": [1, 2, 3],
-        }
-
-        atomic_write_json_file(
-            target,
-            payload,
-            indent=2,
-            ensure_ascii=False
-        )
-
-        with open(
-            target,
-            "r",
-            encoding="utf-8"
-        ) as handle:
-            loaded = json.load(handle)
-
-        if loaded != payload:
-            raise RuntimeError(
-                "Le test d'écriture JSON atomique a échoué."
-            )
-
-        leftovers = [
-            name
-            for name in os.listdir(temp_dir)
-            if "abisses_tmp_" in name
-        ]
-        if leftovers:
-            raise RuntimeError(
-                "Un fichier temporaire atomique est resté après écriture."
-            )
-
-    if (
-        "data/bisses_index.json"
-        not in BISSES_RENDER_APP_JS
-    ):
-        raise RuntimeError(
-            "Le moteur de prévisualisation Bisses est incomplet."
-        )
-
+        raise RuntimeError("La version d'Abisses est introuvable.")
     print(
         json.dumps(
             {
                 "application": "Abisses",
                 "version": APP_VERSION,
                 "python": sys.version.split()[0],
-                "hashlib": "OK",
-                "atomic_json": "OK",
-                "preview_renderer": "OK",
-                "photo_write_policy": "dirty-only",
-                "viewer_rendering": "viewport-only",
-                "gpx_direction_ui": "removed",
-                "gpx_redraw_scheduler": "coalesced",
                 "self_test": "OK",
             },
             ensure_ascii=False,
