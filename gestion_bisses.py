@@ -54,7 +54,7 @@ BISSES_RENDER_README = "# Bisses\n\nPlateforme statique GitHub Pages pour l’in
 class BisseManagerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title(f"Abisses — Édition Pro {display_version(APP_VERSION)}")
+        self.root.title("Abisses - v66")
         self.configure_application_icon()
         self.configure_main_window_geometry()
 
@@ -435,6 +435,8 @@ class BisseManagerApp:
         self._activity_serial = 0
         self._activity_state = None
         self._activity_after_id = None
+        self._folder_open_generation = 0
+        self._folder_open_activity_token = None
         self._photo_workspace_loading = False
         self._photo_workspace_load_generation = 0
         self._photo_workspace_loading_activity_token = None
@@ -671,6 +673,9 @@ class BisseManagerApp:
                 self._photo_workspace_loading_activity_token = None
             if previous_token == getattr(self, "_photo_workspace_open_activity_token", None):
                 self._photo_workspace_open_activity_token = None
+            if previous_token == getattr(self, "_folder_open_activity_token", None):
+                self._folder_open_generation += 1
+                self._folder_open_activity_token = None
             try:
                 self.progress.stop()
             except Exception:
@@ -839,7 +844,10 @@ class BisseManagerApp:
         return token
 
     def close_application(self):
-        """Ferme notamment le serveur et le dossier temporaire de prévisualisation."""
+        """Ferme notamment le serveur, invalide les workers et nettoie la prévisualisation."""
+        self._folder_open_generation += 1
+        self._photo_workspace_load_generation += 1
+        self._viewer_load_generation += 1
         try:
             self.stop_local_preview_server(cleanup=True)
         except Exception:
@@ -10333,88 +10341,112 @@ namespace GestionBissesFolderPicker
         self.load_folder(folder)
 
     def load_folder(self, folder):
-        self.base_folder = os.path.abspath(folder)
+        """Ouvre un bisse sans bloquer Tk pendant le scan et la préparation photo."""
+        if not folder:
+            return
+        folder = os.path.abspath(os.path.expanduser(folder))
+        if not os.path.isdir(folder):
+            messagebox.showerror("Ouverture impossible", f"Dossier introuvable :\n{folder}")
+            return
 
-        try:
-            self.migrate_legacy_global_files_if_needed()
-        except Exception as exc:
-            self.log(f"⚠️ Migration des fichiers globaux impossible : {exc}")
+        self._folder_open_generation += 1
+        generation = self._folder_open_generation
 
-        candidate_photos_folder = os.path.join(self.base_folder, "Photos")
+        def worker(report):
+            return self.prepare_folder_opening_context(folder, report=report)
 
-        manual_is_valid = False
-        if self.manual_photos_folder and os.path.isdir(self.manual_photos_folder):
+        def on_success(result, token):
+            if generation != self._folder_open_generation:
+                self.end_activity(token, restore_status=False)
+                return
+            self._folder_open_activity_token = None
             try:
-                manual_is_valid = os.path.commonpath([
-                    os.path.abspath(self.base_folder),
-                    os.path.abspath(self.manual_photos_folder)
-                ]) == os.path.abspath(self.base_folder)
-            except Exception:
-                manual_is_valid = False
+                self.update_activity(token, "Finalisation de l'ouverture…")
 
-        if manual_is_valid:
-            self.photos_folder = self.manual_photos_folder
-        elif os.path.exists(candidate_photos_folder) and os.path.isdir(candidate_photos_folder):
-            self.photos_folder = candidate_photos_folder
-        else:
-            self.photos_folder = self.base_folder
+                self.base_folder = result["base_folder"]
+                self.photos_folder = result["photos_folder"]
+                self.manual_photos_folder = ""
+                self.export_folder = result["export_folder"]
+                self.gpx_folder = result["gpx_folder"]
+                self.local_catalog_path = result["catalog_path"]
+                self.catalog_path = result["catalog_path"]
+                self.catalog_container = result["catalog_container"]
+                self.catalog_data = result["catalog_data"]
 
-        self.export_folder = os.path.join(self.base_folder, "Export_JPG")
-        self.gpx_folder = os.path.join(self.base_folder, "Fichiers GPX")
-        self.local_catalog_path = os.path.join(self.base_folder, "catalogue.json")
-        self.catalog_path = self.local_catalog_path
+                try:
+                    self.migrate_legacy_global_files_if_needed()
+                except Exception as exc:
+                    self.log(f"⚠️ Migration des fichiers globaux impossible : {exc}")
 
-        try:
-            project_id = self.ensure_project_for_folder(self.base_folder)
-            self.reset_active_catalog_paths_to_local()
-            self.log(f"📦 Projet Data associé : {project_id} — catalogue actif local sécurisé")
-        except Exception as exc:
-            self.current_project_id = ""
-            self.current_project_dir = ""
-            self.current_project_catalog_path = ""
-            self.catalog_path = self.local_catalog_path
-            self.log(f"⚠️ Projet Data indisponible, utilisation du catalogue local : {exc}")
+                try:
+                    project_id = self.ensure_project_for_folder(self.base_folder)
+                    self.reset_active_catalog_paths_to_local()
+                    self.log(f"📦 Projet Data associé : {project_id} — catalogue actif local sécurisé")
+                except Exception as exc:
+                    self.current_project_id = ""
+                    self.current_project_dir = ""
+                    self.current_project_catalog_path = ""
+                    self.catalog_path = self.local_catalog_path
+                    self.log(f"⚠️ Projet Data indisponible, utilisation du catalogue local : {exc}")
 
-        # v65 : l'ouverture garantit prudemment le socle photo, sans interrompre le bisse si une photo échoue.
-        try:
-            self.ensure_photo_foundation_automatic()
-        except Exception as exc:
-            self.log(f"⚠️ Préparation automatique des photos incomplète : {exc}")
+                try:
+                    self.add_folder_to_workspace(self.base_folder)
+                except Exception as exc:
+                    self.log(f"⚠️ Impossible d'ajouter ce dossier à Mes bisses : {exc}")
 
-        try:
-            self.add_folder_to_workspace(self.base_folder)
-        except Exception as exc:
-            self.log(f"⚠️ Impossible d'ajouter ce dossier à Mes bisses : {exc}")
+                try:
+                    self.write_portable_data_copy_for_active_project()
+                except Exception as exc:
+                    self.log(f"⚠️ Copie Data portable impossible : {exc}")
 
-        self.status_header.config(text=f"Dossier actif : {self.base_folder}", fg="green")
-        self.log(f"📂 Analyse du dossier : {self.base_folder}")
+                summary = result.get("summary", {})
+                for message in summary.get("error_messages", []):
+                    self.log(f"⚠️ {message}")
+                if result.get("work_count") or summary.get("errors"):
+                    self.log(
+                        "📷 Préparation automatique : "
+                        f"{summary.get('sources', 0)} source(s), "
+                        f"{summary.get('new_entries', 0)} nouvelle(s), "
+                        f"{summary.get('converted', 0)} HEIC/HEIF convertie(s), "
+                        f"{summary.get('metadata_scanned', 0)} métadonnée(s) relue(s), "
+                        f"{summary.get('metadata_skipped', 0)} lecture(s) EXIF évitée(s), "
+                        f"{summary.get('errors', 0)} erreur(s)."
+                    )
 
-        has_raw_photos = self.folder_has_images(self.photos_folder)
+                self.update_activity(token, "Ouverture du tableau de bord…")
+                self.status_header.config(text=f"Dossier actif : {self.base_folder}", fg="green")
+                self.log(f"📂 Dossier actif : {self.base_folder}")
+                has_raw_photos = self.folder_has_images(self.photos_folder)
+                has_export_photos = os.path.exists(self.export_folder) and self.folder_has_images(self.export_folder)
+                has_catalog = os.path.exists(self.catalog_path)
+                is_geolocated = any(
+                    str(entry.get("gps_sync", "")).startswith("OK")
+                    for entry in self.catalog_data if isinstance(entry, dict)
+                )
+                self.show_contextual_interface(
+                    has_raw=has_raw_photos,
+                    has_export=has_export_photos,
+                    has_cat=has_catalog,
+                    is_geo=is_geolocated,
+                )
+            except Exception as exc:
+                messagebox.showerror("Ouverture incomplète", str(exc))
+            finally:
+                self.end_activity(token, restore_status=False)
 
-        has_export_photos = (
-            os.path.exists(self.export_folder)
-            and self.folder_has_images(self.export_folder)
-        )
+        def on_error(exc, token):
+            if generation != self._folder_open_generation:
+                return
+            self._folder_open_activity_token = None
+            messagebox.showerror("Ouverture impossible", str(exc))
 
-        has_catalog = os.path.exists(self.catalog_path)
-        is_geolocated = False
-        self.catalog_data = []
-
-        if has_catalog:
-            try:
-                self.catalog_data = self.read_catalog()
-                if any(str(entry.get("gps_sync", "")).startswith("OK") for entry in self.catalog_data):
-                    is_geolocated = True
-            except Exception as e:
-                self.log(f"⚠️ Catalogue illisible : {e}")
-                has_catalog = False
-                self.catalog_data = []
-
-        self.show_contextual_interface(
-            has_raw=has_raw_photos,
-            has_export=has_export_photos,
-            has_cat=has_catalog,
-            is_geo=is_geolocated
+        self._folder_open_activity_token = self.run_background_activity(
+            "Ouverture du bisse…",
+            worker,
+            on_success,
+            on_error,
+            delay_ms=300,
+            keep_activity=True,
         )
 
 
@@ -10797,10 +10829,7 @@ namespace GestionBissesFolderPicker
         tk.Button(
             advanced,
             text="🔄 Relancer la préparation des photos",
-            command=lambda: (
-                self.ensure_photo_foundation_automatic(),
-                self.load_folder(self.base_folder)
-            )
+            command=lambda: self.load_folder(self.base_folder)
         ).grid(row=2, column=0, sticky="ew", pady=3)
 
         tk.Label(
@@ -12341,6 +12370,258 @@ namespace GestionBissesFolderPicker
 
         return True
 
+    def default_bisse_info_for_folder(self, folder):
+        title = os.path.basename(os.path.abspath(folder)) if folder else ""
+        return {
+            "slug": self.slugify(title) if title else "",
+            "title": title,
+            "region": "Valais",
+            "commune": "",
+            "description": "",
+            "itinerary": "",
+            "length_km": None,
+            "altitude_min_m": None,
+            "altitude_max_m": None,
+            "difficulty": "",
+            "marked_trail": None,
+            "state": "",
+            "tags": [],
+        }
+
+
+    def empty_catalog_container_for_folder(self, folder):
+        folder = os.path.abspath(folder)
+        title = os.path.basename(folder)
+        return {
+            "catalogue_version": 3,
+            "schema_version": "0.2-local",
+            "project": {
+                "bisse_name": title,
+                "title": title,
+                "year": datetime.now().year,
+                "source_folder": folder,
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            },
+            "bisse_info": self.default_bisse_info_for_folder(folder),
+            "photos": [],
+            "gpx_traces": {"manual_segments": [], "live_topo": []},
+            "gpx_workshop": {
+                "categories": copy.deepcopy(self.default_gpx_categories()),
+                "sources": [],
+                "segments": [],
+                "last_export_at": None,
+            },
+            "external_resources": [],
+            "inventory_info": self.empty_inventory_info(),
+            "platform_export": self.default_platform_export_state(),
+        }
+
+
+    def read_catalog_container_for_opening(self, catalog_path, folder):
+        """Lecture normalisée d'un catalogue sans modifier le bisse actif."""
+        folder = os.path.abspath(folder)
+        if not os.path.exists(catalog_path):
+            return self.empty_catalog_container_for_folder(folder)
+
+        with open(catalog_path, "r", encoding="utf-8") as handle:
+            raw = json.load(handle)
+
+        if isinstance(raw, list):
+            container = self.empty_catalog_container_for_folder(folder)
+            container["photos"] = raw
+            return container
+        if not isinstance(raw, dict):
+            raise ValueError("Format de catalogue.json non reconnu.")
+
+        raw.setdefault("catalogue_version", 3)
+        raw.setdefault("schema_version", "0.2-local")
+        raw.setdefault("project", {})
+        project = raw["project"]
+        project.setdefault("bisse_name", os.path.basename(folder))
+        project.setdefault("title", project.get("bisse_name", ""))
+        project.setdefault("year", datetime.now().year)
+        project.setdefault("source_folder", folder)
+        project.setdefault("updated_at", datetime.now().isoformat(timespec="seconds"))
+
+        defaults = self.default_bisse_info_for_folder(folder)
+        raw.setdefault("bisse_info", copy.deepcopy(defaults))
+        for key, value in defaults.items():
+            raw["bisse_info"].setdefault(key, copy.deepcopy(value))
+        if not raw["bisse_info"].get("title"):
+            raw["bisse_info"]["title"] = project.get("title") or project.get("bisse_name", "")
+        if not raw["bisse_info"].get("slug"):
+            raw["bisse_info"]["slug"] = self.slugify(raw["bisse_info"].get("title") or project.get("bisse_name", ""))
+
+        raw.setdefault("photos", [])
+        if not isinstance(raw["photos"], list):
+            raw["photos"] = []
+        for entry in raw["photos"]:
+            if isinstance(entry, dict):
+                entry.setdefault("platform_selected", False)
+                entry.setdefault("platform_order", 0)
+                entry.setdefault("platform_caption", "")
+
+        raw.setdefault("gpx_traces", {})
+        raw["gpx_traces"].setdefault("manual_segments", [])
+        raw["gpx_traces"].setdefault("live_topo", [])
+        raw.setdefault("gpx_workshop", {})
+        raw["gpx_workshop"].setdefault("categories", copy.deepcopy(self.default_gpx_categories()))
+        raw["gpx_workshop"].setdefault("sources", [])
+        raw["gpx_workshop"].setdefault("segments", [])
+        raw["gpx_workshop"].setdefault("last_export_at", None)
+        raw.setdefault("external_resources", [])
+        raw.setdefault("inventory_info", self.empty_inventory_info())
+        for key, value in self.empty_inventory_info().items():
+            raw["inventory_info"].setdefault(key, value)
+        raw.setdefault("platform_export", self.default_platform_export_state())
+        raw["platform_export"].setdefault("last_export_at", None)
+        raw["platform_export"].setdefault("last_export_folder", "")
+        raw["platform_export"].setdefault("target_repo_name", "Bisses")
+        return raw
+
+
+    def photo_foundation_file_state(self, root_folder, path):
+        """Empreinte légère : chemin relatif, taille et mtime_ns, sans lire l'EXIF."""
+        if not path or not os.path.isfile(path):
+            return None
+        stat = os.stat(path)
+        return {
+            "path": self.photo_relpath_from_root(root_folder, path),
+            "size": int(stat.st_size),
+            "mtime_ns": int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))),
+        }
+
+
+    def photo_foundation_state_matches(self, entry, source_state, working_state):
+        cached = entry.get("_photo_foundation_state") if isinstance(entry, dict) else None
+        if not isinstance(cached, dict):
+            return False
+        return cached.get("source") == source_state and cached.get("working") == working_state
+
+
+    def inspect_photo_foundation_work(self, root_folder, container, photos_folder=None, export_folder=None):
+        """Compte le travail réel sans lire les EXIF ; utilisé pour une progression honnête."""
+        root_folder = os.path.abspath(root_folder)
+        photos_folder = os.path.abspath(photos_folder or os.path.join(root_folder, "Photos"))
+        export_folder = os.path.abspath(export_folder or os.path.join(root_folder, "Export_JPG"))
+        entries = container.get("photos", []) if isinstance(container, dict) else []
+        by_source = {}
+        by_image = {}
+        by_original = {}
+        for idx, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                continue
+            sk = self.normalize_photo_catalog_key(entry.get("source_relative_path"))
+            ik = self.normalize_photo_catalog_key(entry.get("image_relative_path"))
+            ok = str(entry.get("original_filename") or "").casefold()
+            if sk: by_source.setdefault(sk, idx)
+            if ik: by_image.setdefault(ik, idx)
+            if ok: by_original.setdefault(ok, []).append(idx)
+
+        source_files = self.photo_files_for_automatic_preparation(photos_folder)
+        work = []
+        for source_path in source_files:
+            source_rel = self.photo_relpath_from_root(root_folder, source_path)
+            source_key = self.normalize_photo_catalog_key(source_rel)
+            source_name = os.path.basename(source_path)
+            ext = os.path.splitext(source_name)[1].lower()
+            is_heic = ext in (".heic", ".heif")
+            is_jpg = ext in (".jpg", ".jpeg")
+            idx = by_source.get(source_key)
+            if idx is None and is_jpg:
+                idx = by_image.get(source_key)
+            if idx is None:
+                candidates = by_original.get(source_name.casefold(), [])
+                if len(candidates) == 1:
+                    idx = candidates[0]
+            entry = entries[idx] if idx is not None and 0 <= idx < len(entries) and isinstance(entries[idx], dict) else None
+
+            working_path = ""
+            if entry:
+                rel = str(entry.get("image_relative_path") or "")
+                if rel:
+                    candidate = os.path.join(root_folder, rel.replace("/", os.sep))
+                    if os.path.isfile(candidate) and candidate.lower().endswith((".jpg", ".jpeg")):
+                        working_path = candidate
+            if is_heic and not working_path:
+                working_path = os.path.join(export_folder, os.path.splitext(source_name)[0] + ".jpg")
+            elif is_jpg:
+                working_path = source_path
+
+            source_state = self.photo_foundation_file_state(root_folder, source_path)
+            working_state = self.photo_foundation_file_state(root_folder, working_path)
+            needs_work = entry is None or not working_state or not self.photo_foundation_state_matches(entry, source_state, working_state)
+            if needs_work:
+                work.append(source_path)
+        return source_files, work
+
+
+    def prepare_folder_opening_context(self, folder, report=None):
+        """Prépare un dossier hors état actif ; cette fonction peut tourner dans un worker."""
+        folder = os.path.abspath(os.path.expanduser(folder))
+        if not os.path.isdir(folder):
+            raise FileNotFoundError(f"Dossier bisse introuvable : {folder}")
+        photos_folder = os.path.join(folder, "Photos")
+        if not os.path.isdir(photos_folder):
+            raise FileNotFoundError(
+                "Le dossier bisse doit contenir un sous-dossier 'Photos'.\n\n"
+                f"Dossier ouvert : {folder}"
+            )
+        export_folder = os.path.join(folder, "Export_JPG")
+        gpx_folder = os.path.join(folder, "Fichiers GPX")
+        catalog_path = os.path.join(folder, "catalogue.json")
+
+        if callable(report):
+            report("Analyse du dossier…", None, None)
+        container = self.read_catalog_container_for_opening(catalog_path, folder)
+        source_files, work_files = self.inspect_photo_foundation_work(
+            folder, container, photos_folder=photos_folder, export_folder=export_folder
+        )
+        work_keys = {os.path.normcase(os.path.abspath(path)) for path in work_files}
+        total_work = len(work_files)
+        completed = 0
+
+        def progress(_position, _total, filename):
+            nonlocal completed
+            path_key = os.path.normcase(os.path.abspath(filename)) if filename else ""
+            if path_key in work_keys:
+                completed += 1
+                if callable(report):
+                    report(
+                        f"Préparation des photos… {completed}/{max(1, total_work)} · {os.path.basename(filename)}",
+                        completed,
+                        max(1, total_work),
+                    )
+
+        if total_work and callable(report):
+            report("Préparation des photos…", 0, total_work)
+        elif callable(report):
+            report("Vérification des photographies…", None, None)
+
+        prepared, summary, changed = self.prepare_photo_foundation_for_folder(
+            folder,
+            container,
+            photos_folder=photos_folder,
+            export_folder=export_folder,
+            progress_callback=progress,
+            log_callback=None,
+        )
+        if changed or not os.path.exists(catalog_path):
+            self._write_json_atomic_v65(catalog_path, prepared, indent=4)
+
+        return {
+            "base_folder": folder,
+            "photos_folder": photos_folder,
+            "export_folder": export_folder,
+            "gpx_folder": gpx_folder,
+            "catalog_path": catalog_path,
+            "catalog_container": prepared,
+            "catalog_data": prepared.get("photos", []),
+            "summary": summary,
+            "source_count": len(source_files),
+            "work_count": total_work,
+        }
+
     def prepare_photo_foundation_for_folder(
         self,
         root_folder,
@@ -12348,91 +12629,47 @@ namespace GestionBissesFolderPicker
         photos_folder=None,
         export_folder=None,
         progress_callback=None,
+        log_callback=None,
     ):
-        """
-        Réconcilie automatiquement les photos présentes avec les données internes.
-
-        Non destructif :
-        - aucune photo source n'est déplacée, renommée ou supprimée ;
-        - un JPG de travail existant n'est jamais reconverti ;
-        - les titres, descriptions, GPS, ordres et sélections existants gagnent ;
-        - les entrées dont le fichier manque restent conservées ;
-        - seules les informations manquantes sont complétées.
-        """
+        """Réconcilie les photos sans écraser les données métier existantes."""
         root_folder = os.path.abspath(root_folder)
-        photos_folder = os.path.abspath(
-            photos_folder
-            or (
-                os.path.join(root_folder, "Photos")
-                if os.path.isdir(os.path.join(root_folder, "Photos"))
-                else root_folder
-            )
-        )
-        export_folder = os.path.abspath(
-            export_folder or os.path.join(root_folder, "Export_JPG")
-        )
-
+        photos_folder = os.path.abspath(photos_folder or os.path.join(root_folder, "Photos"))
+        export_folder = os.path.abspath(export_folder or os.path.join(root_folder, "Export_JPG"))
         if not isinstance(container, dict):
             raise ValueError("Conteneur de données photo invalide.")
-
         container.setdefault("photos", [])
         if not isinstance(container["photos"], list):
             container["photos"] = []
         entries = container["photos"]
-
         before = json.dumps(container, ensure_ascii=False, sort_keys=True, default=str)
 
-        by_source = {}
-        by_image = {}
-        original_name_indices = {}
-
+        by_source, by_image, original_name_indices = {}, {}, {}
         for idx, entry in enumerate(entries):
             if not isinstance(entry, dict):
                 continue
-
-            source_key = self.normalize_photo_catalog_key(
-                entry.get("source_relative_path")
-            )
-            image_key = self.normalize_photo_catalog_key(
-                entry.get("image_relative_path")
-            )
+            source_key = self.normalize_photo_catalog_key(entry.get("source_relative_path"))
+            image_key = self.normalize_photo_catalog_key(entry.get("image_relative_path"))
             original_key = str(entry.get("original_filename") or "").casefold()
+            if source_key: by_source.setdefault(source_key, idx)
+            if image_key: by_image.setdefault(image_key, idx)
+            if original_key: original_name_indices.setdefault(original_key, []).append(idx)
 
-            if source_key:
-                by_source.setdefault(source_key, idx)
-            if image_key:
-                by_image.setdefault(image_key, idx)
-            if original_key:
-                original_name_indices.setdefault(original_key, []).append(idx)
-
-        # Protection contre deux HEIC/HEIF qui voudraient utiliser le même JPG.
         claimed_working_paths = {}
         for idx, entry in enumerate(entries):
             if not isinstance(entry, dict):
                 continue
-            image_key = self.normalize_photo_catalog_key(
-                entry.get("image_relative_path")
-            )
-            source_key = self.normalize_photo_catalog_key(
-                entry.get("source_relative_path")
-            )
+            image_key = self.normalize_photo_catalog_key(entry.get("image_relative_path"))
+            source_key = self.normalize_photo_catalog_key(entry.get("source_relative_path"))
             if image_key:
-                claimed_working_paths.setdefault(
-                    image_key,
-                    source_key or f"entry:{idx}"
-                )
+                claimed_working_paths.setdefault(image_key, source_key or f"entry:{idx}")
 
         source_files = self.photo_files_for_automatic_preparation(photos_folder)
         total = max(1, len(source_files))
-
         summary = {
-            "sources": len(source_files),
-            "new_entries": 0,
-            "converted": 0,
-            "metadata_completed": 0,
-            "gps_found": 0,
-            "errors": 0,
-            "catalogue_changed": False,
+            "sources": len(source_files), "new_entries": 0, "converted": 0,
+            "metadata_completed": 0, "gps_found": 0, "errors": 0,
+            "catalogue_changed": False, "metadata_scanned": 0, "metadata_skipped": 0,
+            "error_messages": [],
         }
 
         for pos, source_path in enumerate(source_files, start=1):
@@ -12442,47 +12679,30 @@ namespace GestionBissesFolderPicker
             ext = os.path.splitext(source_name)[1].lower()
             is_heic = ext in (".heic", ".heif")
             is_jpg = ext in (".jpg", ".jpeg")
-
             entry_index = by_source.get(source_key)
-
-            # Après un renommage d'un JPG dans Photos/, image_relative_path est
-            # le meilleur identifiant et évite de créer un doublon.
             if entry_index is None and is_jpg:
                 entry_index = by_image.get(source_key)
-
-            # Compatibilité anciens catalogues : repli sur original_filename
-            # uniquement si le nom est unique.
             if entry_index is None:
                 candidates = original_name_indices.get(source_name.casefold(), [])
                 if len(candidates) == 1:
                     entry_index = candidates[0]
 
-            if entry_index is None:
+            new_entry = entry_index is None
+            if new_entry:
                 entry = {
-                    "filename": source_name,
-                    "original_filename": source_name,
-                    "source_relative_path": source_rel,
-                    "image_relative_path": source_rel,
-                    "status": "OK",
-                    "converted_from_heic": is_heic,
-                    "uses_original_jpg": is_jpg,
-                    "copied_from_jpg": False,
-                    "gps_sync": "NON_ENCORE_FAIT",
-                    "gps_source": None,
-                    "date_taken": None,
-                    "gps_coordinates": None,
-                    "title": "",
-                    "description": "",
-                    "platform_selected": False,
-                    "platform_order": 0,
-                    "platform_caption": "",
+                    "filename": source_name, "original_filename": source_name,
+                    "source_relative_path": source_rel, "image_relative_path": source_rel,
+                    "status": "OK", "converted_from_heic": is_heic,
+                    "uses_original_jpg": is_jpg, "copied_from_jpg": False,
+                    "gps_sync": "NON_ENCORE_FAIT", "gps_source": None,
+                    "date_taken": None, "gps_coordinates": None,
+                    "title": "", "description": "", "platform_selected": False,
+                    "platform_order": 0, "platform_caption": "",
                 }
                 entries.append(entry)
                 entry_index = len(entries) - 1
                 by_source[source_key] = entry_index
-                original_name_indices.setdefault(
-                    source_name.casefold(), []
-                ).append(entry_index)
+                original_name_indices.setdefault(source_name.casefold(), []).append(entry_index)
                 summary["new_entries"] += 1
             else:
                 entry = entries[entry_index]
@@ -12491,7 +12711,6 @@ namespace GestionBissesFolderPicker
                     entries[entry_index] = entry
 
             was_discarded = entry.get("status") == "SUPPRIMEE"
-
             entry.setdefault("original_filename", source_name)
             entry.setdefault("source_relative_path", source_rel)
             entry.setdefault("platform_selected", False)
@@ -12507,174 +12726,109 @@ namespace GestionBissesFolderPicker
             entry.setdefault("converted_from_heic", is_heic)
             entry.setdefault("uses_original_jpg", is_jpg)
 
-            # Si une image de travail déjà renommée existe, la conserver.
             working_path = ""
             existing_image_rel = str(entry.get("image_relative_path") or "")
             if existing_image_rel:
-                existing_image_path = os.path.join(
-                    root_folder,
-                    existing_image_rel.replace("/", os.sep)
-                )
-                if (
-                    os.path.isfile(existing_image_path)
-                    and existing_image_path.lower().endswith((".jpg", ".jpeg"))
-                ):
-                    working_path = existing_image_path
+                candidate = os.path.join(root_folder, existing_image_rel.replace("/", os.sep))
+                if os.path.isfile(candidate) and candidate.lower().endswith((".jpg", ".jpeg")):
+                    working_path = candidate
 
             try:
                 if is_heic:
                     if not working_path:
                         target_name = os.path.splitext(source_name)[0] + ".jpg"
                         target_path = os.path.join(export_folder, target_name)
-                        target_rel = self.photo_relpath_from_root(
-                            root_folder, target_path
-                        )
+                        target_rel = self.photo_relpath_from_root(root_folder, target_path)
                         target_key = self.normalize_photo_catalog_key(target_rel)
-
                         claimed_by = claimed_working_paths.get(target_key)
                         if claimed_by and claimed_by != source_key:
-                            raise RuntimeError(
-                                "Collision de JPG de travail pour "
-                                f"{source_name} : {target_name}"
-                            )
-
-                        if self.convert_heic_for_automatic_preparation(
-                            source_path, target_path
-                        ):
+                            raise RuntimeError(f"Collision de JPG de travail pour {source_name} : {target_name}")
+                        if self.convert_heic_for_automatic_preparation(source_path, target_path):
                             summary["converted"] += 1
-
                         working_path = target_path
                         claimed_working_paths[target_key] = source_key
-
                 elif is_jpg:
-                    # Les JPG/JPEG originaux sont utilisés directement.
                     working_path = source_path
 
                 if not working_path or not os.path.isfile(working_path):
-                    raise FileNotFoundError(
-                        f"Image de travail introuvable pour {source_name}"
-                    )
+                    raise FileNotFoundError(f"Image de travail introuvable pour {source_name}")
 
-                working_rel = self.photo_relpath_from_root(
-                    root_folder, working_path
-                )
-
+                working_rel = self.photo_relpath_from_root(root_folder, working_path)
                 current_rel = str(entry.get("image_relative_path") or "")
-                current_abs = (
-                    os.path.join(
-                        root_folder,
-                        current_rel.replace("/", os.sep)
-                    )
-                    if current_rel else ""
-                )
-
-                # Ne remplace le chemin que s'il manque ou ne pointe pas vers
-                # un JPG/JPEG de travail valide. Un HEIC source existant ne doit
-                # donc pas empêcher l'inscription du JPG converti dans Export_JPG.
-                current_is_valid_working = (
-                    bool(current_rel)
-                    and os.path.isfile(current_abs)
-                    and current_abs.lower().endswith((".jpg", ".jpeg"))
-                )
+                current_abs = os.path.join(root_folder, current_rel.replace("/", os.sep)) if current_rel else ""
+                current_is_valid_working = bool(current_rel) and os.path.isfile(current_abs) and current_abs.lower().endswith((".jpg", ".jpeg"))
                 if not current_is_valid_working:
                     entry["image_relative_path"] = working_rel
                     entry["filename"] = os.path.basename(working_path)
                 elif not entry.get("filename"):
                     entry["filename"] = os.path.basename(working_path)
-
-                entry["converted_from_heic"] = bool(
-                    entry.get("converted_from_heic") or is_heic
-                )
+                entry["converted_from_heic"] = bool(entry.get("converted_from_heic") or is_heic)
                 entry["uses_original_jpg"] = bool(is_jpg)
 
+                source_state = self.photo_foundation_file_state(root_folder, source_path)
+                working_state = self.photo_foundation_file_state(root_folder, working_path)
+                should_scan_metadata = new_entry or not self.photo_foundation_state_matches(entry, source_state, working_state)
                 metadata_changed = False
 
-                # Titres/descriptions : compléter seulement si vides.
-                text_meta = self.read_text_metadata_from_jpg(working_path)
-                if text_meta.get("ok"):
-                    meta_title = (text_meta.get("title") or "").strip()
-                    meta_description = (
-                        text_meta.get("description") or ""
-                    ).strip()
-
-                    if not (entry.get("title") or "").strip() and meta_title:
-                        entry["title"] = text_meta.get("title", "")
-                        metadata_changed = True
-                    if (
-                        not (entry.get("description") or "").strip()
-                        and meta_description
-                    ):
-                        entry["description"] = text_meta.get(
-                            "description", ""
-                        )
-                        metadata_changed = True
-
-                # Date : compléter même sans GPS.
-                if not entry.get("date_taken"):
-                    try:
-                        capture_dt = self.get_capture_datetime_for_sort(
-                            working_path, entry
-                        )
-                        if capture_dt != datetime.max:
-                            entry["date_taken"] = capture_dt.isoformat()
+                if should_scan_metadata:
+                    summary["metadata_scanned"] += 1
+                    text_meta = self.read_text_metadata_from_jpg(working_path)
+                    if text_meta.get("ok"):
+                        meta_title = (text_meta.get("title") or "").strip()
+                        meta_description = (text_meta.get("description") or "").strip()
+                        if not (entry.get("title") or "").strip() and meta_title:
+                            entry["title"] = text_meta.get("title", "")
                             metadata_changed = True
-                    except Exception:
-                        pass
+                        if not (entry.get("description") or "").strip() and meta_description:
+                            entry["description"] = text_meta.get("description", "")
+                            metadata_changed = True
 
-                # GPS EXIF : compléter seulement si le catalogue n'a pas déjà
-                # de coordonnées. Les corrections métier existantes gagnent.
-                if not entry.get("gps_coordinates"):
-                    gps_meta = self.read_gps_metadata_from_jpg(working_path)
-                    if gps_meta.get("ok"):
-                        entry["gps_coordinates"] = {
-                            "lat": gps_meta["lat"],
-                            "lon": gps_meta["lon"],
-                            "ele": gps_meta.get("ele"),
-                        }
-                        entry["gps_sync"] = "OK_METADATA"
-                        entry["gps_source"] = "JPG_EXIF"
-                        metadata_changed = True
-                        summary["gps_found"] += 1
+                    if not entry.get("date_taken"):
+                        try:
+                            capture_dt = self.get_capture_datetime_for_sort(working_path, entry)
+                            if capture_dt != datetime.max:
+                                entry["date_taken"] = capture_dt.isoformat()
+                                metadata_changed = True
+                        except Exception:
+                            pass
+
+                    if not entry.get("gps_coordinates"):
+                        gps_meta = self.read_gps_metadata_from_jpg(working_path)
+                        if gps_meta.get("ok"):
+                            entry["gps_coordinates"] = {"lat": gps_meta["lat"], "lon": gps_meta["lon"], "ele": gps_meta.get("ele")}
+                            entry["gps_sync"] = "OK_METADATA"
+                            entry["gps_source"] = "JPG_EXIF"
+                            metadata_changed = True
+                            summary["gps_found"] += 1
+                    entry["_photo_foundation_state"] = {"source": source_state, "working": working_state}
+                else:
+                    summary["metadata_skipped"] += 1
 
                 if metadata_changed:
                     summary["metadata_completed"] += 1
-
-                if (
-                    not was_discarded
-                    and entry.get("status") in (None, "", "ERREUR")
-                ):
+                if not was_discarded and entry.get("status") in (None, "", "ERREUR"):
                     entry["status"] = "OK"
                     entry.pop("error", None)
-
             except Exception as exc:
                 summary["errors"] += 1
+                message = f"Préparation automatique photo : {source_name} · {exc}"
+                summary["error_messages"].append(message)
                 if not was_discarded:
                     entry["status"] = "ERREUR"
                     entry["error"] = str(exc)
-                self.log(
-                    f"⚠️ Préparation automatique photo : {source_name} · {exc}"
-                )
+                if callable(log_callback):
+                    try: log_callback(message)
+                    except Exception: pass
 
             if callable(progress_callback):
-                try:
-                    progress_callback(pos, total, source_name)
-                except Exception:
-                    pass
+                try: progress_callback(pos, total, source_path)
+                except Exception: pass
 
-        after = json.dumps(
-            container,
-            ensure_ascii=False,
-            sort_keys=True,
-            default=str
-        )
+        after = json.dumps(container, ensure_ascii=False, sort_keys=True, default=str)
         changed = before != after
-
         if changed:
             container.setdefault("project", {})
-            container["project"]["updated_at"] = datetime.now().isoformat(
-                timespec="seconds"
-            )
-
+            container["project"]["updated_at"] = datetime.now().isoformat(timespec="seconds")
         summary["catalogue_changed"] = changed
         return container, summary, changed
 
@@ -12693,50 +12847,39 @@ namespace GestionBissesFolderPicker
             )
 
     def ensure_photo_foundation_automatic(self):
-        """Prépare prudemment le socle photo à l'ouverture, avec progression visible."""
-        source_count = len(self.photo_files_for_automatic_preparation(self.photos_folder))
+        """Préparation explicite du bisse actif ; la première ouverture utilise le pipeline asynchrone v66."""
+        if not self.base_folder:
+            return {}
+        container = self.read_catalog_container()
+        _sources, work_files = self.inspect_photo_foundation_work(
+            self.base_folder, container, photos_folder=self.photos_folder, export_folder=self.export_folder
+        )
         token = self.begin_activity(
             "Préparation des photos…",
-            mode="determinate",
-            maximum=max(1, source_count),
-            delay_ms=180,
+            mode="determinate" if work_files else "indeterminate",
+            maximum=max(1, len(work_files)),
+            delay_ms=300,
         )
-
-        def on_progress(position, total, filename):
-            label = os.path.basename(filename or "")
-            message = (
-                f"Préparation des photos… {position}/{total} · {label}"
-                if total else "Préparation des photos…"
-            )
-            self.update_activity(token, message, position, max(1, total))
-
+        work_keys = {os.path.normcase(os.path.abspath(path)) for path in work_files}
+        done = 0
+        def on_progress(_position, _total, filename):
+            nonlocal done
+            key = os.path.normcase(os.path.abspath(filename)) if filename else ""
+            if key in work_keys:
+                done += 1
+                self.update_activity(token, f"Préparation des photos… {done}/{max(1, len(work_files))} · {os.path.basename(filename)}", done, max(1, len(work_files)))
         try:
-            container = self.read_catalog_container()
             prepared, summary, changed = self.prepare_photo_foundation_for_folder(
-                self.base_folder,
-                container,
+                self.base_folder, container,
                 photos_folder=self.photos_folder,
                 export_folder=self.export_folder,
                 progress_callback=on_progress,
+                log_callback=lambda message: self.log(f"⚠️ {message}"),
             )
             self.catalog_container = prepared
             self.catalog_data = prepared.get("photos", [])
             if changed or not os.path.exists(self.catalog_path):
                 self.write_active_catalog_automatic()
-            if (
-                summary.get("new_entries")
-                or summary.get("converted")
-                or summary.get("metadata_completed")
-                or summary.get("errors")
-            ):
-                self.log(
-                    "📷 Préparation automatique : "
-                    f"{summary.get('sources', 0)} source(s), "
-                    f"{summary.get('new_entries', 0)} nouvelle(s), "
-                    f"{summary.get('converted', 0)} HEIC/HEIF convertie(s), "
-                    f"{summary.get('metadata_completed', 0)} métadonnée(s) complétée(s), "
-                    f"{summary.get('errors', 0)} erreur(s)."
-                )
             return summary
         finally:
             self.end_activity(token, restore_status=True)
@@ -13039,8 +13182,9 @@ namespace GestionBissesFolderPicker
         if not self.base_folder or not os.path.isdir(self.base_folder):
             messagebox.showwarning("Rendu / Prévisualisation", "Aucun bisse actif.")
             return
-        token = self.begin_activity("Génération de la prévisualisation…", delay_ms=120)
+        token = self.begin_activity("Génération de la prévisualisation…", delay_ms=0)
         try:
+            self.update_activity(token, "Génération de la prévisualisation…")
             root, errors = self.build_render_preview_for_folders([self.base_folder])
             self.start_local_preview_server(root)
             if errors:
@@ -13062,19 +13206,12 @@ namespace GestionBissesFolderPicker
             "Génération de la prévisualisation…",
             mode="determinate",
             maximum=max(1, len(folders)),
-            delay_ms=120,
+            delay_ms=0,
         )
         def progress(position, total, name):
-            self.update_activity(
-                token,
-                f"Prévisualisation… {position}/{total} · {name}",
-                position,
-                max(1, total),
-            )
+            self.update_activity(token, f"Prévisualisation… {position}/{total} · {name}", position, max(1, total))
         try:
-            root, errors = self.build_render_preview_for_folders(
-                folders, progress_callback=progress
-            )
+            root, errors = self.build_render_preview_for_folders(folders, progress_callback=progress)
             self.start_local_preview_server(root)
             if errors:
                 messagebox.showwarning(
