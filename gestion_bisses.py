@@ -54,7 +54,7 @@ BISSES_RENDER_README = "# Bisses\n\nPlateforme statique GitHub Pages pour l’in
 class BisseManagerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Abisses - v66")
+        self.root.title("Abisses - v67")
         self.configure_application_icon()
         self.configure_main_window_geometry()
 
@@ -2140,7 +2140,7 @@ class BisseManagerApp:
         text_widget.configure(state="disabled")
 
         buttons = tk.Frame(window, padx=12, pady=10)
-        buttons.pack(fill="x")
+        buttons.grid(row=3, column=0, sticky="ew")
 
         tk.Button(
             buttons,
@@ -6935,6 +6935,1015 @@ namespace GestionBissesFolderPicker
         return candidates
 
 
+    # ============================================================
+    # V67 — MES BISSES : AJOUT / RECONSTRUCTION GUIDÉS
+    # ============================================================
+
+    def workspace_identity_relation(self, folder, catalog_title="", catalog_slug=""):
+        """Classe l'écart entre le nom du dossier et l'identité déclarée dans le catalogue."""
+        folder_name = os.path.basename(os.path.abspath(folder or ""))
+        folder_slug = self.slugify(folder_name)
+        raw_catalog_identity = str(catalog_slug or catalog_title or "").strip()
+        if not raw_catalog_identity:
+            return "missing", 0.0
+        cat_slug = self.slugify(raw_catalog_identity)
+
+        def compact(value):
+            return self.slugify(value).replace("-", "")
+
+        folder_compact = compact(folder_slug)
+        cat_compact = compact(cat_slug)
+        if folder_compact and cat_compact and folder_compact == cat_compact:
+            return "exact", 1.0
+
+        ratio = difflib.SequenceMatcher(None, folder_compact, cat_compact).ratio() if folder_compact and cat_compact else 0.0
+
+        # Réutilise le garde-fou historique : une identité jugée compatible mais
+        # non identique est précisément un bon candidat à une uniformisation.
+        pseudo = {
+            "bisse_info": {"title": catalog_title or catalog_slug, "slug": cat_slug},
+            "project": {},
+        }
+        compatible = self.catalogue_seems_compatible_with_folder(pseudo, folder)
+        if compatible or ratio >= 0.72:
+            return "near", ratio
+        return "conflict", ratio
+
+    def raw_catalog_identity_for_workspace_scan(self, catalog_path):
+        """Lecture minimale, sans modifier l'état actif de l'application."""
+        if not catalog_path or not os.path.isfile(catalog_path):
+            return {
+                "exists": False,
+                "readable": True,
+                "title": "",
+                "slug": "",
+                "raw": None,
+                "legacy": False,
+                "error": "",
+            }
+        try:
+            with open(catalog_path, "r", encoding="utf-8") as handle:
+                raw = json.load(handle)
+        except Exception as exc:
+            return {
+                "exists": True,
+                "readable": False,
+                "title": "",
+                "slug": "",
+                "raw": None,
+                "legacy": False,
+                "error": str(exc),
+            }
+
+        if isinstance(raw, dict):
+            info = raw.get("bisse_info", {}) or {}
+            project = raw.get("project", {}) or {}
+            title = (
+                info.get("title")
+                or project.get("title")
+                or project.get("bisse_name")
+                or ""
+            )
+            slug = info.get("slug") or self.slugify(title)
+            return {
+                "exists": True,
+                "readable": True,
+                "title": str(title or ""),
+                "slug": self.slugify(slug or ""),
+                "raw": raw,
+                "legacy": False,
+                "error": "",
+            }
+
+        # Les très anciens catalogues peuvent être une simple liste de photos.
+        # Ils restent intégrables, mais leur identité vient alors du dossier.
+        if isinstance(raw, list):
+            return {
+                "exists": True,
+                "readable": True,
+                "title": "",
+                "slug": "",
+                "raw": raw,
+                "legacy": True,
+                "error": "",
+            }
+
+        return {
+            "exists": True,
+            "readable": False,
+            "title": "",
+            "slug": "",
+            "raw": raw,
+            "legacy": False,
+            "error": "Format de catalogue non reconnu.",
+        }
+
+    def analyze_workspace_folders_v67(self, folders, report=None):
+        """Analyse purement consultative d'une série de dossiers bisses."""
+        unique = []
+        seen = set()
+        for folder in folders or []:
+            if not folder or not os.path.isdir(folder):
+                continue
+            folder = os.path.abspath(folder)
+            key = os.path.normcase(folder)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(folder)
+
+        project_records = self.list_project_records()
+        by_project_id = {
+            str(record.get("project_id") or ""): record
+            for record in project_records
+            if record.get("project_id")
+        }
+        by_folder = {}
+        for record in project_records:
+            linked = record.get("linked_folder", "")
+            if linked:
+                by_folder[os.path.normcase(os.path.abspath(linked))] = record
+
+        plan = []
+        total = len(unique)
+        for index, folder in enumerate(unique, start=1):
+            if callable(report):
+                report(
+                    f"Analyse des bisses — {index}/{total} · {os.path.basename(folder)}",
+                    index - 1,
+                    max(1, total),
+                )
+
+            catalog_path = os.path.join(folder, "catalogue.json")
+            catalog = self.raw_catalog_identity_for_workspace_scan(catalog_path)
+            folder_name = os.path.basename(folder)
+            relation, ratio = self.workspace_identity_relation(
+                folder,
+                catalog.get("title", ""),
+                catalog.get("slug", ""),
+            )
+
+            if catalog.get("readable") and isinstance(catalog.get("raw"), dict):
+                container_for_id = catalog.get("raw")
+            else:
+                container_for_id = None
+            candidate_id = self.project_id_from_container_or_folder(folder, container_for_id)
+            linked_record = by_folder.get(os.path.normcase(folder))
+            candidate_record = by_project_id.get(candidate_id)
+
+            if not catalog.get("exists"):
+                status = "Sans catalogue"
+            elif not catalog.get("readable"):
+                status = "Catalogue illisible"
+            elif catalog.get("legacy"):
+                status = "Catalogue ancien — identité du dossier"
+            elif relation == "exact":
+                status = "Identité cohérente"
+            elif relation == "near":
+                status = "Nom proche — uniformisation proposée"
+            else:
+                status = "Identité incohérente — décision nécessaire"
+
+            if candidate_record and not linked_record:
+                status += " · projet Abisses existant possible"
+
+            item = {
+                "folder": folder,
+                "original_folder": folder,
+                "folder_name": folder_name,
+                "catalog_path": catalog_path,
+                "catalog_exists": bool(catalog.get("exists")),
+                "catalog_readable": bool(catalog.get("readable")),
+                "catalog_legacy": bool(catalog.get("legacy")),
+                "catalog_title": catalog.get("title", ""),
+                "catalog_slug": catalog.get("slug", ""),
+                "catalog_error": catalog.get("error", ""),
+                "identity_relation": relation,
+                "identity_ratio": ratio,
+                "candidate_id": candidate_id,
+                "linked_project_id": (linked_record or {}).get("project_id", ""),
+                "candidate_project_id": (candidate_record or {}).get("project_id", ""),
+                "candidate_project_folder": (candidate_record or {}).get("linked_folder", ""),
+                "candidate_project_hidden": bool((candidate_record or {}).get("hidden_from_workspace", False)),
+                "status": status,
+                "identity_action": "keep",
+                "project_action": "auto",
+                "preferred_project_id": "",
+                "skip": not bool(catalog.get("readable")),
+                "result": "",
+                "error": "",
+            }
+            plan.append(item)
+
+            if callable(report):
+                report(
+                    f"Analyse des bisses — {index}/{total} · {folder_name}",
+                    index,
+                    max(1, total),
+                )
+
+        groups = {}
+        for item in plan:
+            key = self.slugify(item.get("candidate_id") or "")
+            if not key:
+                continue
+            groups.setdefault(key, []).append(item)
+        for key, items in groups.items():
+            if len(items) > 1:
+                for item in items:
+                    item["duplicate_candidate_id"] = key
+                    if not item.get("skip"):
+                        item["status"] += " · doublon possible"
+
+        return plan
+
+    def start_workspace_folder_procedure(self, folders, mode="add"):
+        """Lance analyse -> décisions -> intégration, sans modifier pendant l'analyse."""
+        folders = [
+            os.path.abspath(folder)
+            for folder in (folders or [])
+            if folder and os.path.isdir(folder)
+        ]
+        if not folders:
+            messagebox.showwarning("Mes bisses", "Aucun dossier bisse valide n'a été trouvé.")
+            return
+
+        label = "Reconstruction de Mes bisses" if mode == "rebuild" else "Ajout dans Mes bisses"
+
+        def worker(report):
+            return self.analyze_workspace_folders_v67(folders, report=report)
+
+        def success(plan, _token):
+            self.show_workspace_procedure_review(plan, mode=mode)
+
+        self.run_background_activity(
+            f"{label} — analyse…",
+            worker,
+            success,
+            delay_ms=120,
+        )
+
+    def rebuild_workspace_from_parent_dialog(self):
+        parent = filedialog.askdirectory(
+            title="Choisir le dossier parent contenant les bisses",
+            initialdir=self.get_default_collection_root(),
+        )
+        if not parent:
+            return
+        parent = os.path.abspath(parent)
+        candidates = self.find_bisse_folders_in_parent(parent)
+        if not candidates:
+            messagebox.showwarning(
+                "Aucun bisse détecté",
+                (
+                    "Aucun sous-dossier ressemblant à un dossier bisse n'a été trouvé.\n\n"
+                    "La recherche porte volontairement sur les sous-dossiers immédiats."
+                ),
+            )
+            return
+        self.start_workspace_folder_procedure(candidates, mode="rebuild")
+
+    def show_workspace_procedure_review(self, plan, mode="add"):
+        """Résumé de l'analyse avant toute modification."""
+        window = tk.Toplevel(self.root)
+        window.title("Reconstruire Mes bisses" if mode == "rebuild" else "Ajouter des bisses")
+        screen_w = max(920, int(window.winfo_screenwidth()))
+        screen_h = max(620, int(window.winfo_screenheight()))
+        width = min(1180, max(920, screen_w - 120))
+        height = min(720, max(560, screen_h - 180))
+        window.geometry(f"{width}x{height}")
+        window.minsize(920, 520)
+        window.transient(self.root)
+        window.grab_set()
+        # v67 correctif UI : le tableau est la seule zone extensible.
+        # Les commandes de sélection et « Continuer… » restent toujours
+        # visibles, y compris avec la mise à l'échelle Windows.
+        window.grid_columnconfigure(0, weight=1)
+        window.grid_rowconfigure(1, weight=1)
+
+        counts = {
+            "total": len(plan),
+            "questions": sum(
+                1 for item in plan
+                if not item.get("skip") and item.get("identity_relation") in {"near", "conflict"}
+            ),
+            "errors": sum(1 for item in plan if item.get("skip")),
+            "missing": sum(1 for item in plan if not item.get("catalog_exists")),
+        }
+        intro = (
+            f"{counts['total']} dossier(s) analysé(s). "
+            f"{counts['questions']} identité(s) à confirmer, "
+            f"{counts['missing']} sans catalogue, {counts['errors']} erreur(s).\n\n"
+            "Aucune donnée n'a encore été modifiée. Les questions nécessaires seront posées avant l'intégration."
+        )
+        if mode == "rebuild":
+            intro += "\nLa liste Mes bisses ne sera remplacée qu'après cette étape de validation."
+
+        tk.Label(
+            window,
+            text=intro,
+            justify="left",
+            anchor="w",
+            wraplength=1100,
+        ).grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 8))
+
+        columns = ("include", "folder", "catalog", "status")
+        tree_frame = tk.Frame(window)
+        tree_frame.grid(row=1, column=0, sticky="nsew", padx=12, pady=6)
+        tree_frame.grid_rowconfigure(0, weight=1)
+        tree_frame.grid_columnconfigure(0, weight=1)
+        tree = ttk.Treeview(tree_frame, columns=columns, show="headings", height=12)
+        tree.heading("include", text="Inclure")
+        tree.heading("folder", text="Dossier")
+        tree.heading("catalog", text="Nom dans catalogue.json")
+        tree.heading("status", text="État")
+        tree.column("include", width=70, anchor="center")
+        tree.column("folder", width=330)
+        tree.column("catalog", width=280)
+        tree.column("status", width=400)
+        ybar = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+        xbar = ttk.Scrollbar(tree_frame, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=ybar.set, xscrollcommand=xbar.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        ybar.grid(row=0, column=1, sticky="ns")
+        xbar.grid(row=1, column=0, sticky="ew")
+
+        for index, item in enumerate(plan):
+            catalog_label = item.get("catalog_title") or (
+                "— catalogue absent —" if not item.get("catalog_exists") else "— identité absente —"
+            )
+            if item.get("catalog_error"):
+                catalog_label = f"Erreur : {item['catalog_error']}"
+            tree.insert(
+                "",
+                "end",
+                iid=str(index),
+                values=(
+                    "❌" if item.get("skip") else "✅",
+                    item.get("folder"),
+                    catalog_label,
+                    item.get("status"),
+                ),
+            )
+
+        selection_tools = tk.Frame(window, padx=12, pady=0)
+        selection_tools.grid(row=2, column=0, sticky="ew", pady=(2, 4))
+
+        def refresh_include_marks():
+            for row_id in tree.get_children():
+                try:
+                    item = plan[int(row_id)]
+                except Exception:
+                    continue
+                values = list(tree.item(row_id, "values"))
+                if values:
+                    values[0] = "❌" if item.get("skip") else "✅"
+                    tree.item(row_id, values=values)
+
+        def set_selected_included(value):
+            for row_id in tree.selection():
+                try:
+                    item = plan[int(row_id)]
+                except Exception:
+                    continue
+                if value and not item.get("catalog_readable", True):
+                    continue
+                item["skip"] = not value
+            refresh_include_marks()
+
+        def include_all_valid():
+            for item in plan:
+                item["skip"] = not bool(item.get("catalog_readable", True))
+            refresh_include_marks()
+
+        tk.Button(
+            selection_tools,
+            text="✅ Inclure la sélection",
+            command=lambda: set_selected_included(True),
+        ).pack(side="left")
+        tk.Button(
+            selection_tools,
+            text="🚫 Ignorer la sélection",
+            command=lambda: set_selected_included(False),
+        ).pack(side="left", padx=6)
+        tk.Button(
+            selection_tools,
+            text="Tout inclure (hors erreurs)",
+            command=include_all_valid,
+        ).pack(side="left", padx=(8, 0))
+
+        buttons = tk.Frame(window, padx=12, pady=10)
+        buttons.grid(row=3, column=0, sticky="ew")
+        tk.Button(buttons, text="Annuler", command=window.destroy).pack(side="right")
+
+        def continue_procedure():
+            window.destroy()
+            if not self.resolve_workspace_identity_questions(plan):
+                return
+            if not self.resolve_workspace_duplicate_questions(plan):
+                return
+            if not self.resolve_workspace_project_questions(plan):
+                return
+            self.apply_workspace_procedure_plan(plan, mode=mode)
+
+        tk.Button(
+            buttons,
+            text="Continuer…",
+            command=continue_procedure,
+            bg="#2c3e50",
+            fg="white",
+        ).pack(side="right", padx=(0, 8))
+
+    def ask_workspace_identity_decision(self, item):
+        """Demande quelle identité doit devenir la référence durable."""
+        folder_name = item.get("folder_name") or os.path.basename(item.get("folder", ""))
+        catalog_title = item.get("catalog_title") or item.get("catalog_slug") or ""
+        if not catalog_title:
+            item["identity_action"] = "keep"
+            return True
+
+        window = tk.Toplevel(self.root)
+        window.title("Uniformiser l'identité du bisse")
+        window.geometry("760x430")
+        window.resizable(False, False)
+        window.transient(self.root)
+        window.grab_set()
+
+        relation = item.get("identity_relation")
+        lead = (
+            "Les deux noms sont proches mais différents. Choisissez maintenant le nom de référence ; "
+            "Abisses les mettra en cohérence une fois pour toutes."
+            if relation == "near"
+            else
+            "Le nom du dossier et l'identité du catalogue ne concordent pas. Choisissez lequel est correct."
+        )
+        tk.Label(window, text=lead, justify="left", anchor="w", wraplength=720).pack(
+            fill="x", padx=14, pady=(14, 10)
+        )
+
+        details = tk.LabelFrame(window, text="Comparaison", padx=10, pady=8)
+        details.pack(fill="x", padx=14, pady=(0, 10))
+        tk.Label(details, text=f"Dossier : {folder_name}", anchor="w", justify="left").pack(fill="x")
+        tk.Label(details, text=f"catalogue.json : {catalog_title}", anchor="w", justify="left").pack(fill="x", pady=(4, 0))
+        tk.Label(details, text=item.get("folder", ""), anchor="w", justify="left", fg="#666666", wraplength=700).pack(fill="x", pady=(6, 0))
+
+        choice = tk.StringVar(value="folder")
+        options = tk.LabelFrame(window, text="Nom de référence", padx=10, pady=8)
+        options.pack(fill="x", padx=14, pady=(0, 10))
+        tk.Radiobutton(
+            options,
+            variable=choice,
+            value="folder",
+            text=f"Utiliser le nom du dossier : « {folder_name} »\n→ le catalogue sera mis en cohérence",
+            justify="left",
+            anchor="w",
+        ).pack(fill="x", anchor="w", pady=3)
+        tk.Radiobutton(
+            options,
+            variable=choice,
+            value="catalog",
+            text=f"Utiliser le nom du catalogue : « {catalog_title} »\n→ le dossier sera renommé explicitement",
+            justify="left",
+            anchor="w",
+        ).pack(fill="x", anchor="w", pady=3)
+        tk.Radiobutton(
+            options,
+            variable=choice,
+            value="skip",
+            text="Ignorer ce dossier pour cette opération",
+            justify="left",
+            anchor="w",
+        ).pack(fill="x", anchor="w", pady=3)
+
+        result = {"ok": False}
+        bottom = tk.Frame(window, padx=14, pady=10)
+        bottom.pack(fill="x")
+
+        def validate():
+            result["ok"] = True
+            item["identity_action"] = choice.get()
+            if choice.get() == "skip":
+                item["skip"] = True
+            window.destroy()
+
+        def cancel():
+            result["ok"] = False
+            window.destroy()
+
+        window.protocol("WM_DELETE_WINDOW", cancel)
+        tk.Button(bottom, text="Annuler toute la procédure", command=cancel).pack(side="left")
+        tk.Button(bottom, text="Valider ce choix", command=validate, bg="#2c3e50", fg="white").pack(side="right")
+        self.root.wait_window(window)
+        return bool(result["ok"])
+
+    def resolve_workspace_identity_questions(self, plan):
+        for item in plan:
+            if item.get("skip"):
+                continue
+            if item.get("identity_relation") in {"near", "conflict"}:
+                if not self.ask_workspace_identity_decision(item):
+                    return False
+        return True
+
+    def proposed_workspace_project_id(self, item):
+        action = item.get("identity_action")
+        if action == "folder":
+            return self.slugify(item.get("folder_name") or os.path.basename(item.get("folder", "")))
+        if action == "catalog":
+            return self.slugify(item.get("catalog_slug") or item.get("catalog_title") or item.get("candidate_id"))
+        return self.slugify(item.get("candidate_id") or item.get("folder_name") or "bisse")
+
+    def resolve_workspace_duplicate_questions(self, plan):
+        groups = {}
+        for item in plan:
+            if item.get("skip"):
+                continue
+            key = self.proposed_workspace_project_id(item)
+            if key:
+                groups.setdefault(key, []).append(item)
+
+        for key, items in groups.items():
+            if len(items) < 2:
+                continue
+
+            window = tk.Toplevel(self.root)
+            window.title("Doublon possible")
+            window.geometry("820x470")
+            window.transient(self.root)
+            window.grab_set()
+            tk.Label(
+                window,
+                text=(
+                    f"{len(items)} dossiers aboutissent encore à la même identité « {key} ».\n"
+                    "Choisissez le dossier à conserver, ou traitez-les comme distincts en utilisant leurs noms de dossiers."
+                ),
+                justify="left",
+                anchor="w",
+                wraplength=780,
+            ).pack(fill="x", padx=14, pady=(14, 10))
+
+            keep = tk.StringVar(value="0")
+            box = tk.LabelFrame(window, text="Dossiers concernés", padx=10, pady=8)
+            box.pack(fill="both", expand=True, padx=14, pady=(0, 10))
+            for idx, item in enumerate(items):
+                tk.Radiobutton(
+                    box,
+                    variable=keep,
+                    value=str(idx),
+                    text=f"{os.path.basename(item.get('folder', ''))}\n{item.get('folder', '')}",
+                    justify="left",
+                    anchor="w",
+                ).pack(fill="x", anchor="w", pady=3)
+
+            result = {"ok": False, "mode": "keep"}
+            buttons = tk.Frame(window, padx=14, pady=10)
+            buttons.pack(fill="x")
+
+            def keep_one():
+                result["ok"] = True
+                result["mode"] = "keep"
+                window.destroy()
+
+            def distinct():
+                result["ok"] = True
+                result["mode"] = "distinct"
+                window.destroy()
+
+            def cancel():
+                window.destroy()
+
+            window.protocol("WM_DELETE_WINDOW", cancel)
+            tk.Button(buttons, text="Annuler toute la procédure", command=cancel).pack(side="left")
+            tk.Button(buttons, text="Utiliser les noms des dossiers", command=distinct).pack(side="right")
+            tk.Button(buttons, text="Conserver seulement le dossier choisi", command=keep_one, bg="#2c3e50", fg="white").pack(side="right", padx=(0, 8))
+            self.root.wait_window(window)
+            if not result["ok"]:
+                return False
+            if result["mode"] == "distinct":
+                for item in items:
+                    item["identity_action"] = "folder"
+            else:
+                selected = int(keep.get())
+                for idx, item in enumerate(items):
+                    if idx != selected:
+                        item["skip"] = True
+        return True
+
+    def ask_workspace_project_decision(self, item, record):
+        project_id = record.get("project_id", "")
+        linked = record.get("linked_folder", "")
+        window = tk.Toplevel(self.root)
+        window.title("Projet Abisses existant")
+        window.geometry("790x430")
+        window.resizable(False, False)
+        window.transient(self.root)
+        window.grab_set()
+
+        tk.Label(
+            window,
+            text=(
+                "Un projet Abisses portant la même identité existe déjà. "
+                "Décidez s'il s'agit du même bisse avec une source plus récente, ou d'un nouveau projet distinct."
+            ),
+            justify="left",
+            anchor="w",
+            wraplength=750,
+        ).pack(fill="x", padx=14, pady=(14, 10))
+
+        details = tk.LabelFrame(window, text="Correspondance", padx=10, pady=8)
+        details.pack(fill="x", padx=14, pady=(0, 10))
+        tk.Label(details, text=f"Projet existant : {project_id}", anchor="w").pack(fill="x")
+        tk.Label(details, text=f"Ancienne source : {linked or '—'}", anchor="w", wraplength=720, fg="#666666").pack(fill="x", pady=(4, 0))
+        tk.Label(details, text=f"Nouvelle source : {item.get('folder', '')}", anchor="w", wraplength=720).pack(fill="x", pady=(4, 0))
+
+        choice = tk.StringVar(value="reuse")
+        options = tk.LabelFrame(window, text="Décision", padx=10, pady=8)
+        options.pack(fill="x", padx=14)
+        tk.Radiobutton(
+            options,
+            variable=choice,
+            value="reuse",
+            text="Relier ce dossier au projet existant (cas normal pour une source déplacée ou plus récente)",
+            anchor="w",
+        ).pack(fill="x", anchor="w", pady=3)
+        tk.Radiobutton(
+            options,
+            variable=choice,
+            value="new",
+            text="Créer un projet Abisses distinct",
+            anchor="w",
+        ).pack(fill="x", anchor="w", pady=3)
+        tk.Radiobutton(
+            options,
+            variable=choice,
+            value="skip",
+            text="Ignorer ce dossier",
+            anchor="w",
+        ).pack(fill="x", anchor="w", pady=3)
+
+        result = {"ok": False}
+        bottom = tk.Frame(window, padx=14, pady=10)
+        bottom.pack(fill="x")
+
+        def validate():
+            result["ok"] = True
+            item["project_action"] = choice.get()
+            if choice.get() == "reuse":
+                item["preferred_project_id"] = project_id
+            elif choice.get() == "skip":
+                item["skip"] = True
+            window.destroy()
+
+        def cancel():
+            window.destroy()
+
+        window.protocol("WM_DELETE_WINDOW", cancel)
+        tk.Button(bottom, text="Annuler toute la procédure", command=cancel).pack(side="left")
+        tk.Button(bottom, text="Valider ce choix", command=validate, bg="#2c3e50", fg="white").pack(side="right")
+        self.root.wait_window(window)
+        return bool(result["ok"])
+
+    def find_possible_project_record_v67(self, project_id, folder, records):
+        project_id = self.slugify(project_id or "")
+        folder_abs = os.path.abspath(folder or "") if folder else ""
+        by_id = {record.get("project_id", ""): record for record in records if record.get("project_id")}
+        if project_id in by_id:
+            return by_id[project_id]
+
+        # Correspondance exacte par ancien chemin lié.
+        if folder_abs:
+            for record in records:
+                linked = record.get("linked_folder", "")
+                if linked and os.path.normcase(os.path.abspath(linked)) == os.path.normcase(folder_abs):
+                    return record
+
+        # Ancien projet au nom très proche : on ne décide jamais automatiquement,
+        # on ne fait que le proposer à l'utilisateur.
+        compact_candidate = project_id.replace("-", "")
+        if not compact_candidate or self.is_generic_project_id(project_id):
+            return None
+        scored = []
+        for record in records:
+            candidates = [
+                record.get("project_id", ""),
+                record.get("slug", ""),
+                self.slugify(record.get("title", "")),
+            ]
+            best = 0.0
+            for value in candidates:
+                value_slug = self.slugify(value or "")
+                if not value_slug or self.is_generic_project_id(value_slug):
+                    continue
+                ratio = difflib.SequenceMatcher(
+                    None,
+                    compact_candidate,
+                    value_slug.replace("-", ""),
+                ).ratio()
+                best = max(best, ratio)
+            if best >= 0.82:
+                scored.append((best, record))
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        if not scored:
+            return None
+        if len(scored) > 1 and abs(scored[0][0] - scored[1][0]) < 0.03:
+            return None
+        return scored[0][1]
+
+    def resolve_workspace_project_questions(self, plan):
+        records = self.list_project_records()
+        for item in plan:
+            if item.get("skip") or not item.get("catalog_exists"):
+                continue
+            project_id = self.proposed_workspace_project_id(item)
+            record = self.find_possible_project_record_v67(project_id, item.get("folder", ""), records)
+            if not record:
+                continue
+            linked = record.get("linked_folder", "")
+            if linked and os.path.normcase(os.path.abspath(linked)) == os.path.normcase(os.path.abspath(item.get("folder", ""))):
+                item["preferred_project_id"] = project_id
+                item["project_action"] = "reuse"
+                continue
+            if not self.ask_workspace_project_decision(item, record):
+                return False
+        return True
+
+    def safe_workspace_folder_name(self, title):
+        title = str(title or "").strip()
+        title = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "-", title)
+        title = re.sub(r"\s+", " ", title).strip(" .")
+        return title or "Bisse"
+
+    def backup_catalog_before_identity_v67(self, folder, label="avant_uniformisation_v67"):
+        path = os.path.join(os.path.abspath(folder), "catalogue.json")
+        if not os.path.isfile(path):
+            return ""
+        try:
+            backup_root = self.get_app_data_path("identity_backups")
+            os.makedirs(backup_root, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            stem = self.slugify(os.path.basename(folder) or "bisse")
+            safe_label = self.slugify(label)
+            target = os.path.join(backup_root, f"{stem}_{safe_label}_{stamp}.json")
+            shutil.copy2(path, target)
+            return target
+        except Exception as exc:
+            self.log(f"⚠️ Sauvegarde avant uniformisation impossible : {exc}")
+            return ""
+
+    def update_catalog_identity_v67(self, folder, title):
+        """Uniformise title/slug dans le catalogue local, avec sauvegarde de sécurité."""
+        folder = os.path.abspath(folder)
+        path = os.path.join(folder, "catalogue.json")
+        if not os.path.isfile(path):
+            return
+        with open(path, "r", encoding="utf-8") as handle:
+            raw = json.load(handle)
+        if not isinstance(raw, dict):
+            # Un catalogue ancien sera normalisé lors de sa vraie ouverture ; on
+            # ne tente pas de réécrire ici un format que l'utilisateur n'a pas validé.
+            return
+
+        self.backup_catalog_before_identity_v67(folder, "avant_uniformisation_v67")
+
+        slug = self.slugify(title)
+        info = raw.setdefault("bisse_info", {})
+        project = raw.setdefault("project", {})
+        info["title"] = title
+        info["slug"] = slug
+        project["title"] = title
+        project["bisse_name"] = title
+        project["source_folder"] = folder
+        project["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        self._write_json_atomic_v65(path, raw, indent=4)
+
+    def update_catalog_source_folder_v67(self, folder):
+        path = os.path.join(folder, "catalogue.json")
+        if not os.path.isfile(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                raw = json.load(handle)
+            if not isinstance(raw, dict):
+                return
+            self.backup_catalog_before_identity_v67(folder, "avant_maj_chemin_v67")
+            project = raw.setdefault("project", {})
+            project["source_folder"] = folder
+            project["updated_at"] = datetime.now().isoformat(timespec="seconds")
+            self._write_json_atomic_v65(path, raw, indent=4)
+        except Exception:
+            raise
+
+    def make_distinct_project_id_v67(self, base_id, folder):
+        base = self.slugify(base_id or os.path.basename(folder) or "bisse")
+        root = self.get_projects_root()
+        if not os.path.exists(os.path.join(root, base)):
+            return base
+        suffix = uuid.uuid5(uuid.NAMESPACE_URL, os.path.abspath(folder)).hex[:6]
+        candidate = self.slugify(f"{base}-{suffix}")
+        counter = 2
+        while os.path.exists(os.path.join(root, candidate)):
+            candidate = self.slugify(f"{base}-{suffix}-{counter}")
+            counter += 1
+        return candidate
+
+    def apply_workspace_procedure_plan(self, plan, mode="add"):
+        """Applique les décisions une par une, puis écrit Mes bisses une seule fois."""
+        selected = [item for item in plan if not item.get("skip")]
+        skipped = [item for item in plan if item.get("skip")]
+        if not selected:
+            details = "\n".join(
+                f"• {os.path.basename(item.get('folder', ''))} : {item.get('catalog_error') or 'ignoré'}"
+                for item in skipped[:8]
+            )
+            messagebox.showwarning(
+                "Mes bisses",
+                "Aucun dossier n'a été retenu." + (f"\n\n{details}" if details else ""),
+            )
+            return
+
+        token = self.begin_activity(
+            "Intégration dans Mes bisses…",
+            mode="determinate",
+            maximum=max(1, len(selected)),
+            delay_ms=0,
+        )
+        saved_active = self.capture_active_bisse_state()
+        new_entries = []
+        errors = []
+        uniformized = 0
+        associated = 0
+        distinct = 0
+        now = datetime.now().isoformat(timespec="seconds")
+
+        def finish():
+            self.restore_active_bisse_state(saved_active)
+            if mode == "rebuild":
+                workspace = self.default_workspace()
+            else:
+                workspace = self.read_workspace()
+            bisses = workspace.setdefault("bisses", [])
+
+            for new_entry in new_entries:
+                folder = os.path.abspath(new_entry.get("folder", ""))
+                project_id = new_entry.get("project_id", "")
+                found = False
+                for entry in bisses:
+                    same_project = bool(project_id and entry.get("project_id") == project_id)
+                    same_folder = bool(
+                        entry.get("folder")
+                        and os.path.normcase(os.path.abspath(entry.get("folder"))) == os.path.normcase(folder)
+                    )
+                    if same_project or same_folder:
+                        first = entry.get("first_opened_at") or new_entry.get("first_opened_at") or now
+                        entry.update(new_entry)
+                        entry["first_opened_at"] = first
+                        found = True
+                        break
+                if not found:
+                    bisses.append(new_entry)
+
+            if mode == "rebuild":
+                selected_project_ids = {
+                    entry.get("project_id", "") for entry in new_entries if entry.get("project_id")
+                }
+                # Mes bisses inclut aussi les project.json non masqués. Pour qu'une
+                # reconstruction soit réelle, les anciens projets non retenus doivent
+                # donc être masqués explicitement, jamais supprimés.
+                for record in self.list_project_records():
+                    project_id = record.get("project_id", "")
+                    if not project_id:
+                        continue
+                    should_hide = project_id not in selected_project_ids
+                    if bool(record.get("hidden_from_workspace", False)) != should_hide:
+                        self.set_project_hidden_from_workspace(project_id, should_hide)
+
+            bisses.sort(
+                key=lambda entry: (
+                    self.get_bisse_summary_from_project(entry.get("project_id", ""), entry.get("folder", ""))
+                    if entry.get("project_id")
+                    else self.get_bisse_summary_from_folder(entry.get("folder", ""))
+                ).get("title", "").lower()
+            )
+            self.write_workspace(workspace)
+            self.end_activity(token, restore_status=True)
+            self.show_workspace_home()
+
+            message = (
+                f"Dossiers retenus : {len(selected)}\n"
+                f"Intégrés : {len(new_entries)}\n"
+                f"Identités uniformisées : {uniformized}\n"
+                f"Projets existants reliés : {associated}\n"
+                f"Nouveaux projets distincts : {distinct}\n"
+                f"Ignorés / non intégrables : {len(skipped)}\n"
+                f"Erreurs pendant l'intégration : {len(errors)}"
+            )
+            if skipped:
+                message += "\n\nIgnorés :\n" + "\n".join(
+                    f"• {os.path.basename(item.get('folder', ''))} : {item.get('catalog_error') or 'choix utilisateur'}"
+                    for item in skipped[:8]
+                )
+            if errors:
+                message += "\n\nProblèmes :\n" + "\n".join(f"• {err}" for err in errors[:10])
+                if len(errors) > 10:
+                    message += f"\n… {len(errors) - 10} autre(s)"
+            messagebox.showinfo(
+                "Reconstruction terminée" if mode == "rebuild" else "Ajout terminé",
+                message,
+            )
+
+        state = {"index": 0}
+
+        def process_next():
+            nonlocal uniformized, associated, distinct
+            if state["index"] >= len(selected):
+                finish()
+                return
+
+            item = selected[state["index"]]
+            position = state["index"] + 1
+            folder = os.path.abspath(item.get("folder", ""))
+            display_name = os.path.basename(folder) or folder
+            self.update_activity(
+                token,
+                f"Intégration — {position}/{len(selected)} · {display_name}",
+                position - 1,
+                max(1, len(selected)),
+            )
+
+            try:
+                # 1) Uniformisation explicite de l'identité.
+                if item.get("identity_action") == "folder" and item.get("catalog_exists"):
+                    self.update_catalog_identity_v67(folder, os.path.basename(folder))
+                    uniformized += 1
+                elif item.get("identity_action") == "catalog":
+                    title = item.get("catalog_title") or item.get("catalog_slug")
+                    target_name = self.safe_workspace_folder_name(title)
+                    target = os.path.join(os.path.dirname(folder), target_name)
+                    if os.path.normcase(os.path.abspath(target)) != os.path.normcase(folder):
+                        if os.path.exists(target):
+                            raise FileExistsError(f"Impossible de renommer : le dossier existe déjà : {target}")
+                        os.rename(folder, target)
+                        if os.path.normcase(saved_active.get("base_folder", "")) == os.path.normcase(folder):
+                            saved_active["base_folder"] = target
+                            saved_active["photos_folder"] = os.path.join(target, "Photos") if os.path.isdir(os.path.join(target, "Photos")) else target
+                            saved_active["export_folder"] = os.path.join(target, "Export_JPG")
+                            saved_active["gpx_folder"] = os.path.join(target, "Fichiers GPX")
+                            saved_active["local_catalog_path"] = os.path.join(target, "catalogue.json")
+                            saved_active["catalog_path"] = os.path.join(target, "catalogue.json")
+                            if isinstance(saved_active.get("catalog_container"), dict):
+                                saved_active["catalog_container"] = copy.deepcopy(saved_active["catalog_container"])
+                                saved_active["catalog_container"].setdefault("project", {})["source_folder"] = target
+                        folder = target
+                        item["folder"] = target
+                    self.update_catalog_source_folder_v67(folder)
+                    uniformized += 1
+
+                # 2) Projet Data seulement si un catalogue existe déjà.
+                project_id = ""
+                if os.path.isfile(os.path.join(folder, "catalogue.json")):
+                    action = item.get("project_action", "auto")
+                    if action == "reuse" and item.get("preferred_project_id"):
+                        project_id = self.slugify(item.get("preferred_project_id"))
+                        self.sync_project_catalogue_for_folder(project_id, folder, allow_data_to_local=False)
+                        associated += 1
+                    elif action == "new":
+                        project_id = self.make_distinct_project_id_v67(
+                            self.proposed_workspace_project_id(item),
+                            folder,
+                        )
+                        self.sync_project_catalogue_for_folder(project_id, folder, allow_data_to_local=False)
+                        distinct += 1
+                    else:
+                        project_id = self.ensure_project_for_folder(folder)
+
+                    if project_id:
+                        self.set_project_hidden_from_workspace(project_id, False)
+
+                new_entries.append({
+                    "project_id": project_id,
+                    "folder": folder,
+                    "first_opened_at": now,
+                    "last_opened_at": now,
+                })
+                item["result"] = "ok"
+            except Exception as exc:
+                item["result"] = "error"
+                item["error"] = str(exc)
+                errors.append(f"{display_name} : {exc}")
+                self.log(f"❌ Intégration Mes bisses impossible : {folder} — {exc}")
+
+            self.update_activity(
+                token,
+                f"Intégration — {position}/{len(selected)} · {display_name}",
+                position,
+                max(1, len(selected)),
+            )
+            state["index"] += 1
+            self.root.after(25, process_next)
+
+        process_next()
+
+
     def add_folders_to_workspace_bulk(self, folders, show_summary=True):
         """
         Ajoute vraiment les dossiers à Mes bisses, puis vérifie que chaque
@@ -7109,13 +8118,13 @@ namespace GestionBissesFolderPicker
             return
 
         self.log(
-            "📁 Ajouter plusieurs — sélection brute : "
+            "📁 Ajouter des bisses — sélection brute : "
             + " | ".join(selected_roots)
         )
 
         candidates = self.build_workspace_candidates_from_selected_folders(selected_roots)
         self.log(
-            "📁 Ajouter plusieurs — candidats : "
+            "📁 Ajouter des bisses — candidats : "
             + " | ".join(candidates)
         )
 
@@ -7139,14 +8148,14 @@ namespace GestionBissesFolderPicker
         )
 
         if direct_multi_selection or direct_single_bisse:
-            self.add_folders_to_workspace_bulk(candidates, show_summary=True)
+            self.start_workspace_folder_procedure(candidates, mode="add")
             return
 
         self.show_multiple_bisse_folder_confirmation(selected_roots, candidates)
 
     def show_multiple_bisse_folder_confirmation(self, selected_roots, candidates):
         window = tk.Toplevel(self.root)
-        window.title("Ajouter plusieurs bisses à Mes bisses")
+        window.title("Ajouter des bisses à Mes bisses")
         window.geometry("980x620")
         window.transient(self.root)
         window.grab_set()
@@ -7228,7 +8237,7 @@ namespace GestionBissesFolderPicker
                 return
 
             window.destroy()
-            self.add_folders_to_workspace_bulk(selected, show_summary=True)
+            self.start_workspace_folder_procedure(selected, mode="add")
 
         tk.Button(buttons, text="Tout sélectionner", command=lambda: set_all(True)).pack(side="left")
         tk.Button(buttons, text="Tout désélectionner", command=lambda: set_all(False)).pack(side="left", padx=6)
@@ -7801,7 +8810,7 @@ namespace GestionBissesFolderPicker
 
         tk.Button(
             work_actions,
-            text="📂 Ouvrir un dossier bisse",
+            text="📂 Ouvrir un bisse",
             command=self.select_base_folder,
             bg="#2c3e50",
             fg="white"
@@ -7809,11 +8818,17 @@ namespace GestionBissesFolderPicker
 
         tk.Button(
             work_actions,
-            text="📁 Ajouter plusieurs",
+            text="➕ Ajouter des bisses…",
             command=self.add_multiple_bisse_folders_to_workspace_dialog
         ).grid(row=0, column=1, sticky="ew", padx=(3, 0))
 
-        publication_actions = tk.LabelFrame(action_area, text="Lot plateforme", padx=8, pady=6)
+        tk.Button(
+            work_actions,
+            text="♻️ Reconstruire depuis un dossier parent…",
+            command=self.rebuild_workspace_from_parent_dialog
+        ).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+
+        publication_actions = tk.LabelFrame(action_area, text="Plateforme", padx=8, pady=6)
         publication_actions.grid(row=0, column=1, sticky="nsew", padx=4)
         publication_actions.grid_columnconfigure(0, weight=1)
 
@@ -11816,27 +12831,45 @@ namespace GestionBissesFolderPicker
         for item in self.publication_tree.get_children():
             self.publication_tree.delete(item)
 
-        collection = self.read_publication_collection()
-        for entry in collection.get("bisses", []):
+        entries = self.get_workspace_entries()
+        visible = 0
+        for entry in entries:
             folder = entry.get("folder", "")
-            summary = self.get_bisse_summary_from_folder(folder) if folder else entry
-            item_id = summary.get("folder") or summary.get("id")
-            self.publication_tree.insert(
-                "",
-                "end",
-                iid=item_id,
-                values=(
-                    summary.get("title", ""),
-                    summary.get("id", ""),
-                    summary.get("photos_selected", 0),
-                    summary.get("segments_count", 0),
-                    "✅" if summary.get("exportable") else "⚠️",
-                    summary.get("folder", "")
+            if not folder or not os.path.isdir(folder):
+                continue
+            summary = self.get_bisse_summary_from_folder(folder)
+            item_id = summary.get("folder") or summary.get("id") or f"row-{visible}"
+            try:
+                self.publication_tree.insert(
+                    "",
+                    "end",
+                    iid=item_id,
+                    values=(
+                        summary.get("title", ""),
+                        summary.get("id", ""),
+                        summary.get("photos_selected", 0),
+                        summary.get("segments_count", 0),
+                        "✅" if summary.get("exportable") else "⚠️",
+                        summary.get("folder", ""),
+                    ),
                 )
-            )
+            except Exception:
+                self.publication_tree.insert(
+                    "",
+                    "end",
+                    values=(
+                        summary.get("title", ""),
+                        summary.get("id", ""),
+                        summary.get("photos_selected", 0),
+                        summary.get("segments_count", 0),
+                        "✅" if summary.get("exportable") else "⚠️",
+                        summary.get("folder", ""),
+                    ),
+                )
+            visible += 1
 
         self.publication_status_var.set(
-            f"Collection : {self.get_publication_collection_path()} · {len(collection.get('bisses', []))} bisse(s)"
+            f"Mes bisses : {visible} dossier(s) accessible(s). La sélection d'export est choisie au moment de publier."
         )
 
     def add_folder_to_publication_collection(self, folder):
@@ -11959,6 +12992,326 @@ namespace GestionBissesFolderPicker
             "segments_count": len(geojson.get("features", [])),
             "index_entry": self.build_bisse_index_entry(slug, platform_catalogue)
         }
+
+    # ============================================================
+    # V67 — SÉLECTION COMMUNE POUR PRÉVISUALISATION / EXPORT
+    # ============================================================
+
+    def workspace_selectable_folders_v67(self):
+        result = []
+        seen = set()
+        for entry in self.get_workspace_entries():
+            folder = entry.get("folder", "")
+            if not folder or not os.path.isdir(folder):
+                continue
+            folder = os.path.abspath(folder)
+            key = os.path.normcase(folder)
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append({
+                "folder": folder,
+                "title": entry.get("title") or os.path.basename(folder),
+                "source": "Mes bisses",
+            })
+        result.sort(key=lambda item: (item.get("title", "").casefold(), item.get("folder", "").casefold()))
+        return result
+
+    def show_bisse_set_selection_dialog_v67(self, *, title, intro, confirm_text, on_confirm, default_all=True):
+        """Sélection éphémère : Mes bisses + dossiers externes, sans collection parallèle persistante."""
+        window = tk.Toplevel(self.root)
+        window.title(title)
+        window.geometry("980x680")
+        window.minsize(820, 520)
+        window.transient(self.root)
+        window.grab_set()
+
+        tk.Label(
+            window,
+            text=intro,
+            justify="left",
+            anchor="w",
+            wraplength=930,
+        ).pack(fill="x", padx=12, pady=(12, 8))
+
+        entries = self.workspace_selectable_folders_v67()
+        state = {}
+        scroll_host = tk.Frame(window)
+        scroll_host.pack(fill="both", expand=True, padx=12, pady=6)
+        canvas = tk.Canvas(scroll_host, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(scroll_host, orient="vertical", command=canvas.yview)
+        rows = tk.Frame(canvas, padx=4, pady=4)
+        inner = canvas.create_window((0, 0), window=rows, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        def refresh_scroll(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def resize_inner(event):
+            canvas.itemconfigure(inner, width=event.width)
+
+        rows.bind("<Configure>", refresh_scroll)
+        canvas.bind("<Configure>", resize_inner)
+
+        def add_entry(folder, source="Externe", checked=True):
+            if not folder or not os.path.isdir(folder):
+                return
+            folder = os.path.abspath(folder)
+            key = os.path.normcase(folder)
+            if key in state:
+                state[key]["var"].set(True)
+                return
+            summary = self.get_bisse_summary_from_folder(folder)
+            var = tk.BooleanVar(value=checked)
+            row = tk.Frame(rows)
+            row.pack(fill="x", pady=3)
+            tk.Checkbutton(row, variable=var).pack(side="left", anchor="n")
+            label = (
+                f"{summary.get('title') or os.path.basename(folder)} · {source}\n"
+                f"{folder}"
+            )
+            tk.Label(row, text=label, justify="left", anchor="w", wraplength=860).pack(
+                side="left", fill="x", expand=True
+            )
+            state[key] = {"folder": folder, "var": var, "row": row, "source": source}
+
+        for entry in entries:
+            add_entry(entry["folder"], source=entry.get("source", "Mes bisses"), checked=default_all)
+
+        controls = tk.Frame(window, padx=12, pady=8)
+        controls.pack(fill="x")
+
+        def set_all(value):
+            for item in state.values():
+                item["var"].set(bool(value))
+
+        def add_external_folder():
+            folder = filedialog.askdirectory(
+                title="Ajouter un dossier bisse à cette sélection",
+                initialdir=self.get_default_collection_root(),
+                parent=window,
+            )
+            if folder:
+                add_entry(folder, source="Externe", checked=True)
+
+        def add_external_parent():
+            parent = filedialog.askdirectory(
+                title="Ajouter les bisses d'un dossier parent à cette sélection",
+                initialdir=self.get_default_collection_root(),
+                parent=window,
+            )
+            if not parent:
+                return
+            candidates = self.find_bisse_folders_in_parent(parent)
+            if not candidates:
+                messagebox.showwarning("Aucun bisse", "Aucun sous-dossier bisse détecté.", parent=window)
+                return
+            for folder in candidates:
+                add_entry(folder, source="Dossier parent", checked=True)
+
+        tk.Button(controls, text="Tout sélectionner", command=lambda: set_all(True)).pack(side="left")
+        tk.Button(controls, text="Tout désélectionner", command=lambda: set_all(False)).pack(side="left", padx=6)
+        tk.Button(controls, text="➕ Dossier externe…", command=add_external_folder).pack(side="left", padx=(14, 4))
+        tk.Button(controls, text="➕ Dossier parent…", command=add_external_parent).pack(side="left", padx=4)
+
+        buttons = tk.Frame(window, padx=12, pady=10)
+        buttons.pack(fill="x")
+        tk.Button(buttons, text="Annuler", command=window.destroy).pack(side="right")
+
+        def confirm():
+            folders = [item["folder"] for item in state.values() if item["var"].get()]
+            if not folders:
+                messagebox.showwarning("Aucune sélection", "Sélectionnez au moins un bisse.", parent=window)
+                return
+            window.destroy()
+            on_confirm(folders)
+
+        tk.Button(
+            buttons,
+            text=confirm_text,
+            command=confirm,
+            bg="#1f618d",
+            fg="white",
+        ).pack(side="right", padx=(0, 8))
+
+    def preview_selected_bisses_dialog_v67(self):
+        self.show_bisse_set_selection_dialog_v67(
+            title="Prévisualiser une sélection de bisses",
+            intro=(
+                "Choisissez les bisses à afficher ensemble. Mes bisses est la source principale ; "
+                "vous pouvez ajouter ponctuellement un dossier externe sans l'ajouter à Mes bisses."
+            ),
+            confirm_text="👁 Prévisualiser la sélection",
+            on_confirm=self.preview_folders_web_v67,
+            default_all=True,
+        )
+
+    def preview_folders_web_v67(self, folders):
+        folders = [os.path.abspath(folder) for folder in (folders or []) if folder and os.path.isdir(folder)]
+        if not folders:
+            messagebox.showwarning("Rendu / Prévisualisation", "Aucun bisse accessible à prévisualiser.")
+            return
+        token = self.begin_activity(
+            "Génération de la prévisualisation…",
+            mode="determinate",
+            maximum=max(1, len(folders)),
+            delay_ms=0,
+        )
+
+        def progress(position, total, name):
+            self.update_activity(
+                token,
+                f"Prévisualisation… {position}/{total} · {name}",
+                position,
+                max(1, total),
+            )
+
+        try:
+            root, errors = self.build_render_preview_for_folders(folders, progress_callback=progress)
+            self.start_local_preview_server(root)
+            if errors:
+                messagebox.showwarning(
+                    "Prévisualisation partielle",
+                    "Certains bisses n'ont pas pu être prévisualisés :\n\n" + "\n".join(errors[:10]),
+                )
+        except Exception as exc:
+            messagebox.showerror("Prévisualisation impossible", str(exc))
+        finally:
+            self.end_activity(token, restore_status=True)
+
+    def choose_platform_export_selection_v67(self):
+        self.show_bisse_set_selection_dialog_v67(
+            title="Choisir les bisses à exporter",
+            intro=(
+                "L'export part de Mes bisses, mais la sélection n'est pas une seconde collection permanente. "
+                "Cochez ce qui doit être publié maintenant et ajoutez au besoin des dossiers externes."
+            ),
+            confirm_text="🌍 Exporter la sélection",
+            on_confirm=self.export_selected_folders_to_platform_v67,
+            default_all=True,
+        )
+
+    def platform_export_root_for_folders_v67(self, folders):
+        parents = {os.path.normcase(os.path.dirname(os.path.abspath(folder))) for folder in folders or []}
+        if len(parents) == 1:
+            parent = os.path.dirname(os.path.abspath((folders or [""])[0]))
+            return os.path.join(parent, "Export_Platform")
+        return os.path.join(self.get_default_collection_root(), "Export_Platform")
+
+    def export_selected_folders_to_platform_v67(self, folders):
+        """Export global éphémèrement sélectionné ; aucun bisses_collection.json n'est nécessaire."""
+        unique = []
+        seen = set()
+        for folder in folders or []:
+            if not folder or not os.path.isdir(folder):
+                continue
+            folder = os.path.abspath(folder)
+            key = os.path.normcase(folder)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(folder)
+        if not unique:
+            messagebox.showwarning("Export plateforme", "Aucun dossier bisse valide n'est sélectionné.")
+            return
+
+        export_root = self.platform_export_root_for_folders_v67(unique)
+        if os.path.isdir(os.path.join(export_root, "data")) or os.path.isdir(os.path.join(export_root, "media")):
+            if not messagebox.askyesno(
+                "Remplacer l'export global",
+                (
+                    f"Le dossier d'export existe déjà :\n{export_root}\n\n"
+                    "Remplacer les dossiers data/ et media/ générés ?"
+                ),
+            ):
+                return
+
+        for name in ("data", "media"):
+            path = os.path.join(export_root, name)
+            if os.path.isdir(path):
+                shutil.rmtree(path)
+        os.makedirs(os.path.join(export_root, "data"), exist_ok=True)
+        os.makedirs(os.path.join(export_root, "media"), exist_ok=True)
+
+        token = self.begin_activity(
+            "Export plateforme…",
+            mode="determinate",
+            maximum=max(1, len(unique)),
+            delay_ms=0,
+        )
+        saved_state = self.capture_active_bisse_state()
+        index_entries = []
+        errors = []
+        totals = {"photos": 0, "segments": 0}
+
+        try:
+            for position, folder in enumerate(unique, start=1):
+                name = os.path.basename(folder) or folder
+                self.update_activity(
+                    token,
+                    f"Export plateforme — {position}/{len(unique)} · {name}",
+                    position - 1,
+                    max(1, len(unique)),
+                )
+                try:
+                    self.configure_paths_for_readonly_export(folder)
+                    result = self.export_current_bisse_to_platform_root(export_root)
+                    index_entries.append(result["index_entry"])
+                    totals["photos"] += result.get("photos_count", 0)
+                    totals["segments"] += result.get("segments_count", 0)
+                    self.log(
+                        f"✅ Exporté : {result['slug']} "
+                        f"({result['photos_count']} photos, {result['segments_count']} segments)"
+                    )
+                except Exception as exc:
+                    errors.append(f"{name} : {exc}")
+                self.update_activity(
+                    token,
+                    f"Export plateforme — {position}/{len(unique)} · {name}",
+                    position,
+                    max(1, len(unique)),
+                )
+        finally:
+            self.restore_active_bisse_state(saved_state)
+            self.end_activity(token, restore_status=True)
+
+        if not index_entries:
+            messagebox.showerror(
+                "Export impossible",
+                "Aucun bisse n'a pu être exporté.\n\n" + "\n".join(errors[:10]),
+            )
+            return
+
+        index_entries.sort(key=lambda e: (str(e.get("title") or "").casefold(), str(e.get("id") or "")))
+        self._write_json_atomic_v65(
+            os.path.join(export_root, "data", "bisses_index.json"),
+            index_entries,
+            indent=2,
+        )
+        self.last_platform_export_root = export_root
+        try:
+            self.refresh_publication_tree()
+        except Exception:
+            pass
+
+        if errors:
+            self.log("⚠️ Export partiel :")
+            for error in errors:
+                self.log(f"   - {error}")
+
+        message = (
+            f"Dossier export :\n{export_root}\n\n"
+            f"Bisses exportés : {len(index_entries)} / {len(unique)}\n"
+            f"Photos web : {totals['photos']}\n"
+            f"Segments GeoJSON : {totals['segments']}\n"
+            f"Erreurs : {len(errors)}"
+        )
+        if errors:
+            message += "\n\n" + "\n".join(f"• {error}" for error in errors[:8])
+        messagebox.showinfo("Export plateforme terminé", message)
+
 
     def export_for_platform(self):
         if not self.base_folder:
@@ -12158,31 +13511,23 @@ namespace GestionBissesFolderPicker
 
         toolbar = tk.Frame(outer)
         toolbar.pack(fill="x", pady=(0, 10))
-
-        tk.Button(
-            toolbar,
-            text="🏠 Mes bisses",
-            command=self.show_workspace_home
-        ).pack(side="left")
-
+        tk.Button(toolbar, text="🏠 Mes bisses", command=self.show_workspace_home).pack(side="left")
         tk.Button(
             toolbar,
             text="↩️ Bisse actif",
-            command=self.return_to_active_bisse_or_home
+            command=self.return_to_active_bisse_or_home,
         ).pack(side="left", padx=(6, 0))
-
         tk.Label(
             toolbar,
             text="🌐 Publication / export plateforme",
-            font=("Arial", 16, "bold")
+            font=("Arial", 16, "bold"),
         ).pack(side="left", padx=14)
-
         tk.Button(
             toolbar,
             text="📤 Copier dernier export vers GitHub Bisses",
             command=self.copy_last_export_to_github_repo,
             bg="#117864",
-            fg="white"
+            fg="white",
         ).pack(side="right")
 
         info = tk.LabelFrame(outer, text="Principe", padx=10, pady=8)
@@ -12190,59 +13535,45 @@ namespace GestionBissesFolderPicker
         tk.Label(
             info,
             text=(
-                "Ce module gère l'export statique lu par GitHub Pages. "
-                "Il peut exporter le bisse ouvert ou une collection de plusieurs dossiers bisses, "
-                "puis faciliter la copie de data/ et media/ vers le dépôt local “Bisses”."
+                "Mes bisses est maintenant le réservoir principal. Au moment d'exporter, "
+                "vous choisissez simplement les bisses à publier. Cette sélection est ponctuelle : "
+                "elle ne crée pas un second lot permanent. Des dossiers externes peuvent être ajoutés pour un export précis."
             ),
             justify="left",
             anchor="w",
-            wraplength=1320
+            wraplength=1320,
         ).pack(fill="x")
 
-        actions = tk.LabelFrame(outer, text="Actions rapides", padx=10, pady=8)
+        actions = tk.LabelFrame(outer, text="Actions", padx=10, pady=8)
         actions.pack(fill="x", pady=(0, 10))
-
         tk.Button(
             actions,
-            text="🌐 Exporter le bisse ouvert",
-            command=self.export_for_platform,
-            bg="#1f618d",
-            fg="white"
-        ).pack(side="left", fill="x", expand=True, padx=(0, 4))
-
-        tk.Button(
-            actions,
-            text="➕ Inclure le bisse ouvert dans le lot",
-            command=self.add_current_bisse_to_publication_collection
-        ).pack(side="left", fill="x", expand=True, padx=4)
-
-        tk.Button(
-            actions,
-            text="📁 Ajouter un autre dossier bisse",
-            command=self.add_existing_bisse_folder_to_publication_collection
-        ).pack(side="left", fill="x", expand=True, padx=4)
-
-        tk.Button(
-            actions,
-            text="🌍 Exporter le lot multi-bisses",
-            command=self.export_publication_collection,
+            text="🌍 Choisir les bisses et exporter…",
+            command=self.choose_platform_export_selection_v67,
             bg="#7d3c98",
-            fg="white"
+            fg="white",
+            height=2,
+        ).pack(side="left", fill="x", expand=True, padx=(0, 4))
+        tk.Button(
+            actions,
+            text="👁 Prévisualiser une sélection…",
+            command=self.preview_selected_bisses_dialog_v67,
+            bg="#2980b9",
+            fg="white",
+            height=2,
         ).pack(side="left", fill="x", expand=True, padx=(4, 0))
 
-        collection_frame = tk.LabelFrame(outer, text="Lot plateforme", padx=10, pady=8)
+        collection_frame = tk.LabelFrame(outer, text="Bisses disponibles dans Mes bisses", padx=10, pady=8)
         collection_frame.pack(fill="both", expand=True)
-
         tk.Label(
             collection_frame,
             textvariable=self.publication_status_var,
             anchor="w",
             justify="left",
-            fg="#555555"
+            fg="#555555",
         ).pack(fill="x", pady=(0, 6))
 
         columns = ("title", "slug", "photos", "segments", "exportable", "folder")
-
         publication_table_frame = tk.Frame(collection_frame)
         publication_table_frame.pack(fill="both", expand=True)
         publication_table_frame.grid_rowconfigure(0, weight=1)
@@ -12253,7 +13584,7 @@ namespace GestionBissesFolderPicker
             columns=columns,
             show="headings",
             selectmode="extended",
-            height=12
+            height=12,
         )
         self.publication_tree.heading("title", text="Bisse")
         self.publication_tree.heading("slug", text="Slug")
@@ -12268,33 +13599,34 @@ namespace GestionBissesFolderPicker
         self.publication_tree.column("exportable", width=70, anchor="center")
         self.publication_tree.column("folder", width=650)
 
-        publication_y_scroll = ttk.Scrollbar(publication_table_frame, orient="vertical", command=self.publication_tree.yview)
-        publication_x_scroll = ttk.Scrollbar(publication_table_frame, orient="horizontal", command=self.publication_tree.xview)
+        publication_y_scroll = ttk.Scrollbar(
+            publication_table_frame,
+            orient="vertical",
+            command=self.publication_tree.yview,
+        )
+        publication_x_scroll = ttk.Scrollbar(
+            publication_table_frame,
+            orient="horizontal",
+            command=self.publication_tree.xview,
+        )
         self.publication_tree.configure(
             yscrollcommand=publication_y_scroll.set,
-            xscrollcommand=publication_x_scroll.set
+            xscrollcommand=publication_x_scroll.set,
         )
-
         self.publication_tree.grid(row=0, column=0, sticky="nsew")
         publication_y_scroll.grid(row=0, column=1, sticky="ns")
         publication_x_scroll.grid(row=1, column=0, sticky="ew")
 
         bottom = tk.Frame(collection_frame)
         bottom.pack(fill="x", pady=(8, 0))
-
-        tk.Button(
-            bottom,
-            text="🗑️ Retirer la sélection du lot",
-            command=self.remove_selected_bisse_from_publication_collection
-        ).pack(side="left")
-
         tk.Button(
             bottom,
             text="🔄 Rafraîchir",
-            command=self.refresh_publication_tree
-        ).pack(side="left", padx=8)
+            command=self.refresh_publication_tree,
+        ).pack(side="left")
 
         self.refresh_publication_tree()
+
 
     # ============================================================
     # V65 — SOCLE PHOTO AUTOMATIQUE PRUDENT
@@ -13202,26 +14534,7 @@ namespace GestionBissesFolderPicker
         if not folders:
             messagebox.showwarning("Rendu / Prévisualisation", "Aucun bisse accessible dans Mes bisses.")
             return
-        token = self.begin_activity(
-            "Génération de la prévisualisation…",
-            mode="determinate",
-            maximum=max(1, len(folders)),
-            delay_ms=0,
-        )
-        def progress(position, total, name):
-            self.update_activity(token, f"Prévisualisation… {position}/{total} · {name}", position, max(1, total))
-        try:
-            root, errors = self.build_render_preview_for_folders(folders, progress_callback=progress)
-            self.start_local_preview_server(root)
-            if errors:
-                messagebox.showwarning(
-                    "Prévisualisation partielle",
-                    "Certains bisses n'ont pas pu être prévisualisés :\n\n" + "\n".join(errors[:8]),
-                )
-        except Exception as exc:
-            messagebox.showerror("Prévisualisation impossible", str(exc))
-        finally:
-            self.end_activity(token, restore_status=True)
+        self.preview_folders_web_v67(folders)
 
     def show_render_preview_module(self):
         """Prévisualisation locale et temporaire ; aucune publication ni écriture source."""
@@ -13281,7 +14594,10 @@ namespace GestionBissesFolderPicker
         all_box.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
         tk.Label(
             all_box,
-            text="Voir ensemble tous les bisses accessibles de Mes bisses.",
+            text=(
+                "Voir ensemble tous les bisses de Mes bisses, ou choisir une sélection précise. "
+                "Des dossiers externes peuvent aussi être ajoutés ponctuellement."
+            ),
             justify="left",
             anchor="w",
             wraplength=380,
@@ -13289,10 +14605,16 @@ namespace GestionBissesFolderPicker
         ).pack(fill="x", pady=(0, 10))
         tk.Button(
             all_box,
-            text="👁 Prévisualiser Mes bisses",
-            command=self.preview_all_workspace_bisses_web,
+            text="👁 Choisir les bisses…",
+            command=self.preview_selected_bisses_dialog_v67,
             bg="#6c3483",
             fg="white",
+            height=2,
+        ).pack(fill="x", pady=(0, 6))
+        tk.Button(
+            all_box,
+            text="👁 Prévisualiser tous Mes bisses",
+            command=self.preview_all_workspace_bisses_web,
             height=2,
         ).pack(fill="x")
 
