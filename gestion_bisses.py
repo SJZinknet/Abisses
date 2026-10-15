@@ -54,7 +54,7 @@ BISSES_RENDER_README = "# Bisses\n\nPlateforme statique GitHub Pages pour l’in
 class BisseManagerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Abisses - v67")
+        self.root.title("Abisses - v68")
         self.configure_application_icon()
         self.configure_main_window_geometry()
 
@@ -6301,6 +6301,11 @@ class BisseManagerApp:
             },
             "bisse_info": self.default_bisse_info(),
             "photos": [],
+            # v68 : configuration facultative des lots de photos pour la
+            # synchronisation GPS avancée. Cette donnée est indépendante de
+            # photo_order / platform_order et n'intervient jamais dans le moteur
+            # d'ordre des photos.
+            "photo_gps_batches": [],
             "gpx_traces": {
                 "manual_segments": [],
                 "live_topo": []
@@ -6349,6 +6354,9 @@ class BisseManagerApp:
             raw["bisse_info"]["slug"] = self.slugify(raw["bisse_info"].get("title") or raw["project"].get("bisse_name", ""))
 
         raw.setdefault("photos", [])
+        raw.setdefault("photo_gps_batches", [])
+        if not isinstance(raw.get("photo_gps_batches"), list):
+            raw["photo_gps_batches"] = []
         for index, entry in enumerate(raw.get("photos", []), start=1):
             if isinstance(entry, dict):
                 entry.setdefault("platform_selected", False)
@@ -6401,6 +6409,9 @@ class BisseManagerApp:
             )
         )
         self.catalog_container["photos"] = self.catalog_data
+        self.catalog_container.setdefault("photo_gps_batches", [])
+        if not isinstance(self.catalog_container.get("photo_gps_batches"), list):
+            self.catalog_container["photo_gps_batches"] = []
 
         self.catalog_container.setdefault("gpx_traces", {})
         self.catalog_container["gpx_traces"].setdefault("manual_segments", [])
@@ -14321,11 +14332,786 @@ namespace GestionBissesFolderPicker
         for widget in (self.lbl_gpx, self.btn_sync):
             widget.bind("<Destroy>", release_gpx_controls, add="+")
 
+        advanced = tk.LabelFrame(
+            outer,
+            text="Avancé",
+            padx=12,
+            pady=10
+        )
+        advanced.grid(row=3, column=0, sticky="ew", pady=(12, 0))
+        advanced.grid_columnconfigure(0, weight=1)
+        tk.Label(
+            advanced,
+            text=(
+                "Sortie à plusieurs photographes / appareils : répartissez les photos en lots "
+                "et associez à chaque lot sa ou ses propres traces GPS."
+            ),
+            fg="#666666",
+            justify="left",
+            anchor="w",
+            wraplength=760
+        ).grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        tk.Button(
+            advanced,
+            text="👥 Synchroniser les photos par lots…",
+            command=self.show_photo_gps_batches_dialog_v68
+        ).grid(row=1, column=0, sticky="ew")
+
         tk.Button(
             outer,
             text="✍️ Écrire les coordonnées actuelles dans les JPG",
             command=self.write_catalog_gps_to_jpg_metadata
-        ).grid(row=3, column=0, sticky="ew", pady=(12, 0))
+        ).grid(row=4, column=0, sticky="ew", pady=(12, 0))
+
+    # ============================================================
+    # V68 — GÉOLOCALISATION AVANCÉE PAR LOTS DE PHOTOS
+    # ============================================================
+
+    def photo_gps_device_label_v68(self, entry):
+        """Retourne une identité d'appareil prudente depuis les EXIF, sans rien écrire."""
+        path = self.get_entry_image_path(entry)
+        make = ""
+        model = ""
+        serial = ""
+        try:
+            with Image.open(path) as image:
+                exif = image.getexif()
+                if exif:
+                    make = str(exif.get(271) or "").strip()       # Make
+                    model = str(exif.get(272) or "").strip()      # Model
+                    serial = str(exif.get(42033) or "").strip()   # BodySerialNumber
+        except Exception:
+            pass
+
+        parts = []
+        for value in (make, model):
+            value = re.sub(r"\s+", " ", value).strip()
+            if value and value.casefold() not in {part.casefold() for part in parts}:
+                parts.append(value)
+        label = " ".join(parts).strip()
+        if serial:
+            label = f"{label or 'Appareil'} · série {serial}"
+        return label or "Appareil non identifié"
+
+    def detect_photo_gps_batches_v68(self):
+        """Propose des lots par appareil. Le résultat reste en mémoire jusqu'à validation."""
+        groups = {}
+        for index, entry in enumerate(self.catalog_data or []):
+            if not isinstance(entry, dict) or entry.get("status") != "OK":
+                continue
+            label = self.photo_gps_device_label_v68(entry)
+            key = self.slugify(label) or "appareil-non-identifie"
+            groups.setdefault(key, {"device_label": label, "photo_indices": []})
+            groups[key]["photo_indices"].append(index)
+
+        batches = []
+        ordered = sorted(
+            groups.values(),
+            key=lambda item: (str(item.get("device_label") or "").casefold(), item.get("photo_indices", [10**9])[0])
+        )
+        for number, group in enumerate(ordered, start=1):
+            device = group.get("device_label") or "Appareil non identifié"
+            name = f"Lot {number}"
+            if device != "Appareil non identifié":
+                name += f" — {device}"
+            batches.append({
+                "id": f"gpslot_{uuid.uuid4().hex[:10]}",
+                "name": name,
+                "device_label": device,
+                "photo_indices": set(group.get("photo_indices", [])),
+                "gpx_files": [],
+            })
+        return batches
+
+    def serialize_photo_gps_batch_path_v68(self, path):
+        path = os.path.abspath(path)
+        base = os.path.abspath(self.base_folder) if self.base_folder else ""
+        if base:
+            try:
+                rel = os.path.relpath(path, base)
+                if rel != ".." and not rel.startswith(".." + os.sep):
+                    return rel.replace("\\", "/")
+            except Exception:
+                pass
+        return path
+
+    def resolve_photo_gps_batch_path_v68(self, stored):
+        value = str(stored or "").strip()
+        if not value:
+            return ""
+        candidate = value.replace("/", os.sep)
+        if os.path.isabs(candidate) and os.path.isfile(candidate):
+            return os.path.abspath(candidate)
+        if self.base_folder:
+            joined = os.path.join(self.base_folder, candidate)
+            if os.path.isfile(joined):
+                return os.path.abspath(joined)
+        if self.gpx_folder:
+            joined = os.path.join(self.gpx_folder, os.path.basename(candidate))
+            if os.path.isfile(joined):
+                return os.path.abspath(joined)
+        return os.path.abspath(candidate) if os.path.isabs(candidate) else candidate
+
+    def load_photo_gps_batches_v68(self):
+        """Charge les lots enregistrés. Sans configuration, propose les appareils détectés."""
+        self.catalog_data = self.read_catalog()
+        container = self.catalog_container if isinstance(self.catalog_container, dict) else self.read_catalog_container()
+        definitions = container.get("photo_gps_batches", []) if isinstance(container, dict) else []
+        by_id = {}
+        batches = []
+
+        for raw in definitions if isinstance(definitions, list) else []:
+            if not isinstance(raw, dict):
+                continue
+            batch_id = str(raw.get("id") or "").strip()
+            if not batch_id or batch_id in by_id:
+                continue
+            batch = {
+                "id": batch_id,
+                "name": str(raw.get("name") or batch_id),
+                "device_label": str(raw.get("device_label") or ""),
+                "photo_indices": set(),
+                "gpx_files": [
+                    self.resolve_photo_gps_batch_path_v68(path)
+                    for path in (raw.get("gpx_files") or [])
+                    if str(path or "").strip()
+                ],
+            }
+            batches.append(batch)
+            by_id[batch_id] = batch
+
+        for index, entry in enumerate(self.catalog_data or []):
+            if not isinstance(entry, dict) or entry.get("status") != "OK":
+                continue
+            batch_id = str(entry.get("gps_batch_id") or "").strip()
+            if not batch_id:
+                continue
+            if batch_id not in by_id:
+                batch = {
+                    "id": batch_id,
+                    "name": str(entry.get("gps_batch_name") or batch_id),
+                    "device_label": self.photo_gps_device_label_v68(entry),
+                    "photo_indices": set(),
+                    "gpx_files": [],
+                }
+                batches.append(batch)
+                by_id[batch_id] = batch
+            by_id[batch_id]["photo_indices"].add(index)
+
+        if not batches:
+            batches = self.detect_photo_gps_batches_v68()
+        return batches
+
+    def save_photo_gps_batches_v68(self, batches):
+        """Enregistre uniquement la configuration des lots, jamais l'ordre des photos."""
+        if not isinstance(self.catalog_container, dict):
+            self.catalog_container = self.read_catalog_container()
+        if not isinstance(self.catalog_data, list):
+            self.catalog_data = self.read_catalog()
+
+        owner = {}
+        serialized = []
+        for batch in batches or []:
+            batch_id = str(batch.get("id") or "").strip()
+            if not batch_id:
+                continue
+            name = str(batch.get("name") or batch_id).strip() or batch_id
+            indices = {
+                int(index) for index in (batch.get("photo_indices") or set())
+                if isinstance(index, int) or str(index).isdigit()
+            }
+            for index in indices:
+                if 0 <= index < len(self.catalog_data):
+                    owner[index] = batch_id
+            serialized.append({
+                "id": batch_id,
+                "name": name,
+                "device_label": str(batch.get("device_label") or ""),
+                "gpx_files": [
+                    self.serialize_photo_gps_batch_path_v68(path)
+                    for path in (batch.get("gpx_files") or [])
+                    if str(path or "").strip()
+                ],
+            })
+
+        names = {item["id"]: item["name"] for item in serialized}
+        for index, entry in enumerate(self.catalog_data):
+            if not isinstance(entry, dict):
+                continue
+            batch_id = owner.get(index)
+            if batch_id:
+                entry["gps_batch_id"] = batch_id
+                entry["gps_batch_name"] = names.get(batch_id, batch_id)
+            else:
+                entry.pop("gps_batch_id", None)
+                entry.pop("gps_batch_name", None)
+
+        self.catalog_container["photo_gps_batches"] = serialized
+        self.save_catalog()
+
+    def show_photo_gps_batch_photo_selector_v68(self, parent, batches, batch, refresh_callback):
+        """Sélection manuelle de photos, utile si les appareils ne suffisent pas à séparer les personnes."""
+        window = tk.Toplevel(parent)
+        window.title(f"Photos du lot — {batch.get('name', 'Lot')}")
+        window.geometry("820x650")
+        window.minsize(650, 460)
+        window.transient(parent)
+        window.grab_set()
+
+        tk.Label(
+            window,
+            text=(
+                "Sélectionnez les photos appartenant à ce lot. Une photo ne peut appartenir qu'à un seul lot : "
+                "si vous l'affectez ici, elle sera retirée de l'autre lot éventuel."
+            ),
+            justify="left",
+            anchor="w",
+            wraplength=770,
+        ).pack(fill="x", padx=12, pady=(12, 8))
+
+        frame = tk.Frame(window)
+        frame.pack(fill="both", expand=True, padx=12, pady=4)
+        scrollbar = ttk.Scrollbar(frame, orient="vertical")
+        listbox = tk.Listbox(frame, selectmode="extended", exportselection=False, yscrollcommand=scrollbar.set)
+        scrollbar.config(command=listbox.yview)
+        listbox.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        rows = []
+        for index, entry in enumerate(self.catalog_data or []):
+            if not isinstance(entry, dict) or entry.get("status") != "OK":
+                continue
+            original = entry.get("original_filename") or entry.get("filename") or f"Photo {index + 1}"
+            taken = str(entry.get("date_taken") or "")
+            device = self.photo_gps_device_label_v68(entry)
+            label = str(original)
+            if taken:
+                label += f" · {taken[:19]}"
+            if device and device != "Appareil non identifié":
+                label += f" · {device}"
+            listbox.insert("end", label)
+            rows.append(index)
+            if index in (batch.get("photo_indices") or set()):
+                listbox.selection_set(len(rows) - 1)
+
+        tools = tk.Frame(window)
+        tools.pack(fill="x", padx=12, pady=(4, 0))
+        tk.Button(tools, text="Tout sélectionner", command=lambda: listbox.selection_set(0, "end")).pack(side="left")
+        tk.Button(tools, text="Tout désélectionner", command=lambda: listbox.selection_clear(0, "end")).pack(side="left", padx=6)
+
+        bottom = tk.Frame(window)
+        bottom.pack(fill="x", padx=12, pady=12)
+
+        def validate():
+            selected = {rows[pos] for pos in listbox.curselection() if 0 <= pos < len(rows)}
+            # Affectation exclusive : les photos choisies quittent les autres lots.
+            for other in batches:
+                if other is batch:
+                    continue
+                other.setdefault("photo_indices", set()).difference_update(selected)
+            batch["photo_indices"] = selected
+            window.destroy()
+            refresh_callback()
+
+        tk.Button(bottom, text="Annuler", command=window.destroy).pack(side="right")
+        tk.Button(bottom, text="Valider les photos", command=validate, bg="#2c3e50", fg="white").pack(side="right", padx=(0, 8))
+
+    def show_photo_gps_batches_dialog_v68(self):
+        """Assistant facultatif : lots de photos → trace(s) GPX propres à chaque lot."""
+        if not self.base_folder or not os.path.exists(self.catalog_path):
+            messagebox.showwarning("Géolocalisation", "Aucun catalogue photo disponible.")
+            return
+
+        try:
+            batches = self.load_photo_gps_batches_v68()
+        except Exception as exc:
+            messagebox.showerror("Lots GPS indisponibles", str(exc))
+            return
+
+        window = tk.Toplevel(self.root)
+        window.title("Géolocalisation avancée — lots de photos")
+        screen_h = max(600, int(self.root.winfo_screenheight() or 800))
+        height = min(720, screen_h - 100)
+        window.geometry(f"1080x{height}")
+        window.minsize(850, 520)
+        window.transient(self.root)
+        window.grab_set()
+
+        header = tk.Frame(window, padx=14, pady=12)
+        header.pack(fill="x")
+        tk.Label(
+            header,
+            text="Plusieurs photographes / appareils",
+            font=("Arial", 15, "bold"),
+            anchor="w",
+        ).pack(fill="x")
+        tk.Label(
+            header,
+            text=(
+                "Chaque lot de photos sera synchronisé uniquement avec les traces qui lui sont associées. "
+                "L'outil Ordre des photos n'est pas modifié et garde sa propre logique GPS/topographique."
+            ),
+            justify="left",
+            anchor="w",
+            fg="#555555",
+            wraplength=1020,
+        ).pack(fill="x", pady=(4, 0))
+
+        table_frame = tk.Frame(window)
+        table_frame.pack(fill="both", expand=True, padx=14, pady=(0, 6))
+        table_frame.grid_rowconfigure(0, weight=1)
+        table_frame.grid_columnconfigure(0, weight=1)
+        columns = ("name", "photos", "device", "gpx")
+        tree = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse")
+        tree.heading("name", text="Lot")
+        tree.heading("photos", text="Photos")
+        tree.heading("device", text="Appareil détecté")
+        tree.heading("gpx", text="Trace(s) GPX associée(s)")
+        tree.column("name", width=260)
+        tree.column("photos", width=75, anchor="center")
+        tree.column("device", width=250)
+        tree.column("gpx", width=390)
+        ybar = ttk.Scrollbar(table_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=ybar.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        ybar.grid(row=0, column=1, sticky="ns")
+
+        status_var = tk.StringVar(value="")
+        tk.Label(window, textvariable=status_var, anchor="w", fg="#555555").pack(fill="x", padx=14, pady=(0, 6))
+
+        def selected_batch():
+            selection = tree.selection()
+            if not selection:
+                return None
+            batch_id = selection[0]
+            return next((item for item in batches if item.get("id") == batch_id), None)
+
+        def refresh():
+            current = tree.selection()[0] if tree.selection() else ""
+            for iid in tree.get_children():
+                tree.delete(iid)
+            assigned = set()
+            for batch in batches:
+                indices = set(batch.get("photo_indices") or set())
+                assigned.update(indices)
+                existing_gpx = [path for path in (batch.get("gpx_files") or []) if os.path.isfile(path)]
+                missing_count = len(batch.get("gpx_files") or []) - len(existing_gpx)
+                if not existing_gpx:
+                    gpx_label = "— aucune trace —"
+                elif len(existing_gpx) == 1:
+                    gpx_label = os.path.basename(existing_gpx[0])
+                else:
+                    names = ", ".join(os.path.basename(path) for path in existing_gpx[:2])
+                    gpx_label = f"{len(existing_gpx)} traces · {names}"
+                if missing_count:
+                    gpx_label += f" · {missing_count} introuvable(s)"
+                tree.insert(
+                    "", "end", iid=batch.get("id"),
+                    values=(
+                        batch.get("name") or batch.get("id"),
+                        len(indices),
+                        batch.get("device_label") or "—",
+                        gpx_label,
+                    )
+                )
+            active_indices = {
+                index for index, entry in enumerate(self.catalog_data or [])
+                if isinstance(entry, dict) and entry.get("status") == "OK"
+            }
+            unassigned = len(active_indices - assigned)
+            status_var.set(
+                f"{len(active_indices)} photo(s) active(s) · {len(assigned)} affectée(s) · {unassigned} non affectée(s). "
+                "Une personne peut utiliser plusieurs fichiers GPX."
+            )
+            if current and tree.exists(current):
+                tree.selection_set(current)
+            elif tree.get_children():
+                tree.selection_set(tree.get_children()[0])
+
+        actions = tk.LabelFrame(window, text="Lot sélectionné", padx=10, pady=8)
+        actions.pack(fill="x", padx=14, pady=(0, 8))
+
+        def rename_batch():
+            batch = selected_batch()
+            if not batch:
+                messagebox.showwarning("Lots GPS", "Sélectionnez un lot.", parent=window)
+                return
+            value = simpledialog.askstring(
+                "Renommer le lot", "Nom du lot :", parent=window,
+                initialvalue=batch.get("name") or "Lot"
+            )
+            if value and value.strip():
+                batch["name"] = value.strip()
+                refresh()
+
+        def choose_gpx_for_batch():
+            batch = selected_batch()
+            if not batch:
+                messagebox.showwarning("Lots GPS", "Sélectionnez un lot.", parent=window)
+                return
+            initialdir = self.gpx_folder if self.gpx_folder and os.path.isdir(self.gpx_folder) else self.base_folder
+            paths = filedialog.askopenfilenames(
+                parent=window,
+                title=f"Trace(s) GPX pour {batch.get('name') or 'ce lot'}",
+                filetypes=[("Fichiers GPX", "*.gpx"), ("Tous les fichiers", "*.*")],
+                initialdir=initialdir if initialdir and os.path.isdir(initialdir) else None,
+            )
+            if paths:
+                batch["gpx_files"] = [os.path.abspath(path) for path in paths]
+                refresh()
+
+        def edit_photos():
+            batch = selected_batch()
+            if not batch:
+                messagebox.showwarning("Lots GPS", "Sélectionnez un lot.", parent=window)
+                return
+            self.show_photo_gps_batch_photo_selector_v68(window, batches, batch, refresh)
+
+        def new_batch():
+            batch = {
+                "id": f"gpslot_{uuid.uuid4().hex[:10]}",
+                "name": f"Lot {len(batches) + 1}",
+                "device_label": "Sélection manuelle",
+                "photo_indices": set(),
+                "gpx_files": [],
+            }
+            batches.append(batch)
+            refresh()
+            tree.selection_set(batch["id"])
+            self.show_photo_gps_batch_photo_selector_v68(window, batches, batch, refresh)
+
+        def delete_batch():
+            batch = selected_batch()
+            if not batch:
+                return
+            if messagebox.askyesno(
+                "Supprimer le lot",
+                f"Supprimer « {batch.get('name') or 'ce lot'} » ?\n\nLes photos redeviendront non affectées ; elles ne seront pas supprimées.",
+                parent=window,
+            ):
+                batches.remove(batch)
+                refresh()
+
+        def redetect():
+            if batches and not messagebox.askyesno(
+                "Redétecter les appareils",
+                "Remplacer la configuration affichée par une nouvelle détection automatique des appareils ?\n\n"
+                "Rien ne sera écrit tant que vous n'enregistrez pas.",
+                parent=window,
+            ):
+                return
+            batches[:] = self.detect_photo_gps_batches_v68()
+            refresh()
+
+        tk.Button(actions, text="✏️ Renommer", command=rename_batch).pack(side="left")
+        tk.Button(actions, text="📷 Choisir les photos…", command=edit_photos).pack(side="left", padx=5)
+        tk.Button(actions, text="🛰️ Choisir trace(s) GPX…", command=choose_gpx_for_batch).pack(side="left", padx=5)
+        tk.Button(actions, text="➕ Nouveau lot…", command=new_batch).pack(side="left", padx=5)
+        tk.Button(actions, text="🗑️ Supprimer le lot", command=delete_batch).pack(side="left", padx=5)
+        tk.Button(actions, text="🔎 Redétecter les appareils", command=redetect).pack(side="right")
+
+        bottom = tk.Frame(window, padx=14, pady=12)
+        bottom.pack(fill="x")
+
+        def save_only():
+            try:
+                self.save_photo_gps_batches_v68(batches)
+            except Exception as exc:
+                messagebox.showerror("Enregistrement impossible", str(exc), parent=window)
+                return
+            messagebox.showinfo("Lots GPS", "Configuration des lots enregistrée.", parent=window)
+            refresh()
+
+        def synchronize():
+            configured = [
+                batch for batch in batches
+                if batch.get("photo_indices") and any(os.path.isfile(path) for path in (batch.get("gpx_files") or []))
+            ]
+            if not configured:
+                messagebox.showwarning(
+                    "Lots GPS",
+                    "Aucun lot ne possède à la fois des photos et au moins une trace GPX valide.",
+                    parent=window,
+                )
+                return
+            missing_trace = [
+                batch.get("name") or batch.get("id")
+                for batch in batches
+                if batch.get("photo_indices") and not any(os.path.isfile(path) for path in (batch.get("gpx_files") or []))
+            ]
+            if missing_trace:
+                if not messagebox.askyesno(
+                    "Lots sans trace",
+                    "Ces lots contiennent des photos mais aucune trace valide :\n\n"
+                    + "\n".join(f"• {name}" for name in missing_trace)
+                    + "\n\nIls seront ignorés. Continuer ?",
+                    parent=window,
+                ):
+                    return
+            try:
+                self.save_photo_gps_batches_v68(batches)
+            except Exception as exc:
+                messagebox.showerror("Enregistrement impossible", str(exc), parent=window)
+                return
+            window.destroy()
+            self.run_photo_gps_batches_sync_v68(configured)
+
+        tk.Button(bottom, text="Fermer", command=window.destroy).pack(side="right")
+        tk.Button(bottom, text="💾 Enregistrer", command=save_only).pack(side="right", padx=(0, 8))
+        tk.Button(
+            bottom,
+            text="📍 Géolocaliser les lots configurés",
+            command=synchronize,
+            bg="#27ae60",
+            fg="white",
+        ).pack(side="right", padx=(0, 8))
+
+        refresh()
+
+    def run_photo_gps_batches_sync_v68(self, batches):
+        """Synchronise chaque lot uniquement contre ses propres GPX."""
+        if not batches:
+            return
+
+        tz_name = self.ask_photo_timezone()
+        if not tz_name:
+            return
+        max_gap_minutes = self.ask_gpx_sync_gap_tolerance()
+        if max_gap_minutes is None:
+            return
+
+        all_gpx = []
+        seen = set()
+        for batch in batches:
+            for path in batch.get("gpx_files") or []:
+                if not os.path.isfile(path):
+                    continue
+                key = os.path.normcase(os.path.abspath(path))
+                if key not in seen:
+                    seen.add(key)
+                    all_gpx.append(os.path.abspath(path))
+
+        approval = self.ask_gpx_sync_exif_write_approval(tz_name, max_gap_minutes, all_gpx)
+        if approval is None:
+            return
+
+        self.photo_timezone_name = tz_name
+        self.gpx_sync_max_gap_minutes = int(max_gap_minutes)
+        self.write_exif_after_gpx_sync = bool(approval)
+
+        try:
+            # Relire après la sauvegarde de configuration afin de partir du catalogue réellement écrit.
+            self.catalog_data = self.read_catalog()
+            sync_run_id = uuid.uuid4().hex
+            sync_attempt_at = datetime.now().isoformat(timespec="seconds")
+            max_gap_seconds = int(max_gap_minutes) * 60
+
+            segments_by_batch = {}
+            batch_by_id = {str(batch.get("id")): batch for batch in batches}
+            total_points = 0
+            batch_reports = {}
+            for batch in batches:
+                batch_id = str(batch.get("id") or "")
+                valid_paths = [os.path.abspath(path) for path in (batch.get("gpx_files") or []) if os.path.isfile(path)]
+                segments, points_count = self.load_gpx_time_segments(valid_paths)
+                if not segments:
+                    raise RuntimeError(f"Aucun segment GPX horodaté pour le lot « {batch.get('name') or batch_id} ».")
+                segments_by_batch[batch_id] = segments
+                total_points += points_count
+                batch_reports[batch_id] = {
+                    "name": batch.get("name") or batch_id,
+                    "gpx_files": [os.path.basename(path) for path in valid_paths],
+                    "segments_count": len(segments),
+                    "points_count": points_count,
+                    "synced_count": 0,
+                    "out_of_range_count": 0,
+                    "preserved_existing_count": 0,
+                    "error_time_count": 0,
+                    "missing_file_count": 0,
+                }
+
+            eligible = []
+            for index, entry in enumerate(self.catalog_data):
+                if not isinstance(entry, dict) or entry.get("status") != "OK":
+                    continue
+                batch_id = str(entry.get("gps_batch_id") or "")
+                if batch_id in segments_by_batch:
+                    eligible.append((index, entry, batch_id))
+
+            if not eligible:
+                messagebox.showwarning("Lots GPS", "Aucune photo active n'appartient aux lots configurés.")
+                return
+
+            self.progress["value"] = 0
+            self.log("-" * 40)
+            self.log("👥 [V68] Synchronisation GPS par lots de photos")
+            self.log(f"📷 Photos concernées : {len(eligible)}")
+            self.log(f"🛰️ Lots configurés : {len(segments_by_batch)}")
+            self.log(f"🕒 Fuseau horaire : {tz_name}")
+            self.log(f"⏱️ Tolérance hors plage : {max_gap_minutes} minute(s)")
+
+            synced_count = 0
+            out_of_range_count = 0
+            preserved_existing_count = 0
+            error_time_count = 0
+            missing_file_count = 0
+            per_source_count = {}
+
+            for position, (_index, entry, batch_id) in enumerate(eligible, start=1):
+                batch = batch_by_id.get(batch_id) or {}
+                report = batch_reports[batch_id]
+                img_path = self.get_entry_image_path(entry)
+                filename = os.path.basename(img_path)
+
+                if not os.path.exists(img_path):
+                    entry["gps_sync"] = "FICHIER_INTROUVABLE"
+                    missing_file_count += 1
+                    report["missing_file_count"] += 1
+                    self.log(f"⚠️ {report['name']} · fichier introuvable : {filename}")
+                    self.progress["value"] = (position / len(eligible)) * 100
+                    self.root.update_idletasks()
+                    continue
+
+                photo_time = self.get_photo_time(img_path)
+                if not photo_time:
+                    entry["gps_sync"] = "ERREUR_HEURE"
+                    error_time_count += 1
+                    report["error_time_count"] += 1
+                    self.progress["value"] = (position / len(eligible)) * 100
+                    self.root.update_idletasks()
+                    continue
+
+                result = self.get_gps_from_time_segments(
+                    segments_by_batch[batch_id], photo_time, max_gap_seconds
+                )
+                existing_gps = self.get_entry_gps_latlon(entry)
+
+                if result.get("ok"):
+                    lat = result["lat"]
+                    lon = result["lon"]
+                    ele = result["ele"]
+                    segment = result["segment"]
+                    match_type = result["match_type"]
+                    gap_seconds = result.get("gap_seconds", 0)
+
+                    if match_type == "NEAREST_ENDPOINT" and existing_gps:
+                        entry["last_gpx_sync_status"] = "HORS_PLAGE_COORDONNEES_CONSERVEES"
+                        entry["last_gpx_sync_detail"] = "NEAREST_ENDPOINT_SKIPPED_EXISTING"
+                        entry["last_gpx_sync_gap_seconds"] = round(gap_seconds, 1)
+                        entry["last_gpx_sync_source_file"] = segment["source_name"]
+                        entry["last_gpx_sync_batch_id"] = batch_id
+                        entry["last_gpx_sync_batch_name"] = report["name"]
+                        entry["last_gpx_sync_at"] = sync_attempt_at
+                        entry["last_gpx_sync_run_id"] = sync_run_id
+                        preserved_existing_count += 1
+                        out_of_range_count += 1
+                        report["preserved_existing_count"] += 1
+                        report["out_of_range_count"] += 1
+                        self.log(
+                            f"🛡️ {report['name']} · {filename} · coordonnées existantes conservées "
+                            f"(point terminal à {gap_seconds/60:.1f} min)."
+                        )
+                    else:
+                        entry["gps_coordinates"] = {"lat": lat, "lon": lon, "ele": ele}
+                        entry["date_taken"] = photo_time.isoformat()
+                        entry["gps_sync"] = "OK_GPX_BATCH"
+                        entry["gps_source"] = "GPX_BATCH"
+                        entry["gps_source_file"] = segment["source_name"]
+                        entry["gps_source_segment"] = segment["segment_label"]
+                        entry["gps_sync_detail"] = match_type
+                        entry["gps_match_seconds"] = round(gap_seconds, 1)
+                        entry["gps_sync_run_id"] = sync_run_id
+                        entry["last_gpx_sync_status"] = "OK_GPX_BATCH"
+                        entry["last_gpx_sync_detail"] = match_type
+                        entry["last_gpx_sync_gap_seconds"] = round(gap_seconds, 1)
+                        entry["last_gpx_sync_source_file"] = segment["source_name"]
+                        entry["last_gpx_sync_batch_id"] = batch_id
+                        entry["last_gpx_sync_batch_name"] = report["name"]
+                        entry["last_gpx_sync_at"] = sync_attempt_at
+                        entry["last_gpx_sync_run_id"] = sync_run_id
+                        synced_count += 1
+                        report["synced_count"] += 1
+                        per_source_count[segment["source_name"]] = per_source_count.get(segment["source_name"], 0) + 1
+                        self.log(
+                            f"✅ {report['name']} · {filename} → {lat:.5f}, {lon:.5f} "
+                            f"· {segment['source_name']} · {match_type}"
+                        )
+                else:
+                    nearest_gap = result.get("nearest_gap_seconds")
+                    nearest_segment = result.get("nearest_segment") or {}
+                    entry["last_gpx_sync_status"] = (
+                        "HORS_PLAGE_COORDONNEES_CONSERVEES" if existing_gps else "HORS_PLAGE_GPX_BATCH"
+                    )
+                    entry["last_gpx_sync_detail"] = "OUT_OF_RANGE"
+                    entry["last_gpx_sync_gap_seconds"] = round(nearest_gap, 1) if nearest_gap is not None else None
+                    entry["last_gpx_sync_source_file"] = nearest_segment.get("source_name", "")
+                    entry["last_gpx_sync_batch_id"] = batch_id
+                    entry["last_gpx_sync_batch_name"] = report["name"]
+                    entry["last_gpx_sync_at"] = sync_attempt_at
+                    entry["last_gpx_sync_run_id"] = sync_run_id
+                    if existing_gps:
+                        preserved_existing_count += 1
+                        report["preserved_existing_count"] += 1
+                    else:
+                        entry["gps_sync"] = "HORS_PLAGE_GPX_BATCH"
+                        entry["gps_sync_detail"] = "OUT_OF_RANGE"
+                        entry["gps_match_seconds"] = round(nearest_gap, 1) if nearest_gap is not None else None
+                        entry.pop("gps_sync_run_id", None)
+                    out_of_range_count += 1
+                    report["out_of_range_count"] += 1
+                    self.log(
+                        f"⚠️ {report['name']} · {filename} · hors plage de ses propres traces"
+                        + (f" ({nearest_gap/60:.1f} min)" if nearest_gap is not None else "")
+                    )
+
+                self.progress["value"] = (position / len(eligible)) * 100
+                self.root.update_idletasks()
+
+            if not isinstance(self.catalog_container, dict):
+                self.catalog_container = self.read_catalog_container()
+            self.catalog_container["last_photo_gpx_sync"] = {
+                "synced_at": datetime.now().isoformat(timespec="seconds"),
+                "sync_run_id": sync_run_id,
+                "mode": "photo_batches_v68",
+                "photo_timezone": tz_name,
+                "max_gap_minutes": int(max_gap_minutes),
+                "batches_count": len(segments_by_batch),
+                "photos_considered": len(eligible),
+                "synced_count": synced_count,
+                "out_of_range_count": out_of_range_count,
+                "preserved_existing_count": preserved_existing_count,
+                "error_time_count": error_time_count,
+                "missing_file_count": missing_file_count,
+                "points_count": total_points,
+                "per_source_count": per_source_count,
+                "batches": list(batch_reports.values()),
+            }
+            self.save_catalog()
+
+            self.log("✅ [V68] Synchronisation par lots terminée")
+            for report in batch_reports.values():
+                self.log(
+                    f"   • {report['name']} : {report['synced_count']} photo(s) géolocalisée(s), "
+                    f"{report['out_of_range_count']} hors plage"
+                )
+
+            messagebox.showinfo(
+                "Synchronisation par lots terminée",
+                (
+                    f"Photos géolocalisées : {synced_count}\n"
+                    f"Hors plage : {out_of_range_count}\n"
+                    f"Coordonnées existantes conservées : {preserved_existing_count}\n"
+                    f"Erreurs d'heure : {error_time_count}\n"
+                    f"Fichiers introuvables : {missing_file_count}\n\n"
+                    "Chaque photo n'a été comparée qu'aux traces de son propre lot."
+                )
+            )
+            self.offer_write_gps_to_jpg_after_sync(synced_count, sync_run_id=sync_run_id)
+            self.load_folder(self.base_folder)
+
+        except Exception as exc:
+            messagebox.showerror("Erreur de synchronisation par lots", str(exc))
+            self.log(f"❌ Erreur GPS par lots v68 : {exc}")
 
     def show_trace_module(self):
         """Porte d'entrée utilisateur « Cartographie », moteur GPX v57 inchangé."""
