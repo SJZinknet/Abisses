@@ -9,6 +9,7 @@ import copy
 import shutil
 import sys
 import subprocess
+import socket
 import tempfile
 import queue
 import threading
@@ -54,7 +55,7 @@ BISSES_RENDER_README = "# Bisses\n\nPlateforme statique GitHub Pages pour l’in
 class BisseManagerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Abisses - v69")
+        self.root.title("Abisses - v70")
         self.configure_application_icon()
         self.configure_main_window_geometry()
 
@@ -69,6 +70,20 @@ class BisseManagerApp:
         self.local_log_path = str(self.local_environment.log_file)
         self.app_data_folder = self.resolve_app_data_folder_at_startup()
         os.makedirs(self.app_data_folder, exist_ok=True)
+
+        # v70 — coordination multi-poste. Les verrous de bisse sont de petits
+        # fichiers dans Gestion_Bisses_Data/locks/. Ils ne modifient jamais
+        # catalogue.json et permettent à plusieurs postes de travailler en
+        # parallèle, tant qu'ils ne modifient pas le même bisse.
+        self.multiuser_session_id = uuid.uuid4().hex
+        self.multiuser_host = socket.gethostname() or os.environ.get("COMPUTERNAME") or "Poste inconnu"
+        self.multiuser_user = os.environ.get("USERNAME") or os.environ.get("USER") or "Utilisateur"
+        self.active_bisse_lock = None
+        self.bisse_lock_heartbeat_after_id = None
+        self.bisse_lock_heartbeat_ms = 15000
+        self.bisse_lock_stale_seconds = 300
+        self.read_only_mode = False
+        self.read_only_lock_info = None
 
         # Infobulles légères, notamment pour les longs chemins de Mes bisses.
         self.tooltip_window = None
@@ -849,6 +864,10 @@ class BisseManagerApp:
 
     def close_application(self):
         """Ferme notamment le serveur, invalide les workers et nettoie la prévisualisation."""
+        try:
+            self.release_active_bisse_lock()
+        except Exception:
+            pass
         self._folder_open_generation += 1
         self._photo_workspace_load_generation += 1
         self._viewer_load_generation += 1
@@ -1294,6 +1313,10 @@ class BisseManagerApp:
     def switch_app_data_folder(self, folder, persist=True, refresh=True):
         if not folder:
             return False
+        try:
+            self.release_active_bisse_lock()
+        except Exception:
+            pass
 
         folder = os.path.abspath(os.path.expanduser(folder))
         os.makedirs(folder, exist_ok=True)
@@ -1379,6 +1402,408 @@ class BisseManagerApp:
 
 
     # ============================================================
+    # V70 — COORDINATION MULTI-POSTE / VERROUS NAS
+    # ============================================================
+
+    def get_bisse_locks_root(self):
+        path = os.path.join(self.app_data_folder, "locks")
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def get_short_locks_root(self):
+        path = os.path.join(self.app_data_folder, ".global_locks")
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def bisse_lock_key_for_folder(self, folder):
+        """Identifiant stable du verrou, déterminé sans modifier le bisse."""
+        folder = os.path.abspath(folder or "")
+        catalog_path = os.path.join(folder, "catalogue.json")
+        raw = {}
+        try:
+            with open(catalog_path, "r", encoding="utf-8") as handle:
+                candidate = json.load(handle)
+            if isinstance(candidate, dict):
+                raw = candidate
+        except Exception:
+            raw = {}
+
+        info = raw.get("bisse_info", {}) if isinstance(raw.get("bisse_info"), dict) else {}
+        project = raw.get("project", {}) if isinstance(raw.get("project"), dict) else {}
+        for value in (
+            info.get("slug"),
+            info.get("title"),
+            project.get("title"),
+            project.get("bisse_name"),
+            os.path.basename(folder),
+        ):
+            key = self.slugify(value or "")
+            if key:
+                return key
+        return "bisse"
+
+    def bisse_lock_path(self, lock_key):
+        return os.path.join(self.get_bisse_locks_root(), f"{self.slugify(lock_key or 'bisse')}.lock")
+
+    def read_bisse_lock_file(self, lock_key):
+        path = self.bisse_lock_path(lock_key)
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            if not isinstance(data, dict):
+                data = {}
+        except Exception:
+            data = {}
+        data["_path"] = path
+        return data
+
+    def bisse_lock_is_stale(self, info):
+        if not isinstance(info, dict) or not info:
+            return False
+        stamp = info.get("heartbeat_at") or info.get("acquired_at")
+        if stamp:
+            try:
+                age = time.time() - datetime.fromisoformat(str(stamp).replace("Z", "+00:00")).timestamp()
+                return age > float(self.bisse_lock_stale_seconds)
+            except Exception:
+                pass
+        path = info.get("_path")
+        try:
+            return path and (time.time() - os.path.getmtime(path)) > float(self.bisse_lock_stale_seconds)
+        except Exception:
+            return False
+
+    def make_bisse_lock_record(self, folder, lock_key):
+        now = datetime.now().isoformat(timespec="seconds")
+        return {
+            "schema_version": "1.0",
+            "lock_key": lock_key,
+            "folder": os.path.abspath(folder),
+            "session_id": self.multiuser_session_id,
+            "host": self.multiuser_host,
+            "user": self.multiuser_user,
+            "pid": os.getpid(),
+            "acquired_at": now,
+            "heartbeat_at": now,
+            "app_version": "v70",
+        }
+
+    def try_create_bisse_lock(self, folder, lock_key=None):
+        """Création exclusive : une seule instance peut gagner le verrou."""
+        folder = os.path.abspath(folder)
+        lock_key = lock_key or self.bisse_lock_key_for_folder(folder)
+        path = self.bisse_lock_path(lock_key)
+        record = self.make_bisse_lock_record(folder, lock_key)
+        payload = (json.dumps(record, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            existing = self.read_bisse_lock_file(lock_key)
+            if existing.get("session_id") == self.multiuser_session_id:
+                existing.setdefault("lock_key", lock_key)
+                existing.setdefault("folder", folder)
+                existing["_path"] = path
+                return "owned", existing
+            return "busy", existing
+        except Exception as exc:
+            return "error", {"error": str(exc), "lock_key": lock_key, "_path": path}
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                try:
+                    os.fsync(handle.fileno())
+                except Exception:
+                    pass
+        except Exception:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+            raise
+        record["_path"] = path
+        return "acquired", record
+
+    def take_over_stale_bisse_lock(self, folder, lock_key, expected_info):
+        path = self.bisse_lock_path(lock_key)
+        current = self.read_bisse_lock_file(lock_key)
+        # On ne retire que le verrou effectivement présenté à l'utilisateur.
+        expected_session = (expected_info or {}).get("session_id")
+        if expected_session and current.get("session_id") != expected_session:
+            return self.try_create_bisse_lock(folder, lock_key)
+        if current and not self.bisse_lock_is_stale(current):
+            return "busy", current
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            return "error", {"error": str(exc), "lock_key": lock_key, "_path": path}
+        return self.try_create_bisse_lock(folder, lock_key)
+
+    def show_bisse_access_conflict_dialog(self, title, lock_info=None, stale=False, lock_error=""):
+        """Popup exceptionnelle : uniquement lorsqu'un bisse n'est pas modifiable."""
+        result = {"value": "cancel"}
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Bisse déjà ouvert" if not lock_error else "Verrouillage indisponible")
+        dialog.geometry("620x330" if stale else "620x290")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        frame = tk.Frame(dialog, padx=20, pady=18)
+        frame.pack(fill="both", expand=True)
+        tk.Label(
+            frame,
+            text="🔒 Ouverture en lecture seule",
+            font=("Arial", 15, "bold"),
+            anchor="w"
+        ).pack(fill="x", pady=(0, 12))
+
+        if lock_error:
+            message = (
+                f"Abisses ne peut pas vérifier le verrou de « {title} » sur le dossier de données commun.\n\n"
+                "Par sécurité, le bisse peut être consulté mais les modifications resteront désactivées."
+            )
+        else:
+            host = (lock_info or {}).get("host") or "un autre poste"
+            user = (lock_info or {}).get("user") or ""
+            owner = f"{host}" + (f" · {user}" if user else "")
+            message = (
+                f"« {title} » est déjà en cours de modification sur {owner}.\n\n"
+                "Vous pouvez l'ouvrir et consulter ses informations, mais les modifications sont désactivées "
+                "pour éviter que deux personnes travaillent sur le même bisse en même temps."
+            )
+            if stale:
+                message += (
+                    "\n\nCe verrou ne donne plus signe d'activité depuis plusieurs minutes. "
+                    "Si l'autre poste a été fermé ou a planté, vous pouvez reprendre la modification."
+                )
+
+        tk.Label(frame, text=message, justify="left", anchor="w", wraplength=570).pack(fill="x")
+        buttons = tk.Frame(frame)
+        buttons.pack(fill="x", pady=(22, 0))
+
+        def choose(value):
+            result["value"] = value
+            try:
+                dialog.grab_release()
+            except Exception:
+                pass
+            dialog.destroy()
+
+        tk.Button(buttons, text="Annuler", command=lambda: choose("cancel"), width=12).pack(side="right")
+        tk.Button(
+            buttons,
+            text="Ouvrir en lecture seule",
+            command=lambda: choose("readonly"),
+            bg="#d68910",
+            fg="white",
+            width=22
+        ).pack(side="right", padx=8)
+        if stale and not lock_error:
+            tk.Button(
+                buttons,
+                text="Reprendre la modification",
+                command=lambda: choose("takeover"),
+                bg="#2874a6",
+                fg="white",
+                width=22
+            ).pack(side="left")
+
+        dialog.protocol("WM_DELETE_WINDOW", lambda: choose("cancel"))
+        dialog.wait_window()
+        return result["value"]
+
+    def resolve_bisse_access_for_open(self, folder):
+        folder = os.path.abspath(folder)
+        lock_key = self.bisse_lock_key_for_folder(folder)
+        title = os.path.basename(folder) or lock_key
+
+        # Réouverture du bisse déjà détenu par cette instance : aucun nouveau verrou.
+        current = self.active_bisse_lock or {}
+        if (
+            current.get("session_id") == self.multiuser_session_id
+            and current.get("lock_key") == lock_key
+        ):
+            return {"mode": "edit", "lock": current, "lock_key": lock_key, "new_lock": False}
+
+        status, info = self.try_create_bisse_lock(folder, lock_key)
+        if status in ("acquired", "owned"):
+            return {"mode": "edit", "lock": info, "lock_key": lock_key, "new_lock": status == "acquired"}
+
+        if status == "error":
+            choice = self.show_bisse_access_conflict_dialog(
+                title,
+                lock_error=info.get("error", "Impossible d'accéder au verrou."),
+            )
+            if choice == "readonly":
+                return {"mode": "readonly", "lock": info, "lock_key": lock_key, "new_lock": False}
+            return None
+
+        stale = self.bisse_lock_is_stale(info)
+        choice = self.show_bisse_access_conflict_dialog(title, info, stale=stale)
+        if choice == "readonly":
+            return {"mode": "readonly", "lock": info, "lock_key": lock_key, "new_lock": False}
+        if choice == "takeover" and stale:
+            status2, info2 = self.take_over_stale_bisse_lock(folder, lock_key, info)
+            if status2 in ("acquired", "owned"):
+                return {"mode": "edit", "lock": info2, "lock_key": lock_key, "new_lock": status2 == "acquired"}
+            # Quelqu'un a pu reprendre le verrou entre-temps : retour propre en lecture seule.
+            choice2 = self.show_bisse_access_conflict_dialog(title, info2, stale=False)
+            if choice2 == "readonly":
+                return {"mode": "readonly", "lock": info2, "lock_key": lock_key, "new_lock": False}
+        return None
+
+    def cancel_bisse_lock_heartbeat(self):
+        if self.bisse_lock_heartbeat_after_id is not None:
+            try:
+                self.root.after_cancel(self.bisse_lock_heartbeat_after_id)
+            except Exception:
+                pass
+        self.bisse_lock_heartbeat_after_id = None
+
+    def refresh_active_bisse_lock_heartbeat(self):
+        self.bisse_lock_heartbeat_after_id = None
+        info = self.active_bisse_lock
+        if not isinstance(info, dict) or info.get("session_id") != self.multiuser_session_id:
+            return
+        path = info.get("_path") or self.bisse_lock_path(info.get("lock_key"))
+        current = self.read_bisse_lock_file(info.get("lock_key"))
+        if current.get("session_id") != self.multiuser_session_id:
+            self.active_bisse_lock = None
+            self.read_only_mode = True
+            self.read_only_lock_info = current or {"host": "un autre poste"}
+            try:
+                self.show_contextual_interface(
+                    has_raw=self.folder_has_images(self.photos_folder),
+                    has_export=os.path.exists(self.export_folder) and self.folder_has_images(self.export_folder),
+                    has_cat=os.path.exists(self.catalog_path),
+                    is_geo=any(str(e.get("gps_sync", "")).startswith("OK") for e in self.catalog_data if isinstance(e, dict)),
+                )
+            except Exception:
+                pass
+            return
+        info["heartbeat_at"] = datetime.now().isoformat(timespec="seconds")
+        payload = {k: v for k, v in info.items() if not k.startswith("_")}
+        try:
+            self._write_json_atomic_v65(path, payload, indent=2)
+        except Exception as exc:
+            self.log(f"⚠️ Renouvellement du verrou impossible : {exc}")
+        try:
+            self.bisse_lock_heartbeat_after_id = self.root.after(
+                self.bisse_lock_heartbeat_ms,
+                self.refresh_active_bisse_lock_heartbeat,
+            )
+        except Exception:
+            pass
+
+    def activate_bisse_access(self, folder, access):
+        """Bascule le verrou seulement une fois l'ouverture du nouveau bisse réussie."""
+        old = self.active_bisse_lock
+        new = access.get("lock") if access else None
+        mode = (access or {}).get("mode", "readonly")
+        if old and (not new or old.get("lock_key") != new.get("lock_key")):
+            self.release_active_bisse_lock(old)
+        self.cancel_bisse_lock_heartbeat()
+        self.read_only_mode = mode == "readonly"
+        self.read_only_lock_info = new if self.read_only_mode else None
+        if mode == "edit":
+            self.active_bisse_lock = new
+            self.refresh_active_bisse_lock_heartbeat()
+        else:
+            self.active_bisse_lock = None
+
+    def release_active_bisse_lock(self, lock_info=None):
+        info = lock_info or self.active_bisse_lock
+        if not isinstance(info, dict):
+            if lock_info is None:
+                self.active_bisse_lock = None
+                self.cancel_bisse_lock_heartbeat()
+            return
+        lock_key = info.get("lock_key")
+        path = info.get("_path") or (self.bisse_lock_path(lock_key) if lock_key else "")
+        try:
+            current = self.read_bisse_lock_file(lock_key) if lock_key else {}
+            if current.get("session_id") == self.multiuser_session_id and path:
+                os.remove(path)
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            self.log(f"⚠️ Libération du verrou impossible : {exc}")
+        if lock_info is None or info is self.active_bisse_lock or (
+            self.active_bisse_lock and self.active_bisse_lock.get("lock_key") == lock_key
+        ):
+            self.active_bisse_lock = None
+            self.cancel_bisse_lock_heartbeat()
+
+    def short_data_lock_acquire(self, name, timeout=8.0):
+        key = self.slugify(name or "global") or "global"
+        path = os.path.join(self.get_short_locks_root(), f"{key}.lock")
+        deadline = time.time() + timeout
+        payload = {
+            "session_id": self.multiuser_session_id,
+            "host": self.multiuser_host,
+            "pid": os.getpid(),
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        while True:
+            try:
+                fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    json.dump(payload, handle, ensure_ascii=False)
+                return path
+            except FileExistsError:
+                try:
+                    if time.time() - os.path.getmtime(path) > 30:
+                        os.remove(path)
+                        continue
+                except Exception:
+                    pass
+                if time.time() >= deadline:
+                    raise TimeoutError(f"Fichier global occupé : {name}")
+                time.sleep(0.05)
+
+    def short_data_lock_release(self, path):
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+
+    def atomic_write_shared_json(self, path, data, indent=4):
+        self._write_json_atomic_v65(path, data, indent=indent)
+
+    def workspace_transaction(self, mutator):
+        path = self.get_workspace_path()
+        lock = self.short_data_lock_acquire("bisses_workspace")
+        try:
+            workspace = self.read_workspace()
+            result = mutator(workspace)
+            workspace["updated_at"] = datetime.now().isoformat(timespec="seconds")
+            self.atomic_write_shared_json(path, workspace, indent=2)
+            return result
+        finally:
+            self.short_data_lock_release(lock)
+
+    def workspace_lock_label(self, project_id="", folder=""):
+        key = self.slugify(project_id or "") or self.bisse_lock_key_for_folder(folder)
+        info = self.read_bisse_lock_file(key)
+        if not info or not info.get("session_id"):
+            return "Libre"
+        if self.bisse_lock_is_stale(info):
+            return f"⚠ ancien · {info.get('host') or 'poste inconnu'}"
+        if info.get("session_id") == self.multiuser_session_id:
+            return "🔒 ce poste"
+        return f"🔒 {info.get('host') or 'autre poste'}"
+
+
+    # ============================================================
     # PROJETS PORTABLES DANS Gestion_Bisses_Data
     # ============================================================
 
@@ -1411,8 +1836,7 @@ class BisseManagerApp:
 
     def write_json_file_safe(self, path, data):
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=4, ensure_ascii=False)
+        self._write_json_atomic_v65(path, data, indent=4)
 
     def normalize_json_for_compare(self, data):
         try:
@@ -1513,8 +1937,7 @@ class BisseManagerApp:
         data["project"]["bisse_name"] = title
         data["project"]["title"] = title
 
-        with open(catalog_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=4, ensure_ascii=False)
+        self._write_json_atomic_v65(catalog_path, data, indent=4)
 
     def project_id_from_container_or_folder(self, folder=None, container=None):
         info = {}
@@ -1832,7 +2255,17 @@ class BisseManagerApp:
         Sinon, on revient à l'accueil Mes bisses.
         """
         if self.base_folder and os.path.isdir(self.base_folder):
-            self.load_folder(self.base_folder)
+            if getattr(self, "read_only_mode", False):
+                has_raw = self.folder_has_images(self.photos_folder)
+                has_export = os.path.exists(self.export_folder) and self.folder_has_images(self.export_folder)
+                has_cat = os.path.exists(self.catalog_path)
+                is_geo = any(
+                    str(entry.get("gps_sync", "")).startswith("OK")
+                    for entry in self.catalog_data if isinstance(entry, dict)
+                )
+                self.show_contextual_interface(has_raw, has_export, has_cat, is_geo)
+            else:
+                self.load_folder(self.base_folder)
         else:
             self.show_workspace_home()
 
@@ -3204,12 +3637,11 @@ class BisseManagerApp:
         }
 
         os.makedirs(os.path.dirname(self.segment_categories_file), exist_ok=True)
-        temp_path = self.segment_categories_file + ".tmp"
-
-        with open(temp_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=4, ensure_ascii=False)
-
-        os.replace(temp_path, self.segment_categories_file)
+        lock = self.short_data_lock_acquire("segment_categories")
+        try:
+            self.atomic_write_shared_json(self.segment_categories_file, payload, indent=4)
+        finally:
+            self.short_data_lock_release(lock)
         self.global_segment_categories = normalized
 
     def get_global_segment_category_by_id(self, category_id):
@@ -6391,6 +6823,9 @@ class BisseManagerApp:
         return raw
 
     def save_catalog(self):
+        if getattr(self, "read_only_mode", False):
+            self.log("⛔ Sauvegarde ignorée : bisse ouvert en lecture seule.")
+            raise RuntimeError("Ce bisse est ouvert en lecture seule.")
         if not isinstance(self.catalog_container, dict):
             self.catalog_container = self.empty_catalog_container()
 
@@ -6433,8 +6868,7 @@ class BisseManagerApp:
 
         # Mode sécurisé : écriture principale dans le dossier local actif.
         self.reset_active_catalog_paths_to_local()
-        with open(self.catalog_path, "w", encoding="utf-8") as f:
-            json.dump(self.catalog_container, f, indent=4, ensure_ascii=False)
+        self._write_json_atomic_v65(self.catalog_path, self.catalog_container, indent=4)
 
         # Copie portable dans Data, sans jamais réécrire le local depuis Data.
         try:
@@ -6504,8 +6938,11 @@ class BisseManagerApp:
         path = self.get_workspace_path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
         workspace["updated_at"] = datetime.now().isoformat(timespec="seconds")
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(workspace, f, indent=2, ensure_ascii=False)
+        lock = self.short_data_lock_acquire("bisses_workspace")
+        try:
+            self.atomic_write_shared_json(path, workspace, indent=2)
+        finally:
+            self.short_data_lock_release(lock)
         self.log(f"💾 Liste Mes bisses sauvegardée : {path}")
 
     def add_folder_to_workspace(self, folder):
@@ -6516,37 +6953,36 @@ class BisseManagerApp:
         try:
             project_id = self.ensure_project_for_folder(folder_abs)
         except Exception:
-            project_id = ""
-
-        workspace = self.read_workspace()
-        bisses = workspace.setdefault("bisses", [])
+            project_id = self.bisse_lock_key_for_folder(folder_abs)
 
         now = datetime.now().isoformat(timespec="seconds")
-        found = False
 
-        for entry in bisses:
-            same_project = project_id and entry.get("project_id") == project_id
-            same_folder = os.path.abspath(entry.get("folder", "")) == folder_abs if entry.get("folder") else False
-            if same_project or same_folder:
-                entry["project_id"] = project_id or entry.get("project_id", "")
-                entry["folder"] = folder_abs
-                entry["last_opened_at"] = now
-                found = True
-                break
+        def mutate(workspace):
+            bisses = workspace.setdefault("bisses", [])
+            found = False
+            for entry in bisses:
+                same_project = project_id and entry.get("project_id") == project_id
+                same_folder = os.path.abspath(entry.get("folder", "")) == folder_abs if entry.get("folder") else False
+                if same_project or same_folder:
+                    entry["project_id"] = project_id or entry.get("project_id", "")
+                    entry["folder"] = folder_abs
+                    entry["last_opened_at"] = now
+                    found = True
+                    break
+            if not found:
+                bisses.append({
+                    "project_id": project_id,
+                    "folder": folder_abs,
+                    "first_opened_at": now,
+                    "last_opened_at": now
+                })
+            return bisses
 
-        if not found:
-            bisses.append({
-                "project_id": project_id,
-                "folder": folder_abs,
-                "first_opened_at": now,
-                "last_opened_at": now
-            })
+        self.workspace_transaction(mutate)
 
         if project_id:
             self.set_project_hidden_from_workspace(project_id, False)
-
-        bisses.sort(key=lambda entry: self.get_bisse_summary_from_project(entry.get("project_id", ""), entry.get("folder", "")).get("title", "").lower())
-        self.write_workspace(workspace)
+        self.log(f"💾 Mes bisses mis à jour : {folder_abs}")
 
     def looks_like_bisse_folder(self, folder):
         """
@@ -8338,35 +8774,35 @@ namespace GestionBissesFolderPicker
         if not folder:
             return
         folder_abs = os.path.abspath(folder)
-        workspace = self.read_workspace()
-        before = len(workspace.get("bisses", []))
-        workspace["bisses"] = [
-            entry for entry in workspace.get("bisses", [])
-            if os.path.abspath(entry.get("folder", "")) != folder_abs
-        ]
-        after = len(workspace.get("bisses", []))
-        self.write_workspace(workspace)
-        self.log(f"🗑️ {before - after} bisse(s) retiré(s) de Mes bisses.")
+        removed = {"count": 0}
+        def mutate(workspace):
+            before = len(workspace.get("bisses", []))
+            workspace["bisses"] = [
+                entry for entry in workspace.get("bisses", [])
+                if os.path.abspath(entry.get("folder", "")) != folder_abs
+            ]
+            removed["count"] = before - len(workspace["bisses"])
+        self.workspace_transaction(mutate)
+        self.log(f"🗑️ {removed['count']} bisse(s) retiré(s) de Mes bisses.")
 
 
     def remove_workspace_entry(self, project_id="", folder=""):
-        workspace = self.read_workspace()
-        before = len(workspace.get("bisses", []))
         folder_abs = os.path.abspath(folder) if folder else ""
-
-        workspace["bisses"] = [
-            entry for entry in workspace.get("bisses", [])
-            if not (
-                (project_id and entry.get("project_id") == project_id)
-                or (folder_abs and entry.get("folder") and os.path.abspath(entry.get("folder", "")) == folder_abs)
-            )
-        ]
-
+        removed = {"count": 0}
+        def mutate(workspace):
+            before = len(workspace.get("bisses", []))
+            workspace["bisses"] = [
+                entry for entry in workspace.get("bisses", [])
+                if not (
+                    (project_id and entry.get("project_id") == project_id)
+                    or (folder_abs and entry.get("folder") and os.path.abspath(entry.get("folder", "")) == folder_abs)
+                )
+            ]
+            removed["count"] = before - len(workspace["bisses"])
+        self.workspace_transaction(mutate)
         if project_id:
             self.set_project_hidden_from_workspace(project_id, True)
-
-        self.write_workspace(workspace)
-        self.log(f"🗑️ {before - len(workspace.get('bisses', []))} entrée(s) retirée(s) de Mes bisses.")
+        self.log(f"🗑️ {removed['count']} entrée(s) retirée(s) de Mes bisses.")
 
     def get_bisse_summary_from_project(self, project_id, folder=""):
         project_id = self.slugify(project_id or "")
@@ -8668,6 +9104,8 @@ namespace GestionBissesFolderPicker
         Écrit une copie portable dans Gestion_Bisses_Data/projects/<project_id>/catalogue.json.
         Ne modifie jamais le catalogue local.
         """
+        if getattr(self, "read_only_mode", False):
+            return
         if not self.base_folder or not isinstance(self.catalog_container, dict):
             return
 
@@ -8780,6 +9218,13 @@ namespace GestionBissesFolderPicker
         v43 : Mes bisses affiche les projets Data, même si leur dossier source
         doit être relié sur cet ordinateur.
         """
+        # Retour à l'accueil = fin explicite de la session de modification du bisse.
+        try:
+            self.release_active_bisse_lock()
+        except Exception:
+            pass
+        self.read_only_mode = False
+        self.read_only_lock_info = None
         self.clear_main_frame()
         self.status_header.config(text="Mes bisses", fg="#34495e")
 
@@ -8935,7 +9380,7 @@ namespace GestionBissesFolderPicker
 
             columns = (
                 "title", "slug", "region", "commune",
-                "photos", "segments", "publication", "source", "status",
+                "photos", "segments", "publication", "source", "lock", "status",
                 "last_opened", "folder"
             )
             tree = ttk.Treeview(
@@ -8955,6 +9400,7 @@ namespace GestionBissesFolderPicker
                 "segments": "Segments",
                 "publication": "Lot",
                 "source": "Dossier source",
+                "lock": "Verrou",
                 "status": "Catalogue",
                 "last_opened": "Dernière ouverture",
                 "folder": "Dossier"
@@ -8968,6 +9414,7 @@ namespace GestionBissesFolderPicker
                 "segments": 75,
                 "publication": 55,
                 "source": 115,
+                "lock": 145,
                 "status": 120,
                 "last_opened": 135,
                 "folder": 640
@@ -8977,7 +9424,7 @@ namespace GestionBissesFolderPicker
                 tree.heading(col, text=headings[col])
                 tree.column(col, width=widths[col], anchor="w")
 
-            for col in ("photos", "segments", "publication", "source", "status"):
+            for col in ("photos", "segments", "publication", "source", "lock", "status"):
                 tree.column(col, anchor="center")
 
             tree.column("folder", minwidth=500, stretch=True)
@@ -9014,6 +9461,7 @@ namespace GestionBissesFolderPicker
                         entry.get("segments_count", 0),
                         "✅" if in_publication else "—",
                         "✅" if source_ok else "🔗 à relier",
+                        self.workspace_lock_label(project_id, folder),
                         "✅" if entry.get("has_catalog") else "⚪",
                         entry.get("last_opened_at", ""),
                         folder if source_ok else "(dossier source à relier)"
@@ -11371,7 +11819,7 @@ namespace GestionBissesFolderPicker
         self.load_folder(folder)
 
     def load_folder(self, folder):
-        """Ouvre un bisse sans bloquer Tk pendant le scan et la préparation photo."""
+        """Ouvre un bisse avec verrou multi-poste ; lecture seule en cas de conflit."""
         if not folder:
             return
         folder = os.path.abspath(os.path.expanduser(folder))
@@ -11379,14 +11827,22 @@ namespace GestionBissesFolderPicker
             messagebox.showerror("Ouverture impossible", f"Dossier introuvable :\n{folder}")
             return
 
+        access = self.resolve_bisse_access_for_open(folder)
+        if access is None:
+            return
+        read_only = access.get("mode") == "readonly"
+
         self._folder_open_generation += 1
         generation = self._folder_open_generation
 
         def worker(report):
-            return self.prepare_folder_opening_context(folder, report=report)
+            return self.prepare_folder_opening_context(folder, report=report, read_only=read_only)
 
         def on_success(result, token):
             if generation != self._folder_open_generation:
+                # Un verrou nouvellement acquis mais jamais activé doit être libéré.
+                if access.get("new_lock"):
+                    self.release_active_bisse_lock(access.get("lock"))
                 self.end_activity(token, restore_status=False)
                 return
             self._folder_open_activity_token = None
@@ -11403,40 +11859,48 @@ namespace GestionBissesFolderPicker
                 self.catalog_container = result["catalog_container"]
                 self.catalog_data = result["catalog_data"]
 
-                # v69 : un historique Cartographie d'un autre bisse ne doit
-                # jamais être disponible dans le nouveau contexte actif.
-                self.ensure_gpx_workshop_history_context()
+                # Le nouveau contexte ne devient propriétaire qu'après une ouverture réussie.
+                self.activate_bisse_access(folder, access)
 
-                try:
-                    self.migrate_legacy_global_files_if_needed()
-                except Exception as exc:
-                    self.log(f"⚠️ Migration des fichiers globaux impossible : {exc}")
+                if not self.read_only_mode:
+                    try:
+                        self.migrate_legacy_global_files_if_needed()
+                    except Exception as exc:
+                        self.log(f"⚠️ Migration des fichiers globaux impossible : {exc}")
 
-                try:
-                    project_id = self.ensure_project_for_folder(self.base_folder)
-                    self.reset_active_catalog_paths_to_local()
-                    self.log(f"📦 Projet Data associé : {project_id} — catalogue actif local sécurisé")
-                except Exception as exc:
-                    self.current_project_id = ""
-                    self.current_project_dir = ""
-                    self.current_project_catalog_path = ""
+                if not self.read_only_mode:
+                    try:
+                        project_id = self.ensure_project_for_folder(self.base_folder)
+                        self.reset_active_catalog_paths_to_local()
+                        self.log(f"📦 Projet Data associé : {project_id} — catalogue actif local sécurisé")
+                    except Exception as exc:
+                        self.current_project_id = ""
+                        self.current_project_dir = ""
+                        self.current_project_catalog_path = ""
+                        self.catalog_path = self.local_catalog_path
+                        self.log(f"⚠️ Projet Data indisponible, utilisation du catalogue local : {exc}")
+
+                    try:
+                        self.add_folder_to_workspace(self.base_folder)
+                    except Exception as exc:
+                        self.log(f"⚠️ Impossible d'ajouter ce dossier à Mes bisses : {exc}")
+
+                    try:
+                        self.write_portable_data_copy_for_active_project()
+                    except Exception as exc:
+                        self.log(f"⚠️ Copie Data portable impossible : {exc}")
+                else:
+                    project_id = access.get("lock_key") or self.bisse_lock_key_for_folder(self.base_folder)
+                    self.current_project_id = project_id
+                    self.current_project_dir = os.path.join(self.app_data_folder, "projects", project_id)
+                    self.current_project_catalog_path = os.path.join(self.current_project_dir, "catalogue.json")
                     self.catalog_path = self.local_catalog_path
-                    self.log(f"⚠️ Projet Data indisponible, utilisation du catalogue local : {exc}")
-
-                try:
-                    self.add_folder_to_workspace(self.base_folder)
-                except Exception as exc:
-                    self.log(f"⚠️ Impossible d'ajouter ce dossier à Mes bisses : {exc}")
-
-                try:
-                    self.write_portable_data_copy_for_active_project()
-                except Exception as exc:
-                    self.log(f"⚠️ Copie Data portable impossible : {exc}")
+                    self.log(f"🔒 Lecture seule : {project_id} — aucune préparation ni copie Data effectuée")
 
                 summary = result.get("summary", {})
                 for message in summary.get("error_messages", []):
                     self.log(f"⚠️ {message}")
-                if result.get("work_count") or summary.get("errors"):
+                if not self.read_only_mode and (result.get("work_count") or summary.get("errors")):
                     self.log(
                         "📷 Préparation automatique : "
                         f"{summary.get('sources', 0)} source(s), "
@@ -11448,7 +11912,10 @@ namespace GestionBissesFolderPicker
                     )
 
                 self.update_activity(token, "Ouverture du tableau de bord…")
-                self.status_header.config(text=f"Dossier actif : {self.base_folder}", fg="green")
+                if self.read_only_mode:
+                    self.status_header.config(text=f"LECTURE SEULE · {self.base_folder}", fg="#b03a2e")
+                else:
+                    self.status_header.config(text=f"Dossier actif : {self.base_folder}", fg="green")
                 self.log(f"📂 Dossier actif : {self.base_folder}")
                 has_raw_photos = self.folder_has_images(self.photos_folder)
                 has_export_photos = os.path.exists(self.export_folder) and self.folder_has_images(self.export_folder)
@@ -11464,11 +11931,15 @@ namespace GestionBissesFolderPicker
                     is_geo=is_geolocated,
                 )
             except Exception as exc:
+                if access.get("new_lock") and not self.active_bisse_lock:
+                    self.release_active_bisse_lock(access.get("lock"))
                 messagebox.showerror("Ouverture incomplète", str(exc))
             finally:
                 self.end_activity(token, restore_status=False)
 
         def on_error(exc, token):
+            if access.get("new_lock"):
+                self.release_active_bisse_lock(access.get("lock"))
             if generation != self._folder_open_generation:
                 return
             self._folder_open_activity_token = None
@@ -11570,6 +12041,27 @@ namespace GestionBissesFolderPicker
                 anchor="w"
             ).grid(row=1, column=0, sticky="ew")
 
+        if self.read_only_mode:
+            owner = self.read_only_lock_info or {}
+            host = owner.get("host") or "un autre poste"
+            user = owner.get("user") or ""
+            owner_text = host + (f" · {user}" if user else "")
+            lock_text = f"🔒 LECTURE SEULE — ce bisse est en modification sur {owner_text}"
+            lock_bg, lock_fg = "#fdebd0", "#922b21"
+        else:
+            lock_text = f"🔒 MODIFICATION — verrou actif sur ce poste ({self.multiuser_host})"
+            lock_bg, lock_fg = "#e9f7ef", "#196f3d"
+        tk.Label(
+            header,
+            text=lock_text,
+            bg=lock_bg,
+            fg=lock_fg,
+            anchor="w",
+            padx=8,
+            pady=5,
+            font=("Arial", 9, "bold")
+        ).grid(row=2, column=0, sticky="ew", pady=(5, 0))
+
         tk.Button(
             header,
             text="🏠 Mes bisses",
@@ -11577,7 +12069,7 @@ namespace GestionBissesFolderPicker
         ).grid(
             row=0,
             column=1,
-            rowspan=2,
+            rowspan=3,
             sticky="e"
         )
 
@@ -11658,7 +12150,8 @@ namespace GestionBissesFolderPicker
                 workflow,
                 text="Ouvrir",
                 command=command,
-                width=12
+                width=12,
+                state=("disabled" if self.read_only_mode and number != 6 else "normal")
             ).grid(
                 row=row,
                 column=2,
@@ -11756,7 +12249,8 @@ namespace GestionBissesFolderPicker
             command=self.show_bisse_photos_module,
             bg="#2980b9",
             fg="white",
-            height=2
+            height=2,
+            state=("disabled" if self.read_only_mode else "normal")
         ).grid(
             row=0,
             column=0,
@@ -11770,7 +12264,8 @@ namespace GestionBissesFolderPicker
             command=self.show_trace_module,
             bg="#d35400",
             fg="white",
-            height=2
+            height=2,
+            state=("disabled" if self.read_only_mode else "normal")
         ).grid(
             row=1,
             column=0,
@@ -11809,7 +12304,8 @@ namespace GestionBissesFolderPicker
         tk.Button(
             secondary,
             text="📝 Fiche du bisse",
-            command=self.show_bisse_info_editor
+            command=self.show_bisse_info_editor,
+            state=("disabled" if self.read_only_mode else "normal")
         ).grid(
             row=0,
             column=0,
@@ -11851,7 +12347,8 @@ namespace GestionBissesFolderPicker
         tk.Button(
             advanced,
             text="✅ Vérifier la structure du dossier",
-            command=self.check_local_folder_structure
+            command=self.check_local_folder_structure,
+            state=("disabled" if self.read_only_mode else "normal")
         ).grid(row=0, column=0, sticky="ew", pady=3)
 
         tk.Button(
@@ -11863,7 +12360,8 @@ namespace GestionBissesFolderPicker
         tk.Button(
             advanced,
             text="🔄 Relancer la préparation des photos",
-            command=lambda: self.load_folder(self.base_folder)
+            command=lambda: self.load_folder(self.base_folder),
+            state=("disabled" if self.read_only_mode else "normal")
         ).grid(row=2, column=0, sticky="ew", pady=3)
 
         tk.Label(
@@ -11963,8 +12461,11 @@ namespace GestionBissesFolderPicker
         path = self.get_bisses_library_path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
         library["updated_at"] = datetime.now().isoformat(timespec="seconds")
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(library, f, indent=2, ensure_ascii=False)
+        lock = self.short_data_lock_acquire("bisses_library")
+        try:
+            self.atomic_write_shared_json(path, library, indent=2)
+        finally:
+            self.short_data_lock_release(lock)
         self.log(f"💾 Bibliothèque des bisses sauvegardée : {path}")
 
     def update_bisses_library_from_file(self, file_path):
@@ -13907,8 +14408,8 @@ namespace GestionBissesFolderPicker
         return source_files, work
 
 
-    def prepare_folder_opening_context(self, folder, report=None):
-        """Prépare un dossier hors état actif ; cette fonction peut tourner dans un worker."""
+    def prepare_folder_opening_context(self, folder, report=None, read_only=False):
+        """Prépare un dossier hors état actif ; en lecture seule, aucune écriture n'est effectuée."""
         folder = os.path.abspath(os.path.expanduser(folder))
         if not os.path.isdir(folder):
             raise FileNotFoundError(f"Dossier bisse introuvable : {folder}")
@@ -13925,6 +14426,20 @@ namespace GestionBissesFolderPicker
         if callable(report):
             report("Analyse du dossier…", None, None)
         container = self.read_catalog_container_for_opening(catalog_path, folder)
+        if read_only:
+            source_files = self.photo_files_for_automatic_preparation(photos_folder)
+            return {
+                "base_folder": folder,
+                "photos_folder": photos_folder,
+                "export_folder": export_folder,
+                "gpx_folder": gpx_folder,
+                "catalog_path": catalog_path,
+                "catalog_container": container,
+                "catalog_data": container.get("photos", []),
+                "summary": {"sources": len(source_files), "errors": 0, "error_messages": []},
+                "source_count": len(source_files),
+                "work_count": 0,
+            }
         source_files, work_files = self.inspect_photo_foundation_work(
             folder, container, photos_folder=photos_folder, export_folder=export_folder
         )
