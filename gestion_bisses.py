@@ -54,7 +54,7 @@ BISSES_RENDER_README = "# Bisses\n\nPlateforme statique GitHub Pages pour l’in
 class BisseManagerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Abisses - v68")
+        self.root.title("Abisses - v69")
         self.configure_application_icon()
         self.configure_main_window_geometry()
 
@@ -271,6 +271,10 @@ class BisseManagerApp:
         self.gpx_workshop_pending_segment_id = None
         self.gpx_workshop_undo_stack = []
         self.gpx_workshop_redo_stack = []
+        # v69 : l'historique Annuler/Rétablir de Cartographie appartient
+        # explicitement au bisse courant. Il ne doit jamais survivre à un
+        # changement de dossier et être rejoué sur un autre catalogue.
+        self.gpx_workshop_history_owner = None
 
         # v52b : micro-correction non destructive et création prudente d'un
         # segment par clics. Le même moteur de brouillon est partagé par les
@@ -11399,6 +11403,10 @@ namespace GestionBissesFolderPicker
                 self.catalog_container = result["catalog_container"]
                 self.catalog_data = result["catalog_data"]
 
+                # v69 : un historique Cartographie d'un autre bisse ne doit
+                # jamais être disponible dans le nouveau contexte actif.
+                self.ensure_gpx_workshop_history_context()
+
                 try:
                     self.migrate_legacy_global_files_if_needed()
                 except Exception as exc:
@@ -17311,6 +17319,44 @@ namespace GestionBissesFolderPicker
     # CATÉGORIES LIBRES ET EXPORT
     # ============================================================
 
+    def gpx_workshop_context_key(self):
+        """Identité interne du bisse auquel l'atelier Cartographie est rattaché."""
+        folder = os.path.normcase(
+            os.path.abspath(os.path.expanduser(self.base_folder or ""))
+        ) if self.base_folder else ""
+        catalog = os.path.normcase(
+            os.path.abspath(os.path.expanduser(self.local_catalog_path or self.catalog_path or ""))
+        ) if (self.local_catalog_path or self.catalog_path) else ""
+        return (folder, catalog)
+
+    def reset_gpx_workshop_history(self, owner=None):
+        """Vide silencieusement l'historique Cartographie et fixe son propriétaire."""
+        self.gpx_workshop_undo_stack = []
+        self.gpx_workshop_redo_stack = []
+        self.gpx_workshop_history_owner = (
+            owner if owner is not None else self.gpx_workshop_context_key()
+        )
+
+    def ensure_gpx_workshop_history_context(self):
+        """Garantit qu'Annuler/Rétablir ne peut concerner que le bisse actif."""
+        current = self.gpx_workshop_context_key()
+        if self.gpx_workshop_history_owner != current:
+            had_history = bool(
+                self.gpx_workshop_undo_stack or self.gpx_workshop_redo_stack
+            )
+            self.reset_gpx_workshop_history(current)
+            if had_history:
+                self.log(
+                    "🛡️ Historique Cartographie réinitialisé après changement de bisse."
+                )
+            return False
+        return True
+
+    def gpx_history_snapshot_matches_current(self, snapshot):
+        if not isinstance(snapshot, dict):
+            return False
+        return snapshot.get("_bisse_context") == self.gpx_workshop_context_key()
+
     def get_gpx_workshop_state(self):
         if not isinstance(self.catalog_container, dict):
             self.read_catalog_container()
@@ -17374,9 +17420,11 @@ namespace GestionBissesFolderPicker
         return labels
 
     def snapshot_gpx_segments(self, reason="", include_sources=False):
+        self.ensure_gpx_workshop_history_context()
         workshop = self.get_gpx_workshop_state()
         snapshot = {
             "reason": reason,
+            "_bisse_context": self.gpx_workshop_context_key(),
             "segments": copy.deepcopy(workshop.get("segments", []))
         }
         # Les sources GPX peuvent être très volumineuses. Elles ne sont copiées
@@ -17396,8 +17444,16 @@ namespace GestionBissesFolderPicker
                 "Utilisez ↶ dans la barre de correction, ou quittez ce mode."
             )
             return
+        self.ensure_gpx_workshop_history_context()
         if not self.gpx_workshop_undo_stack:
             self.gpx_workshop_status_var.set("Aucune action de segment à annuler.")
+            return
+
+        previous = self.gpx_workshop_undo_stack[-1]
+        if not self.gpx_history_snapshot_matches_current(previous):
+            self.reset_gpx_workshop_history()
+            self.gpx_workshop_status_var.set("Aucune action de segment à annuler.")
+            self.log("🛡️ Historique Cartographie étranger ignoré.")
             return
 
         workshop = self.get_gpx_workshop_state()
@@ -17405,6 +17461,7 @@ namespace GestionBissesFolderPicker
         previous = self.gpx_workshop_undo_stack.pop()
         future = {
             "reason": previous.get("reason", ""),
+            "_bisse_context": self.gpx_workshop_context_key(),
             "segments": current_segments
         }
         if "sources" in previous:
@@ -17427,8 +17484,16 @@ namespace GestionBissesFolderPicker
                 "Terminez ou quittez la correction avant de rétablir une action de segment."
             )
             return
+        self.ensure_gpx_workshop_history_context()
         if not self.gpx_workshop_redo_stack:
             self.gpx_workshop_status_var.set("Aucune action de segment à rétablir.")
+            return
+
+        future = self.gpx_workshop_redo_stack[-1]
+        if not self.gpx_history_snapshot_matches_current(future):
+            self.reset_gpx_workshop_history()
+            self.gpx_workshop_status_var.set("Aucune action de segment à rétablir.")
+            self.log("🛡️ Historique Cartographie étranger ignoré.")
             return
 
         workshop = self.get_gpx_workshop_state()
@@ -17436,6 +17501,7 @@ namespace GestionBissesFolderPicker
         future = self.gpx_workshop_redo_stack.pop()
         previous = {
             "reason": future.get("reason", ""),
+            "_bisse_context": self.gpx_workshop_context_key(),
             "segments": current_segments
         }
         if "sources" in future:
@@ -17480,6 +17546,7 @@ namespace GestionBissesFolderPicker
     def show_gpx_workshop(self):
         try:
             self.ensure_catalog_file_exists()
+            self.ensure_gpx_workshop_history_context()
             self.get_gpx_workshop_state()
             self.gpx_workshop_photos = self.load_geolocated_photos()
         except Exception as e:
