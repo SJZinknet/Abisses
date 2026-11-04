@@ -55,7 +55,7 @@ BISSES_RENDER_README = "# Bisses\n\nPlateforme statique GitHub Pages pour l’in
 class BisseManagerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Abisses - v70")
+        self.root.title("Abisses - v71")
         self.configure_application_icon()
         self.configure_main_window_geometry()
 
@@ -71,7 +71,7 @@ class BisseManagerApp:
         self.app_data_folder = self.resolve_app_data_folder_at_startup()
         os.makedirs(self.app_data_folder, exist_ok=True)
 
-        # v70 — coordination multi-poste. Les verrous de bisse sont de petits
+        # v71 — coordination multi-poste. Les verrous de bisse sont de petits
         # fichiers dans Gestion_Bisses_Data/locks/. Ils ne modifient jamais
         # catalogue.json et permettent à plusieurs postes de travailler en
         # parallèle, tant qu'ils ne modifient pas le même bisse.
@@ -80,8 +80,9 @@ class BisseManagerApp:
         self.multiuser_user = os.environ.get("USERNAME") or os.environ.get("USER") or "Utilisateur"
         self.active_bisse_lock = None
         self.bisse_lock_heartbeat_after_id = None
-        self.bisse_lock_heartbeat_ms = 15000
+        self.bisse_lock_heartbeat_ms = 5000
         self.bisse_lock_stale_seconds = 300
+        self.bisse_handover_wait_seconds = 12
         self.read_only_mode = False
         self.read_only_lock_info = None
 
@@ -1286,20 +1287,23 @@ class BisseManagerApp:
                 )
             else:
                 folder = os.path.abspath(os.path.expanduser(configured))
-                if os.path.isdir(folder):
-                    return folder
-
-                settings["previous_app_data_folder"] = configured
-                settings.pop("app_data_folder", None)
-                self.write_local_settings(settings)
-                messagebox.showwarning(
-                    "Dossier de données introuvable",
-                    "Le dossier de données enregistré n'est actuellement pas "
-                    "accessible :\n\n"
-                    f"{configured}\n\n"
-                    "Il n'a pas été recréé automatiquement. Vous pouvez choisir "
-                    "le dossier existant, notamment sur le NAS, ou en créer un nouveau."
-                )
+                while not os.path.isdir(folder):
+                    retry = messagebox.askretrycancel(
+                        "Données communes indisponibles",
+                        "Le dossier Gestion_Bisses_Data configuré n'est pas accessible :\n\n"
+                        f"{configured}\n\n"
+                        "Abisses ne va pas utiliser ni créer un autre dossier de données, "
+                        "afin d'éviter de séparer les informations entre les postes.\n\n"
+                        "Vérifiez que le NAS est accessible puis choisissez « Réessayer ».\n"
+                        "« Annuler » ferme Abisses."
+                    )
+                    if not retry:
+                        try:
+                            self.root.destroy()
+                        except Exception:
+                            pass
+                        raise SystemExit(0)
+                return folder
 
         folder = self.prompt_app_data_folder_at_startup()
         folder = os.path.abspath(os.path.expanduser(folder))
@@ -1402,7 +1406,7 @@ class BisseManagerApp:
 
 
     # ============================================================
-    # V70 — COORDINATION MULTI-POSTE / VERROUS NAS
+    # V71 — COORDINATION MULTI-POSTE / VERROUS NAS
     # ============================================================
 
     def get_bisse_locks_root(self):
@@ -1445,6 +1449,270 @@ class BisseManagerApp:
     def bisse_lock_path(self, lock_key):
         return os.path.join(self.get_bisse_locks_root(), f"{self.slugify(lock_key or 'bisse')}.lock")
 
+    def bisse_access_guard_name(self, lock_key):
+        return f"bisse_access_{self.slugify(lock_key or 'bisse')}"
+
+    def bisse_handover_request_path(self, lock_key):
+        return os.path.join(
+            self.get_bisse_locks_root(),
+            f"{self.slugify(lock_key or 'bisse')}.takeover.json",
+        )
+
+    def read_bisse_handover_request(self, lock_key):
+        path = self.bisse_handover_request_path(lock_key)
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            if not isinstance(data, dict):
+                data = {}
+        except Exception:
+            data = {}
+        data["_path"] = path
+        return data
+
+    def clear_bisse_handover_request(self, lock_key, requester_session_id=""):
+        path = self.bisse_handover_request_path(lock_key)
+        try:
+            if requester_session_id:
+                current = self.read_bisse_handover_request(lock_key)
+                if current.get("requester_session_id") not in ("", requester_session_id):
+                    return
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+
+    def create_bisse_handover_request(self, folder, lock_key, owner_info):
+        """Dépose une demande de transfert sans retirer le verrou du propriétaire."""
+        guard = self.short_data_lock_acquire(self.bisse_access_guard_name(lock_key))
+        try:
+            current = self.read_bisse_lock_file(lock_key)
+            owner_session = (owner_info or {}).get("session_id")
+            if not owner_session or current.get("session_id") != owner_session:
+                return "changed", current
+            payload = {
+                "schema_version": "1.0",
+                "lock_key": lock_key,
+                "folder": os.path.abspath(folder),
+                "target_session_id": owner_session,
+                "target_host": current.get("host") or (owner_info or {}).get("host") or "",
+                "requester_session_id": self.multiuser_session_id,
+                "requester_host": self.multiuser_host,
+                "requester_user": self.multiuser_user,
+                "requested_at": datetime.now().isoformat(timespec="seconds"),
+                "status": "pending",
+            }
+            self._write_json_atomic_v65(
+                self.bisse_handover_request_path(lock_key), payload, indent=2
+            )
+            return "requested", payload
+        finally:
+            self.short_data_lock_release(guard)
+
+    def set_read_only_after_lock_loss(self, lock_info=None, notify=False, reason=""):
+        """Bascule immédiatement l'interface en lecture seule après perte du verrou."""
+        self.active_bisse_lock = None
+        self.cancel_bisse_lock_heartbeat()
+        self.read_only_mode = True
+        self.read_only_lock_info = lock_info or {"host": "un autre poste"}
+        try:
+            self.show_contextual_interface(
+                has_raw=self.folder_has_images(self.photos_folder),
+                has_export=os.path.exists(self.export_folder) and self.folder_has_images(self.export_folder),
+                has_cat=os.path.exists(self.catalog_path),
+                is_geo=any(
+                    str(e.get("gps_sync", "")).startswith("OK")
+                    for e in self.catalog_data if isinstance(e, dict)
+                ),
+            )
+        except Exception:
+            pass
+        if notify:
+            owner = self.read_only_lock_info or {}
+            host = owner.get("host") or "un autre poste"
+            text = reason or (
+                f"Le verrou de ce bisse appartient maintenant à {host}.\n\n"
+                "Ce poste passe en lecture seule afin d'éviter toute écriture concurrente."
+            )
+            try:
+                messagebox.showinfo("Bisse en lecture seule", text)
+            except Exception:
+                pass
+
+    def process_bisse_handover_request(self):
+        """Le propriétaire sauvegarde puis cède volontairement un verrou demandé."""
+        info = self.active_bisse_lock
+        if not isinstance(info, dict) or info.get("session_id") != self.multiuser_session_id:
+            return False
+        lock_key = info.get("lock_key")
+        if not lock_key:
+            return False
+        request = self.read_bisse_handover_request(lock_key)
+        if (
+            request.get("status") != "pending"
+            or request.get("target_session_id") != self.multiuser_session_id
+            or not request.get("requester_session_id")
+        ):
+            return False
+
+        try:
+            self.save_catalog()
+        except Exception as exc:
+            request["status"] = "save_error"
+            request["error"] = str(exc)
+            request["responded_at"] = datetime.now().isoformat(timespec="seconds")
+            try:
+                self._write_json_atomic_v65(
+                    self.bisse_handover_request_path(lock_key), request, indent=2
+                )
+            except Exception:
+                pass
+            return False
+
+        request["status"] = "saved"
+        request["responded_at"] = datetime.now().isoformat(timespec="seconds")
+        try:
+            self._write_json_atomic_v65(
+                self.bisse_handover_request_path(lock_key), request, indent=2
+            )
+        except Exception:
+            pass
+
+        requester_info = {
+            "host": request.get("requester_host") or "un autre poste",
+            "user": request.get("requester_user") or "",
+            "lock_key": lock_key,
+        }
+        self.release_active_bisse_lock(info)
+        request["status"] = "released"
+        request["released_at"] = datetime.now().isoformat(timespec="seconds")
+        try:
+            self._write_json_atomic_v65(
+                self.bisse_handover_request_path(lock_key), request, indent=2
+            )
+        except Exception:
+            pass
+        self.set_read_only_after_lock_loss(
+            requester_info,
+            notify=True,
+            reason=(
+                "Une autre personne a demandé à reprendre la modification de ce bisse.\n\n"
+                "Les données ont été enregistrées automatiquement sur ce poste avant de libérer le verrou. "
+                "Ce poste est maintenant en lecture seule."
+            ),
+        )
+        return True
+
+    def wait_for_bisse_handover(self, folder, lock_key, owner_info):
+        """Attend une cession coopérative tout en gardant Tk réactif."""
+        status, payload = self.create_bisse_handover_request(folder, lock_key, owner_info)
+        if status != "requested":
+            return status, payload
+
+        result = {"status": "waiting", "info": payload}
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Reprise de la modification")
+        dialog.geometry("600x235")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        frame = tk.Frame(dialog, padx=20, pady=18)
+        frame.pack(fill="both", expand=True)
+        tk.Label(
+            frame,
+            text="Transfert du verrou",
+            font=("Arial", 15, "bold"),
+            anchor="w",
+        ).pack(fill="x", pady=(0, 12))
+        host = (owner_info or {}).get("host") or "l'autre poste"
+        tk.Label(
+            frame,
+            text=(
+                f"Abisses demande à {host} d'enregistrer automatiquement le bisse puis de libérer la modification.\n\n"
+                "Si ce poste est actif, le transfert se fera automatiquement. "
+                "S'il est en veille ou arrêté, Abisses vous le signalera."
+            ),
+            justify="left",
+            anchor="w",
+            wraplength=550,
+        ).pack(fill="x")
+        status_var = tk.StringVar(value="Demande envoyée…")
+        tk.Label(frame, textvariable=status_var, fg="#555555", anchor="w").pack(fill="x", pady=(16, 0))
+
+        deadline = time.monotonic() + float(self.bisse_handover_wait_seconds)
+
+        def finish(value, info=None):
+            if result["status"] != "waiting":
+                return
+            result["status"] = value
+            result["info"] = info or {}
+            try:
+                dialog.grab_release()
+            except Exception:
+                pass
+            try:
+                dialog.destroy()
+            except Exception:
+                pass
+
+        def poll():
+            if result["status"] != "waiting":
+                return
+            request = self.read_bisse_handover_request(lock_key)
+            if request.get("requester_session_id") == self.multiuser_session_id:
+                if request.get("status") == "save_error":
+                    finish("save_error", request)
+                    return
+            current = self.read_bisse_lock_file(lock_key)
+            expected_session = (owner_info or {}).get("session_id")
+            if not current.get("session_id") or current.get("session_id") != expected_session:
+                status2, info2 = self.try_create_bisse_lock(folder, lock_key)
+                if status2 in ("acquired", "owned"):
+                    self.clear_bisse_handover_request(lock_key, self.multiuser_session_id)
+                    finish("acquired", info2)
+                    return
+                if status2 == "busy":
+                    finish("busy", info2)
+                    return
+            if time.monotonic() >= deadline:
+                self.clear_bisse_handover_request(lock_key, self.multiuser_session_id)
+                finish("no_response", current or owner_info)
+                return
+            try:
+                dialog.after(250, poll)
+            except Exception:
+                finish("no_response", current or owner_info)
+
+        dialog.protocol(
+            "WM_DELETE_WINDOW",
+            lambda: (
+                self.clear_bisse_handover_request(lock_key, self.multiuser_session_id),
+                finish("cancel", owner_info),
+            ),
+        )
+        dialog.after(100, poll)
+        dialog.wait_window()
+        return result["status"], result["info"]
+
+    def show_force_takeover_dialog(self, title, lock_info):
+        host = (lock_info or {}).get("host") or "l'autre poste"
+        return messagebox.askyesnocancel(
+            "L'autre poste ne répond pas",
+            (
+                f"{host} n'a pas répondu à la demande de transfert de « {title} ».\n\n"
+                "Il est probablement en veille, arrêté ou déconnecté. Les données déjà enregistrées "
+                "sur le NAS sont conservées.\n\n"
+                "Une reprise forcée empêchera l'ancien poste d'enregistrer lorsqu'il se réveillera. "
+                "En revanche, des modifications qui n'avaient jamais été enregistrées avant sa mise en veille "
+                "ne peuvent pas être récupérées.\n\n"
+                "Oui = forcer la reprise\n"
+                "Non = ouvrir en lecture seule\n"
+                "Annuler = ne pas ouvrir"
+            ),
+        )
+
     def read_bisse_lock_file(self, lock_key):
         path = self.bisse_lock_path(lock_key)
         try:
@@ -1485,7 +1753,7 @@ class BisseManagerApp:
             "pid": os.getpid(),
             "acquired_at": now,
             "heartbeat_at": now,
-            "app_version": "v70",
+            "app_version": "v71",
         }
 
     def try_create_bisse_lock(self, folder, lock_key=None):
@@ -1529,21 +1797,26 @@ class BisseManagerApp:
         return "acquired", record
 
     def take_over_stale_bisse_lock(self, folder, lock_key, expected_info):
-        path = self.bisse_lock_path(lock_key)
-        current = self.read_bisse_lock_file(lock_key)
-        # On ne retire que le verrou effectivement présenté à l'utilisateur.
-        expected_session = (expected_info or {}).get("session_id")
-        if expected_session and current.get("session_id") != expected_session:
-            return self.try_create_bisse_lock(folder, lock_key)
-        if current and not self.bisse_lock_is_stale(current):
-            return "busy", current
+        """Reprise forcée, sérialisée avec les sauvegardes et heartbeats du bisse."""
+        guard = self.short_data_lock_acquire(self.bisse_access_guard_name(lock_key))
         try:
-            os.remove(path)
-        except FileNotFoundError:
-            pass
-        except Exception as exc:
-            return "error", {"error": str(exc), "lock_key": lock_key, "_path": path}
-        return self.try_create_bisse_lock(folder, lock_key)
+            path = self.bisse_lock_path(lock_key)
+            current = self.read_bisse_lock_file(lock_key)
+            expected_session = (expected_info or {}).get("session_id")
+            if expected_session and current.get("session_id") != expected_session:
+                return self.try_create_bisse_lock(folder, lock_key)
+            if current and not self.bisse_lock_is_stale(current):
+                return "busy", current
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+            except Exception as exc:
+                return "error", {"error": str(exc), "lock_key": lock_key, "_path": path}
+            self.clear_bisse_handover_request(lock_key)
+            return self.try_create_bisse_lock(folder, lock_key)
+        finally:
+            self.short_data_lock_release(guard)
 
     def show_bisse_access_conflict_dialog(self, title, lock_info=None, stale=False, lock_error=""):
         """Popup exceptionnelle : uniquement lorsqu'un bisse n'est pas modifiable."""
@@ -1581,7 +1854,8 @@ class BisseManagerApp:
             if stale:
                 message += (
                     "\n\nCe verrou ne donne plus signe d'activité depuis plusieurs minutes. "
-                    "Si l'autre poste a été fermé ou a planté, vous pouvez reprendre la modification."
+                    "Vous pouvez demander la reprise : si l'autre poste est actif, Abisses lui demandera "
+                    "d'abord d'enregistrer automatiquement puis de libérer le bisse."
                 )
 
         tk.Label(frame, text=message, justify="left", anchor="w", wraplength=570).pack(fill="x")
@@ -1649,14 +1923,51 @@ class BisseManagerApp:
         choice = self.show_bisse_access_conflict_dialog(title, info, stale=stale)
         if choice == "readonly":
             return {"mode": "readonly", "lock": info, "lock_key": lock_key, "new_lock": False}
-        if choice == "takeover" and stale:
-            status2, info2 = self.take_over_stale_bisse_lock(folder, lock_key, info)
-            if status2 in ("acquired", "owned"):
-                return {"mode": "edit", "lock": info2, "lock_key": lock_key, "new_lock": status2 == "acquired"}
-            # Quelqu'un a pu reprendre le verrou entre-temps : retour propre en lecture seule.
-            choice2 = self.show_bisse_access_conflict_dialog(title, info2, stale=False)
+        if choice != "takeover" or not stale:
+            return None
+
+        # v71 : on tente toujours une cession coopérative avant toute reprise forcée.
+        status2, info2 = self.wait_for_bisse_handover(folder, lock_key, info)
+        if status2 == "acquired":
+            return {"mode": "edit", "lock": info2, "lock_key": lock_key, "new_lock": True}
+
+        if status2 == "save_error":
+            messagebox.showwarning(
+                "Reprise impossible",
+                "L'autre poste a reçu la demande, mais Abisses n'a pas pu enregistrer le bisse "
+                "avant de libérer le verrou.\n\nPar sécurité, la reprise automatique est annulée."
+            )
+            current2 = self.read_bisse_lock_file(lock_key)
+            choice2 = self.show_bisse_access_conflict_dialog(title, current2, stale=False)
             if choice2 == "readonly":
-                return {"mode": "readonly", "lock": info2, "lock_key": lock_key, "new_lock": False}
+                return {"mode": "readonly", "lock": current2, "lock_key": lock_key, "new_lock": False}
+            return None
+
+        if status2 == "no_response":
+            force = self.show_force_takeover_dialog(title, info2 or info)
+            if force is False:
+                return {"mode": "readonly", "lock": info2 or info, "lock_key": lock_key, "new_lock": False}
+            if force is None:
+                return None
+            status3, info3 = self.take_over_stale_bisse_lock(folder, lock_key, info2 or info)
+            if status3 in ("acquired", "owned"):
+                return {"mode": "edit", "lock": info3, "lock_key": lock_key, "new_lock": status3 == "acquired"}
+            # Le propriétaire a pu se réveiller pendant la confirmation.
+            current3 = info3 if isinstance(info3, dict) else self.read_bisse_lock_file(lock_key)
+            choice3 = self.show_bisse_access_conflict_dialog(title, current3, stale=False)
+            if choice3 == "readonly":
+                return {"mode": "readonly", "lock": current3, "lock_key": lock_key, "new_lock": False}
+            return None
+
+        if status2 in ("changed", "busy"):
+            current2 = info2 if isinstance(info2, dict) else self.read_bisse_lock_file(lock_key)
+            if not current2.get("session_id"):
+                status3, info3 = self.try_create_bisse_lock(folder, lock_key)
+                if status3 in ("acquired", "owned"):
+                    return {"mode": "edit", "lock": info3, "lock_key": lock_key, "new_lock": status3 == "acquired"}
+            choice2 = self.show_bisse_access_conflict_dialog(title, current2, stale=False)
+            if choice2 == "readonly":
+                return {"mode": "readonly", "lock": current2, "lock_key": lock_key, "new_lock": False}
         return None
 
     def cancel_bisse_lock_heartbeat(self):
@@ -1672,35 +1983,50 @@ class BisseManagerApp:
         info = self.active_bisse_lock
         if not isinstance(info, dict) or info.get("session_id") != self.multiuser_session_id:
             return
-        path = info.get("_path") or self.bisse_lock_path(info.get("lock_key"))
-        current = self.read_bisse_lock_file(info.get("lock_key"))
-        if current.get("session_id") != self.multiuser_session_id:
-            self.active_bisse_lock = None
-            self.read_only_mode = True
-            self.read_only_lock_info = current or {"host": "un autre poste"}
+
+        # Une demande de transfert est traitée avant de renouveler le verrou :
+        # sauvegarde locale + copie Data, puis libération volontaire.
+        if self.process_bisse_handover_request():
+            return
+
+        lock_key = info.get("lock_key")
+        path = info.get("_path") or self.bisse_lock_path(lock_key)
+        guard = None
+        try:
+            guard = self.short_data_lock_acquire(
+                self.bisse_access_guard_name(lock_key), timeout=2.0
+            )
+            current = self.read_bisse_lock_file(lock_key)
+            if current.get("session_id") != self.multiuser_session_id:
+                self.set_read_only_after_lock_loss(
+                    current or {"host": "un autre poste"},
+                    notify=True,
+                    reason=(
+                        "Ce bisse a été repris sur un autre poste.\n\n"
+                        "Par sécurité, ce poste passe immédiatement en lecture seule et ne peut plus enregistrer."
+                    ),
+                )
+                return
+            info["heartbeat_at"] = datetime.now().isoformat(timespec="seconds")
+            payload = {k: v for k, v in info.items() if not k.startswith("_")}
+            self._write_json_atomic_v65(path, payload, indent=2)
+        except TimeoutError:
+            # Une sauvegarde ou une reprise est momentanément en cours ; on réessaie au prochain cycle.
+            pass
+        except Exception as exc:
+            self.log(f"⚠️ Renouvellement du verrou impossible : {exc}")
+        finally:
+            if guard:
+                self.short_data_lock_release(guard)
+
+        if self.active_bisse_lock is not None and not self.read_only_mode:
             try:
-                self.show_contextual_interface(
-                    has_raw=self.folder_has_images(self.photos_folder),
-                    has_export=os.path.exists(self.export_folder) and self.folder_has_images(self.export_folder),
-                    has_cat=os.path.exists(self.catalog_path),
-                    is_geo=any(str(e.get("gps_sync", "")).startswith("OK") for e in self.catalog_data if isinstance(e, dict)),
+                self.bisse_lock_heartbeat_after_id = self.root.after(
+                    self.bisse_lock_heartbeat_ms,
+                    self.refresh_active_bisse_lock_heartbeat,
                 )
             except Exception:
                 pass
-            return
-        info["heartbeat_at"] = datetime.now().isoformat(timespec="seconds")
-        payload = {k: v for k, v in info.items() if not k.startswith("_")}
-        try:
-            self._write_json_atomic_v65(path, payload, indent=2)
-        except Exception as exc:
-            self.log(f"⚠️ Renouvellement du verrou impossible : {exc}")
-        try:
-            self.bisse_lock_heartbeat_after_id = self.root.after(
-                self.bisse_lock_heartbeat_ms,
-                self.refresh_active_bisse_lock_heartbeat,
-            )
-        except Exception:
-            pass
 
     def activate_bisse_access(self, folder, access):
         """Bascule le verrou seulement une fois l'ouverture du nouveau bisse réussie."""
@@ -1727,7 +2053,12 @@ class BisseManagerApp:
             return
         lock_key = info.get("lock_key")
         path = info.get("_path") or (self.bisse_lock_path(lock_key) if lock_key else "")
+        guard = None
         try:
+            if lock_key:
+                guard = self.short_data_lock_acquire(
+                    self.bisse_access_guard_name(lock_key), timeout=2.0
+                )
             current = self.read_bisse_lock_file(lock_key) if lock_key else {}
             if current.get("session_id") == self.multiuser_session_id and path:
                 os.remove(path)
@@ -1735,6 +2066,9 @@ class BisseManagerApp:
             pass
         except Exception as exc:
             self.log(f"⚠️ Libération du verrou impossible : {exc}")
+        finally:
+            if guard:
+                self.short_data_lock_release(guard)
         if lock_info is None or info is self.active_bisse_lock or (
             self.active_bisse_lock and self.active_bisse_lock.get("lock_key") == lock_key
         ):
@@ -3889,10 +4223,9 @@ class BisseManagerApp:
         tk.Label(
             info_tab,
             text=(
-                "Recommandation : garder GitHub pour le code seulement, et utiliser "
-                "un Gestion_Bisses_Data local stable, par exemple l'ancien dossier "
-                "qui contient déjà vos projets et catégories. Le dossier actuel n'est "
-                "jamais supprimé lors d'un changement."
+                "Recommandation : garder GitHub pour le code seulement. Dans une installation "
+                "multi-poste, utiliser le même Gestion_Bisses_Data commun sur le NAS pour tous "
+                "les postes. Le dossier actuel n'est jamais supprimé lors d'un changement volontaire."
             ),
             justify="left",
             anchor="w",
@@ -3903,8 +4236,8 @@ class BisseManagerApp:
         tk.Label(
             info_tab,
             text=(
-                "Les futurs paramètres NAS / mode réseau direct / mode local synchronisé "
-                "seront ajoutés dans cette section."
+                "Le verrouillage multi-poste protège les bisses lorsque ce dossier commun "
+                "est partagé entre plusieurs ordinateurs."
             ),
             justify="left",
             anchor="w",
@@ -6822,7 +7155,46 @@ class BisseManagerApp:
         self.catalog_container = raw
         return raw
 
-    def save_catalog(self):
+    def acquire_active_bisse_write_guard_v71(self):
+        """Vérifie la propriété du verrou juste avant une écriture du bisse actif."""
+        if getattr(self, "read_only_mode", False):
+            raise RuntimeError("Ce bisse est ouvert en lecture seule.")
+
+        info = self.active_bisse_lock
+        if not isinstance(info, dict) or info.get("session_id") != self.multiuser_session_id:
+            return None
+        if not self.base_folder:
+            return None
+
+        current_key = self.bisse_lock_key_for_folder(self.base_folder)
+        if info.get("lock_key") != current_key:
+            # Certaines opérations administratives créent temporairement un catalogue
+            # hors du bisse interactif ; elles ne doivent pas emprunter son verrou.
+            return None
+
+        guard = self.short_data_lock_acquire(
+            self.bisse_access_guard_name(current_key), timeout=8.0
+        )
+        current = self.read_bisse_lock_file(current_key)
+        if current.get("session_id") != self.multiuser_session_id:
+            self.short_data_lock_release(guard)
+            self.set_read_only_after_lock_loss(
+                current or {"host": "un autre poste"},
+                notify=True,
+                reason=(
+                    "Ce bisse n'est plus verrouillé par ce poste.\n\n"
+                    "La sauvegarde a été bloquée avant toute écriture et Abisses passe en lecture seule."
+                ),
+            )
+            raise RuntimeError("Verrou de modification perdu : sauvegarde bloquée.")
+        now = datetime.now().isoformat(timespec="seconds")
+        current["heartbeat_at"] = now
+        info["heartbeat_at"] = now
+        payload = {k: v for k, v in current.items() if not k.startswith("_")}
+        self._write_json_atomic_v65(self.bisse_lock_path(current_key), payload, indent=2)
+        return guard
+
+    def _save_catalog_payload_v71(self):
         if getattr(self, "read_only_mode", False):
             self.log("⛔ Sauvegarde ignorée : bisse ouvert en lecture seule.")
             raise RuntimeError("Ce bisse est ouvert en lecture seule.")
@@ -6875,6 +7247,14 @@ class BisseManagerApp:
             self.write_portable_data_copy_for_active_project()
         except Exception as exc:
             self.log(f"⚠️ Copie Data portable impossible : {exc}")
+
+    def save_catalog(self):
+        guard = self.acquire_active_bisse_write_guard_v71()
+        try:
+            return self._save_catalog_payload_v71()
+        finally:
+            if guard:
+                self.short_data_lock_release(guard)
 
     def read_catalog(self):
         container = self.read_catalog_container()
@@ -11836,7 +12216,14 @@ namespace GestionBissesFolderPicker
         generation = self._folder_open_generation
 
         def worker(report):
-            return self.prepare_folder_opening_context(folder, report=report, read_only=read_only)
+            lock_info = access.get("lock") if isinstance(access, dict) else {}
+            return self.prepare_folder_opening_context(
+                folder,
+                report=report,
+                read_only=read_only,
+                lock_key=access.get("lock_key") if isinstance(access, dict) else "",
+                lock_session_id=(lock_info or {}).get("session_id", ""),
+            )
 
         def on_success(result, token):
             if generation != self._folder_open_generation:
@@ -14408,7 +14795,9 @@ namespace GestionBissesFolderPicker
         return source_files, work
 
 
-    def prepare_folder_opening_context(self, folder, report=None, read_only=False):
+    def prepare_folder_opening_context(
+        self, folder, report=None, read_only=False, lock_key="", lock_session_id=""
+    ):
         """Prépare un dossier hors état actif ; en lecture seule, aucune écriture n'est effectuée."""
         folder = os.path.abspath(os.path.expanduser(folder))
         if not os.path.isdir(folder):
@@ -14473,7 +14862,28 @@ namespace GestionBissesFolderPicker
             log_callback=None,
         )
         if changed or not os.path.exists(catalog_path):
-            self._write_json_atomic_v65(catalog_path, prepared, indent=4)
+            guard = None
+            try:
+                if lock_key and lock_session_id:
+                    guard = self.short_data_lock_acquire(
+                        self.bisse_access_guard_name(lock_key), timeout=8.0
+                    )
+                    current_lock = self.read_bisse_lock_file(lock_key)
+                    if current_lock.get("session_id") != lock_session_id:
+                        raise RuntimeError(
+                            "Le verrou du bisse a changé pendant son ouverture ; aucune donnée n'a été écrite."
+                        )
+                    current_lock["heartbeat_at"] = datetime.now().isoformat(timespec="seconds")
+                    payload = {
+                        k: v for k, v in current_lock.items() if not k.startswith("_")
+                    }
+                    self._write_json_atomic_v65(
+                        self.bisse_lock_path(lock_key), payload, indent=2
+                    )
+                self._write_json_atomic_v65(catalog_path, prepared, indent=4)
+            finally:
+                if guard:
+                    self.short_data_lock_release(guard)
 
         return {
             "base_folder": folder,
