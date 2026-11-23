@@ -16,6 +16,7 @@ import threading
 import time
 import csv
 import heapq
+import hashlib
 import webbrowser
 import http.server
 import tkinter as tk
@@ -24,6 +25,7 @@ from PIL import Image, ImageTk, ImageOps, ImageDraw, ImageFont
 import pillow_heif
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
+from pathlib import Path
 import gpxpy
 import tkintermapview
 import piexif
@@ -41,6 +43,8 @@ pillow_heif.register_heif_opener()
 
 APP_VERSION = get_current_version()
 
+# v73 — moteur EXIF transactionnel commun : texte + GPS, GPS invalide assaini, catalogue prioritaire.
+
 
 # v65 — moteur de rendu local utilisé uniquement dans le dossier temporaire de prévisualisation.
 BISSES_RENDER_INDEX_HTML = '<!doctype html>\n<html lang="fr">\n<head>\n  <meta charset="utf-8">\n  <meta name="viewport" content="width=device-width, initial-scale=1">\n  <title>Bisses du Valais</title>\n  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css">\n  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet.markercluster@1.5.3/dist/MarkerCluster.css">\n  <link rel="stylesheet" href="assets/css/styles.css">\n</head>\n\n<body>\n  <div id="app-shell">\n    <main id="map-region" aria-label="Carte des bisses du Valais">\n      <div id="map"></div>\n\n      <header class="topbar">\n        <div class="brand">\n          <div class="eyebrow">Inventaire cartographique</div>\n          <h1>Bisses du Valais</h1>\n          <div class="build-version">bisses-ui-clusters-2026-08-11-v6.3</div>\n        </div>\n\n        <div class="toolbar">\n          <button id="btn-valais" type="button">Vue Valais</button>\n          <button id="btn-list" type="button">Liste</button>\n          <button id="btn-basemap" type="button">Satellite</button>\n        </div>\n      </header>\n\n      <div id="legend" class="legend"></div>\n      <div id="scale-pill" class="scale-pill">Fond carte</div>\n      <div id="status-pill" class="status-pill">Chargement…</div>\n    </main>\n\n    <aside id="side-panel" class="side-panel" aria-label="Informations">\n      <button id="btn-close-panel" class="close-button" type="button" aria-label="Fermer">×</button>\n      <div class="panel-kicker" id="panel-kicker">Fiche bisse</div>\n      <h2 id="panel-title">Bisses du Valais</h2>\n      <div id="panel-content">\n        <p class="muted">Sélectionnez un bisse pour afficher sa fiche.</p>\n      </div>\n    </aside>\n  </div>\n\n  <script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js"></script>\n  <script src="https://cdn.jsdelivr.net/npm/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>\n  <script src="https://cdn.jsdelivr.net/npm/leaflet-tilelayer-swiss@2.4.0/dist/Leaflet.TileLayer.Swiss.umd.js"></script>\n  <script src="https://cdn.jsdelivr.net/npm/leaflet-polylineoffset@1.1.1/leaflet.polylineoffset.js"></script>\n  <script src="assets/js/app.js"></script>\n</body>\n</html>\n'
@@ -55,7 +59,7 @@ BISSES_RENDER_README = "# Bisses\n\nPlateforme statique GitHub Pages pour l’in
 class BisseManagerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Abisses - v71")
+        self.root.title("Abisses - v73")
         self.configure_application_icon()
         self.configure_main_window_geometry()
 
@@ -161,6 +165,12 @@ class BisseManagerApp:
         self.map_widget = None
         self.map_markers = []
         self.geolocated_photos = []
+        # v72 : corpus complet de l'atelier Photos. geolocated_photos devient
+        # seulement la vue filtrée utilisée par la carte et la navigation.
+        self.photo_all_geolocated_photos = []
+        self.photo_filter_mode = "all"
+        self.photo_filter_button = None
+        self.photo_cleanup_button = None
         self.current_photo = None
 
         # Atelier Photos : les trois panneaux restent indépendants et peuvent
@@ -1753,7 +1763,7 @@ class BisseManagerApp:
             "pid": os.getpid(),
             "acquired_at": now,
             "heartbeat_at": now,
-            "app_version": "v71",
+            "app_version": "v73",
         }
 
     def try_create_bisse_lock(self, folder, lock_key=None):
@@ -15052,10 +15062,23 @@ namespace GestionBissesFolderPicker
                     if text_meta.get("ok"):
                         meta_title = (text_meta.get("title") or "").strip()
                         meta_description = (text_meta.get("description") or "").strip()
-                        if not (entry.get("title") or "").strip() and meta_title:
+                        title_managed = bool(entry.get("title_managed_by_abisses", False))
+                        description_managed = bool(
+                            entry.get("description_managed_by_abisses", False)
+                            or entry.get("ignore_jpg_description", False)
+                        )
+                        if (
+                            not title_managed
+                            and not (entry.get("title") or "").strip()
+                            and meta_title
+                        ):
                             entry["title"] = text_meta.get("title", "")
                             metadata_changed = True
-                        if not (entry.get("description") or "").strip() and meta_description:
+                        if (
+                            not description_managed
+                            and not (entry.get("description") or "").strip()
+                            and meta_description
+                        ):
                             entry["description"] = text_meta.get("description", "")
                             metadata_changed = True
 
@@ -23922,22 +23945,30 @@ namespace GestionBissesFolderPicker
     # ============================================================
 
     def rational_to_float(self, value):
+        """Convertit un rationnel EXIF, ou renvoie None s'il est invalide.
+
+        v73 : un dénominateur nul (0/0 notamment) est une métadonnée invalide,
+        pas la valeur 0. Cette distinction évite d'importer un faux GPS (0, 0).
+        """
         try:
             if isinstance(value, tuple) and len(value) == 2:
                 num, den = value
                 if den == 0:
-                    return 0.0
+                    return None
                 return float(num) / float(den)
 
             if hasattr(value, "numerator") and hasattr(value, "denominator"):
                 if value.denominator == 0:
-                    return 0.0
+                    return None
                 return float(value.numerator) / float(value.denominator)
 
-            return float(value)
+            number = float(value)
+            if not math.isfinite(number):
+                return None
+            return number
 
         except Exception:
-            return 0.0
+            return None
 
     def gps_dms_to_decimal(self, dms, ref):
         if not dms or len(dms) != 3:
@@ -23946,17 +23977,25 @@ namespace GestionBissesFolderPicker
         deg = self.rational_to_float(dms[0])
         minutes = self.rational_to_float(dms[1])
         seconds = self.rational_to_float(dms[2])
-
-        decimal = deg + (minutes / 60.0) + (seconds / 3600.0)
+        if deg is None or minutes is None or seconds is None:
+            return None
 
         if isinstance(ref, bytes):
             ref = ref.decode("ascii", errors="ignore")
 
-        ref = str(ref).upper().strip()
+        ref = str(ref).upper().strip().strip("\x00")
+        if ref not in ("N", "S", "E", "W"):
+            return None
 
+        if not (0 <= minutes < 60 and 0 <= seconds < 60.0001):
+            return None
+
+        decimal = deg + (minutes / 60.0) + (seconds / 3600.0)
         if ref in ("S", "W"):
             decimal = -decimal
 
+        if not math.isfinite(decimal):
+            return None
         return decimal
 
     def read_gps_metadata_from_jpg(self, image_path):
@@ -23986,7 +24025,6 @@ namespace GestionBissesFolderPicker
 
             lat_tuple = gps.get(piexif.GPSIFD.GPSLatitude)
             lat_ref = gps.get(piexif.GPSIFD.GPSLatitudeRef)
-
             lon_tuple = gps.get(piexif.GPSIFD.GPSLongitude)
             lon_ref = gps.get(piexif.GPSIFD.GPSLongitudeRef)
 
@@ -23998,7 +24036,10 @@ namespace GestionBissesFolderPicker
             lon = self.gps_dms_to_decimal(lon_tuple, lon_ref)
 
             if lat is None or lon is None:
-                result["error"] = "Coordonnées GPS illisibles"
+                result["error"] = "Coordonnées GPS EXIF invalides"
+                return result
+            if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+                result["error"] = "Coordonnées GPS hors limites"
                 return result
 
             ele = None
@@ -24006,15 +24047,18 @@ namespace GestionBissesFolderPicker
             alt_ref = gps.get(piexif.GPSIFD.GPSAltitudeRef, 0)
 
             if alt_value is not None:
-                ele = self.rational_to_float(alt_value)
-
-                if isinstance(alt_ref, bytes):
-                    alt_ref_value = alt_ref[0] if alt_ref else 0
-                else:
-                    alt_ref_value = int(alt_ref)
-
-                if alt_ref_value == 1:
-                    ele = -ele
+                ele_value = self.rational_to_float(alt_value)
+                if ele_value is not None:
+                    ele = ele_value
+                    if isinstance(alt_ref, bytes):
+                        alt_ref_value = alt_ref[0] if alt_ref else 0
+                    else:
+                        try:
+                            alt_ref_value = int(alt_ref)
+                        except Exception:
+                            alt_ref_value = 0
+                    if alt_ref_value == 1:
+                        ele = -ele
 
             result["ok"] = True
             result["lat"] = lat
@@ -24177,71 +24221,21 @@ namespace GestionBissesFolderPicker
             return None
 
     def write_gps_metadata_to_jpg(self, image_path, lat, lon, ele=None, gps_datetime=None):
-        """
-        Écrit les coordonnées GPS dans les métadonnées EXIF d'un JPG/JPEG.
-
-        Ne s'applique volontairement pas aux HEIC/HEIF : le logiciel écrit dans
-        les JPG utilisés pour le travail, soit les JPG originaux, soit les JPG
-        convertis dans Export_JPG.
-        """
-        if not image_path or not os.path.exists(image_path):
-            return {"ok": False, "error": "Image introuvable"}
-
-        if not image_path.lower().endswith((".jpg", ".jpeg")):
-            return {"ok": False, "error": "Le fichier n'est pas un JPG/JPEG"}
-
+        """Écrit un bloc GPS propre avec le moteur EXIF commun v73."""
         if lat is None or lon is None:
             return {"ok": False, "error": "Coordonnées manquantes"}
-
         try:
-            lat = float(lat)
-            lon = float(lon)
+            gps_coords = {"lat": float(lat), "lon": float(lon), "ele": ele}
+        except Exception as exc:
+            return {"ok": False, "error": f"Coordonnées invalides : {exc}"}
 
-            if not (-90 <= lat <= 90 and -180 <= lon <= 180):
-                return {"ok": False, "error": "Coordonnées hors limites"}
-
-            try:
-                exif_dict = piexif.load(image_path)
-            except Exception:
-                exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
-
-            gps_ifd = exif_dict.setdefault("GPS", {})
-
-            gps_ifd[piexif.GPSIFD.GPSVersionID] = (2, 3, 0, 0)
-
-            gps_ifd[piexif.GPSIFD.GPSLatitudeRef] = b"N" if lat >= 0 else b"S"
-            gps_ifd[piexif.GPSIFD.GPSLatitude] = self.decimal_to_gps_dms_rational(lat)
-
-            gps_ifd[piexif.GPSIFD.GPSLongitudeRef] = b"E" if lon >= 0 else b"W"
-            gps_ifd[piexif.GPSIFD.GPSLongitude] = self.decimal_to_gps_dms_rational(lon)
-
-            if ele is not None:
-                try:
-                    ele_value = float(ele)
-                    gps_ifd[piexif.GPSIFD.GPSAltitudeRef] = 1 if ele_value < 0 else 0
-                    gps_ifd[piexif.GPSIFD.GPSAltitude] = self.float_to_rational(abs(ele_value), precision=100)
-                except Exception:
-                    pass
-
-            gps_ifd[piexif.GPSIFD.GPSMapDatum] = b"WGS-84"
-
-            dt_utc = self.parse_iso_datetime_to_utc(gps_datetime)
-
-            if dt_utc:
-                gps_ifd[piexif.GPSIFD.GPSDateStamp] = dt_utc.strftime("%Y:%m:%d").encode("ascii")
-                gps_ifd[piexif.GPSIFD.GPSTimeStamp] = (
-                    (dt_utc.hour, 1),
-                    (dt_utc.minute, 1),
-                    (dt_utc.second, 1)
-                )
-
-            exif_bytes = piexif.dump(exif_dict)
-            piexif.insert(exif_bytes, image_path)
-
-            return {"ok": True, "error": ""}
-
-        except Exception as e:
-            return {"ok": False, "error": str(e)}
+        ok, message = self.write_photo_metadata_to_jpg_v73(
+            image_path,
+            gps_coords=gps_coords,
+            gps_datetime=gps_datetime,
+            force_gps_write=True,
+        )
+        return {"ok": bool(ok), "error": "" if ok else message, "message": message}
 
     def write_catalog_gps_to_jpg_metadata(
         self,
@@ -24340,7 +24334,8 @@ namespace GestionBissesFolderPicker
                 written_count += 1
                 entry["gps_written_to_jpg_exif"] = True
                 entry["gps_written_to_jpg_exif_at"] = datetime.now().isoformat(timespec="seconds")
-                self.log(f"✅ GPS écrit dans EXIF : {filename}")
+                entry.pop("gps_written_to_jpg_exif_error", None)
+                self.log(f"✅ GPS écrit et validé dans EXIF : {filename}")
             else:
                 error_count += 1
                 entry["gps_written_to_jpg_exif"] = False
@@ -25322,12 +25317,24 @@ namespace GestionBissesFolderPicker
             catalog_description = entry.get("description", "") or ""
 
             jpg_title = jpg_meta.get("title", "") or ""
-            jpg_description = jpg_meta.get("description", "") or ""
+            raw_jpg_description = jpg_meta.get("description", "") or ""
+            title_managed = bool(entry.get("title_managed_by_abisses", False))
+            description_managed = bool(
+                entry.get("description_managed_by_abisses", False)
+                or entry.get("ignore_jpg_description", False)
+            )
+            ignore_jpg_description = bool(entry.get("ignore_jpg_description", False))
+            jpg_description = "" if description_managed else raw_jpg_description
 
-            display_title = jpg_title if jpg_title else catalog_title
-            display_description = jpg_description if jpg_description else catalog_description
+            title_from_catalog = title_managed or bool(str(catalog_title).strip())
+            description_from_catalog = description_managed or bool(str(catalog_description).strip())
+            display_title = catalog_title if title_from_catalog else jpg_title
+            display_description = catalog_description if description_from_catalog else jpg_description
 
-            metadata_source = "JPG" if (jpg_title or jpg_description) else "catalogue.json"
+            if title_from_catalog or description_from_catalog:
+                metadata_source = "catalogue.json"
+            else:
+                metadata_source = "JPG" if (jpg_title or jpg_description) else "catalogue.json"
 
             sort_datetime = self.get_capture_datetime_for_sort(image_path, entry)
 
@@ -25352,6 +25359,9 @@ namespace GestionBissesFolderPicker
                 "jpg_description": jpg_description,
                 "catalog_title": catalog_title,
                 "catalog_description": catalog_description,
+                "title_managed_by_abisses": title_managed,
+                "description_managed_by_abisses": description_managed,
+                "ignore_jpg_description": ignore_jpg_description,
                 "date_taken": entry.get("date_taken", ""),
                 "gps_source": entry.get("gps_source", ""),
                 "lat": float(lat),
@@ -25726,7 +25736,9 @@ namespace GestionBissesFolderPicker
             pass
 
     def _show_map_interface_ready(self, photos):
-        self.geolocated_photos = photos
+        self.photo_all_geolocated_photos = list(photos)
+        self.geolocated_photos = list(photos)
+        self.photo_filter_mode = "all"
         self.current_photo = None
         self.gpx_workshop_active = False
 
@@ -25857,6 +25869,15 @@ namespace GestionBissesFolderPicker
             width=4
         ).pack(side="left", padx=2)
 
+        self.photo_filter_button = tk.Menubutton(
+            nav_group,
+            text="Afficher : Toutes ▾",
+            relief="raised",
+            padx=7
+        )
+        self.photo_filter_button.pack(side="left", padx=(8, 2))
+        self.refresh_photo_filter_menu_v72()
+
         tk.Button(
             row_b,
             text="📍 Recentrer photo",
@@ -25874,6 +25895,18 @@ namespace GestionBissesFolderPicker
             text="ℹ️ Détails photo",
             command=self.show_current_photo_technical_details
         ).pack(side="left", padx=4)
+
+        # Placé sous « Panneaux » : outil occasionnel, visible sans alourdir
+        # la navigation quotidienne. Le filtre, lui, reste dans Navigation.
+        self.photo_cleanup_button = tk.Menubutton(
+            row_b,
+            text="🧹 Nettoyer ▾",
+            relief="raised",
+            padx=7,
+            state=("disabled" if getattr(self, "read_only_mode", False) else "normal")
+        )
+        self.photo_cleanup_button.pack(side="right", padx=(8, 0))
+        self.refresh_photo_cleanup_menu_v72()
 
         self.photo_workspace_paned = tk.PanedWindow(
             self.main_frame,
@@ -25926,6 +25959,1034 @@ namespace GestionBissesFolderPicker
 
         self.log(f"🗺️ Atelier Photos ouvert avec {len(photos)} photo(s).")
 
+
+    # ============================================================
+    # V72 — FILTRES DE L'ATELIER PHOTOS + NETTOYAGE DES DESCRIPTIONS
+    # ============================================================
+
+    def photo_filter_definitions_v72(self):
+        return (
+            ("all", "Toutes"),
+            ("title", "Avec titre"),
+            ("description", "Avec description"),
+            ("both", "Avec titre + description"),
+            ("platform", "Sélectionnées pour la plateforme"),
+        )
+
+    def photo_matches_filter_v72(self, photo, mode=None):
+        mode = mode or getattr(self, "photo_filter_mode", "all")
+        title = str((photo or {}).get("title") or "").strip()
+        description = str((photo or {}).get("description") or "").strip()
+        if mode == "title":
+            return bool(title)
+        if mode == "description":
+            return bool(description)
+        if mode == "both":
+            return bool(title and description)
+        if mode == "platform":
+            return bool((photo or {}).get("platform_selected", False))
+        return True
+
+    def photo_filter_label_v72(self, mode=None):
+        mode = mode or getattr(self, "photo_filter_mode", "all")
+        return dict(self.photo_filter_definitions_v72()).get(mode, "Toutes")
+
+    def photo_filter_count_v72(self, mode):
+        photos = list(getattr(self, "photo_all_geolocated_photos", []) or [])
+        return sum(1 for photo in photos if self.photo_matches_filter_v72(photo, mode))
+
+    def refresh_photo_filter_menu_v72(self):
+        button = getattr(self, "photo_filter_button", None)
+        if button is None:
+            return
+        menu = tk.Menu(button, tearoff=False)
+        current = getattr(self, "photo_filter_mode", "all")
+        for mode, label in self.photo_filter_definitions_v72():
+            count = self.photo_filter_count_v72(mode)
+            prefix = "✓ " if mode == current else ""
+            menu.add_command(
+                label=f"{prefix}{label} ({count})",
+                command=lambda chosen=mode: self.set_photo_filter_v72(chosen)
+            )
+        button.config(
+            menu=menu,
+            text=(
+                f"Afficher : {self.photo_filter_label_v72(current)} "
+                f"({self.photo_filter_count_v72(current)}) ▾"
+            )
+        )
+
+    def clear_photo_display_v72(self):
+        self.current_photo = None
+        self.photo_index_var.set("Photo 0 / 0")
+        self.photo_filename_var.set("")
+        self.photo_meta_var.set("")
+        self.photo_coords_var.set("")
+        self.viewer_info_var.set("")
+        self.viewer_zoom_var.set("Zoom : —")
+        try:
+            self.photo_technical_summary_var.set("")
+        except Exception:
+            pass
+        if self.photo_title_entry is not None:
+            self.photo_title_entry.delete(0, tk.END)
+        if self.photo_desc_text is not None:
+            self.photo_desc_text.delete("1.0", tk.END)
+        self.platform_selected_var.set(False)
+        self.platform_order_var.set(0)
+        if self.viewer_canvas is not None:
+            try:
+                self.viewer_canvas.delete("all")
+            except Exception:
+                pass
+        self.viewer_original_image = None
+        self.viewer_display_image = None
+        self.viewer_image_on_canvas = None
+
+    def apply_photo_filter_v72(self, preferred_catalog_index=None, center_map=False):
+        all_photos = list(getattr(self, "photo_all_geolocated_photos", []) or [])
+        filtered = [
+            photo for photo in all_photos
+            if self.photo_matches_filter_v72(photo)
+        ]
+        old_current = self.current_photo
+        self.geolocated_photos = filtered
+        self.refresh_photo_filter_menu_v72()
+        self.refresh_photo_cleanup_menu_v72()
+
+        if not filtered:
+            self.clear_photo_display_v72()
+            self.refresh_map_markers()
+            self.photo_status_var.set(
+                f"Aucune photo pour le filtre « {self.photo_filter_label_v72()} »."
+            )
+            return
+
+        target = None
+        if preferred_catalog_index is not None:
+            target = next(
+                (p for p in filtered if p.get("catalog_index") == preferred_catalog_index),
+                None
+            )
+        if target is None and old_current in filtered:
+            target = old_current
+        if target is None:
+            target = filtered[0]
+
+        if target is old_current:
+            index = filtered.index(target) + 1
+            self.photo_index_var.set(f"Photo {index} / {len(filtered)}")
+            self.refresh_map_markers()
+        else:
+            self.select_photo_on_map(target, center_map=center_map)
+
+    def set_photo_filter_v72(self, mode):
+        valid_modes = {key for key, _label in self.photo_filter_definitions_v72()}
+        if mode not in valid_modes:
+            mode = "all"
+
+        # Un changement de filtre ne doit jamais faire perdre un texte saisi.
+        current_index = None
+        if self.current_photo is not None:
+            current_index = self.current_photo.get("catalog_index")
+            if self.photo_title_entry is not None and not getattr(self, "read_only_mode", False):
+                self.save_current_photo_metadata(silent=True)
+
+        self.photo_filter_mode = mode
+        self.apply_photo_filter_v72(
+            preferred_catalog_index=current_index,
+            center_map=False
+        )
+
+    def refresh_photo_cleanup_menu_v72(self):
+        button = getattr(self, "photo_cleanup_button", None)
+        if button is None:
+            return
+        menu = tk.Menu(button, tearoff=False)
+        menu.add_command(
+            label="Effacer les descriptions du filtre actuel…",
+            command=lambda: self.clean_photo_descriptions_v72("filter")
+        )
+        menu.add_command(
+            label="Effacer toutes les descriptions du bisse…",
+            command=lambda: self.clean_photo_descriptions_v72("all")
+        )
+        button.config(menu=menu)
+
+    def _catalog_gps_payload_v73(self, entry):
+        if not isinstance(entry, dict):
+            return None
+        coords = entry.get("gps_coordinates") or {}
+        lat = coords.get("lat")
+        lon = coords.get("lon")
+        if lat is None or lon is None:
+            return None
+        try:
+            lat = float(lat)
+            lon = float(lon)
+            if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+                return None
+            payload = {"lat": lat, "lon": lon, "ele": coords.get("ele")}
+            return payload
+        except Exception:
+            return None
+
+    def _jpeg_exif_location_v73(self, data):
+        """Localise le premier segment APP1/Exif d'un JPEG.
+
+        Retourne (debut_segment, fin_segment, tiff_bytes). Si le JPEG n'a pas
+        encore d'EXIF, debut/fin valent None et tiff_bytes vaut None.
+        """
+        if not isinstance(data, (bytes, bytearray)) or len(data) < 4 or data[:2] != b"\xff\xd8":
+            raise ValueError("Fichier JPEG invalide")
+
+        pos = 2
+        size = len(data)
+        standalone = {0x01, 0xD8, 0xD9, *range(0xD0, 0xD8)}
+        while pos < size:
+            if data[pos] != 0xFF:
+                raise ValueError("Structure JPEG inattendue avant SOS")
+            marker_start = pos
+            while pos < size and data[pos] == 0xFF:
+                pos += 1
+            if pos >= size:
+                break
+            marker = data[pos]
+            pos += 1
+
+            if marker == 0xDA:  # Start of Scan
+                break
+            if marker in standalone:
+                continue
+            if pos + 2 > size:
+                raise ValueError("Segment JPEG tronqué")
+            segment_length = int.from_bytes(data[pos:pos + 2], "big")
+            if segment_length < 2:
+                raise ValueError("Longueur de segment JPEG invalide")
+            segment_end = pos + segment_length
+            if segment_end > size:
+                raise ValueError("Segment JPEG hors limites")
+            payload = data[pos + 2:segment_end]
+            if marker == 0xE1 and payload.startswith(b"Exif\x00\x00"):
+                return marker_start, segment_end, bytes(payload[6:])
+            pos = segment_end
+
+        return None, None, None
+
+    def _jpeg_exif_insert_position_v73(self, data):
+        """Position sûre pour ajouter APP1/Exif à un JPEG qui n'en a pas."""
+        if len(data) < 4 or data[:2] != b"\xff\xd8":
+            raise ValueError("Fichier JPEG invalide")
+        # Conserver l'APP0/JFIF éventuel en première position, puis placer EXIF.
+        pos = 2
+        if pos + 4 <= len(data) and data[pos:pos + 2] == b"\xff\xe0":
+            seg_len = int.from_bytes(data[pos + 2:pos + 4], "big")
+            end = pos + 2 + seg_len
+            if seg_len >= 2 and end <= len(data):
+                return end
+        return 2
+
+    def _raw_exif_model_v73(self, image_path):
+        """Lit la structure TIFF brute sans jeter les tags inconnus constructeur.
+
+        Contrairement à piexif.load(), chaque entrée IFD est conservée sous sa
+        forme brute de 12 octets. C'est la base du moteur d'écriture v73 : les
+        entrées non modifiées sont recopiées telles quelles et continuent à
+        pointer vers les données originales.
+        """
+        data = Path(image_path).read_bytes()
+        segment_start, segment_end, tiff = self._jpeg_exif_location_v73(data)
+        had_exif = tiff is not None
+
+        if tiff is None:
+            # TIFF big-endian minimal : header + IFD0 vide. Le moteur créera
+            # ensuite un nouvel IFD0 actif sans dépendre de piexif.dump().
+            tiff = b"MM\x00\x2a\x00\x00\x00\x08\x00\x00\x00\x00\x00\x00"
+
+        if len(tiff) < 8:
+            raise ValueError("Bloc EXIF/TIFF trop court")
+        if tiff[:2] == b"II":
+            endian = "little"
+        elif tiff[:2] == b"MM":
+            endian = "big"
+        else:
+            raise ValueError("Ordre d'octets TIFF inconnu")
+        if int.from_bytes(tiff[2:4], endian) != 42:
+            raise ValueError("En-tête TIFF invalide")
+
+        def u16(offset):
+            if offset < 0 or offset + 2 > len(tiff):
+                raise ValueError("Offset EXIF hors limites")
+            return int.from_bytes(tiff[offset:offset + 2], endian)
+
+        def u32(offset):
+            if offset < 0 or offset + 4 > len(tiff):
+                raise ValueError("Offset EXIF hors limites")
+            return int.from_bytes(tiff[offset:offset + 4], endian)
+
+        def parse_ifd(offset):
+            if not offset:
+                return {"offset": 0, "entries": [], "next": 0}
+            count = u16(offset)
+            entries_start = offset + 2
+            entries_end = entries_start + 12 * count
+            if entries_end + 4 > len(tiff):
+                raise ValueError("IFD EXIF tronqué")
+            entries = []
+            for i in range(count):
+                entry_offset = entries_start + 12 * i
+                entries.append({
+                    "tag": u16(entry_offset),
+                    "type": u16(entry_offset + 2),
+                    "count": u32(entry_offset + 4),
+                    "raw": bytes(tiff[entry_offset:entry_offset + 12]),
+                    "value4": bytes(tiff[entry_offset + 8:entry_offset + 12]),
+                })
+            return {
+                "offset": offset,
+                "entries": entries,
+                "next": u32(entries_end),
+            }
+
+        ifd0_offset = u32(4)
+        zeroth = parse_ifd(ifd0_offset)
+        zeroth_map = {entry["tag"]: entry for entry in zeroth["entries"]}
+
+        def pointer_from(entry):
+            if not entry:
+                return 0
+            return int.from_bytes(entry["value4"], endian)
+
+        exif_ifd = parse_ifd(pointer_from(zeroth_map.get(0x8769)))
+        gps_ifd = parse_ifd(pointer_from(zeroth_map.get(0x8825)))
+        exif_map = {entry["tag"]: entry for entry in exif_ifd["entries"]}
+        interop_ifd = parse_ifd(pointer_from(exif_map.get(0xA005)))
+        first_ifd = parse_ifd(zeroth.get("next", 0))
+
+        return {
+            "jpeg": bytes(data),
+            "segment_start": segment_start,
+            "segment_end": segment_end,
+            "had_exif": had_exif,
+            "tiff": bytes(tiff),
+            "endian": endian,
+            "0th": zeroth,
+            "Exif": exif_ifd,
+            "GPS": gps_ifd,
+            "Interop": interop_ifd,
+            "1st": first_ifd,
+        }
+
+    def _raw_exif_entry_data_v73(self, model, ifd_name, tag):
+        type_sizes = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8, 11: 4, 12: 8}
+        ifd = model.get(ifd_name) or {}
+        entry = next((item for item in ifd.get("entries", []) if item.get("tag") == tag), None)
+        if not entry:
+            return None
+        unit = type_sizes.get(entry.get("type"))
+        if not unit:
+            return None
+        size = unit * int(entry.get("count") or 0)
+        if size <= 4:
+            return bytes(entry.get("value4") or b"")[:size]
+        offset = int.from_bytes(entry.get("value4") or b"\x00\x00\x00\x00", model["endian"])
+        tiff = model["tiff"]
+        if offset < 0 or offset + size > len(tiff):
+            return None
+        return bytes(tiff[offset:offset + size])
+
+    def _raw_build_shadow_ifd_v73(self, original_ifd, modifications, removals, endian, ifd_offset, next_ifd=None):
+        """Construit un nouvel IFD en recopiant chaque entrée intacte brute.
+
+        Les anciennes données restent à leur offset original. Seules les valeurs
+        modifiées sont ajoutées à la fin du nouveau tableau. Les tags inconnus de
+        piexif sont donc conservés sans même devoir les interpréter.
+        """
+        type_sizes = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8, 11: 4, 12: 8}
+        original_entries = [
+            entry for entry in (original_ifd.get("entries", []) or [])
+            if entry.get("tag") not in removals and entry.get("tag") not in modifications
+        ]
+        items = [("raw", entry["tag"], entry) for entry in original_entries]
+        items.extend(("modified", tag, value) for tag, value in modifications.items())
+        items.sort(key=lambda item: item[1])
+
+        table_size = 2 + 12 * len(items) + 4
+        next_data_offset = ifd_offset + table_size
+        entries_bytes = []
+        extra = bytearray()
+
+        for kind, tag, payload in items:
+            if kind == "raw":
+                entries_bytes.append(payload["raw"])
+                continue
+
+            value_type, count, raw_value = payload
+            if value_type not in type_sizes:
+                raise ValueError(f"Type EXIF non pris en charge pour le tag {tag:#06x}")
+            raw_value = bytes(raw_value)
+            required_size = type_sizes[value_type] * int(count)
+            if len(raw_value) != required_size:
+                raise ValueError(
+                    f"Taille EXIF incohérente pour le tag {tag:#06x} "
+                    f"({len(raw_value)} au lieu de {required_size})"
+                )
+
+            header = (
+                int(tag).to_bytes(2, endian)
+                + int(value_type).to_bytes(2, endian)
+                + int(count).to_bytes(4, endian)
+            )
+            if required_size <= 4:
+                value_field = raw_value + b"\x00" * (4 - required_size)
+            else:
+                # Alignement sur deux octets, suffisant pour TIFF/EXIF.
+                if next_data_offset % 2:
+                    extra.extend(b"\x00")
+                    next_data_offset += 1
+                value_field = next_data_offset.to_bytes(4, endian)
+                extra.extend(raw_value)
+                next_data_offset += required_size
+            entries_bytes.append(header + value_field)
+
+        if next_ifd is None:
+            next_ifd = original_ifd.get("next", 0) or 0
+        return (
+            len(items).to_bytes(2, endian)
+            + b"".join(entries_bytes)
+            + int(next_ifd).to_bytes(4, endian)
+            + bytes(extra)
+        )
+
+    def _raw_rational_bytes_v73(self, values, endian):
+        raw = bytearray()
+        for numerator, denominator in values:
+            numerator = int(numerator)
+            denominator = int(denominator)
+            if denominator == 0:
+                raise ValueError("Dénominateur rationnel EXIF nul")
+            raw.extend(numerator.to_bytes(4, endian, signed=False))
+            raw.extend(denominator.to_bytes(4, endian, signed=False))
+        return bytes(raw)
+
+    def _raw_gps_is_valid_v73(self, model):
+        try:
+            gps_entries = {entry["tag"]: entry for entry in model["GPS"].get("entries", [])}
+            if not all(tag in gps_entries for tag in (1, 2, 3, 4)):
+                return False
+            lat_ref = (self._raw_exif_entry_data_v73(model, "GPS", 1) or b"").rstrip(b"\x00").decode("ascii", errors="ignore")
+            lon_ref = (self._raw_exif_entry_data_v73(model, "GPS", 3) or b"").rstrip(b"\x00").decode("ascii", errors="ignore")
+            if lat_ref not in ("N", "S") or lon_ref not in ("E", "W"):
+                return False
+            for tag in (2, 4):
+                raw = self._raw_exif_entry_data_v73(model, "GPS", tag)
+                if not raw or len(raw) != 24:
+                    return False
+                for pos in range(0, 24, 8):
+                    denominator = int.from_bytes(raw[pos + 4:pos + 8], model["endian"])
+                    if denominator == 0:
+                        return False
+            return True
+        except Exception:
+            return False
+
+    def _raw_gps_coordinates_v73(self, model):
+        if not self._raw_gps_is_valid_v73(model):
+            return None
+        try:
+            endian = model["endian"]
+
+            def rational_triplet(tag):
+                raw = self._raw_exif_entry_data_v73(model, "GPS", tag)
+                values = []
+                for pos in range(0, 24, 8):
+                    numerator = int.from_bytes(raw[pos:pos + 4], endian)
+                    denominator = int.from_bytes(raw[pos + 4:pos + 8], endian)
+                    if denominator == 0:
+                        raise ValueError("rationnel GPS invalide")
+                    values.append(numerator / denominator)
+                return values
+
+            lat_d, lat_m, lat_s = rational_triplet(2)
+            lon_d, lon_m, lon_s = rational_triplet(4)
+            lat = lat_d + lat_m / 60.0 + lat_s / 3600.0
+            lon = lon_d + lon_m / 60.0 + lon_s / 3600.0
+            lat_ref = (self._raw_exif_entry_data_v73(model, "GPS", 1) or b"").rstrip(b"\x00").decode("ascii")
+            lon_ref = (self._raw_exif_entry_data_v73(model, "GPS", 3) or b"").rstrip(b"\x00").decode("ascii")
+            if lat_ref == "S":
+                lat = -lat
+            if lon_ref == "W":
+                lon = -lon
+            return {"lat": lat, "lon": lon}
+        except Exception:
+            return None
+
+    def _raw_text_values_v73(self, model):
+        xp_title = self.decode_windows_xp_field(self._raw_exif_entry_data_v73(model, "0th", 0x9C9B))
+        xp_comment = self.decode_windows_xp_field(self._raw_exif_entry_data_v73(model, "0th", 0x9C9C))
+        image_description = self.decode_exif_text_field(self._raw_exif_entry_data_v73(model, "0th", 0x010E))
+        xp_subject = self.decode_windows_xp_field(self._raw_exif_entry_data_v73(model, "0th", 0x9C9F))
+        user_comment = self.decode_user_comment(self._raw_exif_entry_data_v73(model, "Exif", 0x9286))
+        return {
+            "title": xp_title or image_description or xp_subject,
+            "description": xp_comment or user_comment,
+            "XPTitle": xp_title,
+            "XPComment": xp_comment,
+            "ImageDescription": image_description,
+            "XPSubject": xp_subject,
+            "UserComment": user_comment,
+        }
+
+    def _jpeg_without_exif_digest_v73(self, image_path):
+        """Empreinte de tout le JPEG sauf le segment APP1/Exif."""
+        try:
+            data = Path(image_path).read_bytes()
+            start, end, _tiff = self._jpeg_exif_location_v73(data)
+            if start is None:
+                kept = data
+            else:
+                kept = data[:start] + data[end:]
+            return hashlib.sha256(kept).hexdigest()
+        except Exception:
+            return None
+
+    def _build_gps_modifications_v73(self, lat, lon, ele, gps_datetime, endian):
+        lat = float(lat)
+        lon = float(lon)
+        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            raise ValueError("Coordonnées GPS hors limites")
+
+        modifications = {
+            0: (1, 4, b"\x02\x03\x00\x00"),
+            1: (2, 2, (b"N" if lat >= 0 else b"S") + b"\x00"),
+            2: (5, 3, self._raw_rational_bytes_v73(self.decimal_to_gps_dms_rational(lat), endian)),
+            3: (2, 2, (b"E" if lon >= 0 else b"W") + b"\x00"),
+            4: (5, 3, self._raw_rational_bytes_v73(self.decimal_to_gps_dms_rational(lon), endian)),
+            18: (2, 7, b"WGS-84\x00"),
+        }
+
+        if ele is not None:
+            try:
+                ele_value = float(ele)
+                altitude = self.float_to_rational(abs(ele_value), precision=100)
+                modifications[5] = (1, 1, b"\x01" if ele_value < 0 else b"\x00")
+                modifications[6] = (5, 1, self._raw_rational_bytes_v73([altitude], endian))
+            except Exception:
+                pass
+
+        dt_utc = self.parse_iso_datetime_to_utc(gps_datetime)
+        if dt_utc:
+            modifications[7] = (
+                5,
+                3,
+                self._raw_rational_bytes_v73(
+                    [(dt_utc.hour, 1), (dt_utc.minute, 1), (dt_utc.second, 1)],
+                    endian,
+                ),
+            )
+            date_bytes = dt_utc.strftime("%Y:%m:%d").encode("ascii") + b"\x00"
+            modifications[29] = (2, len(date_bytes), date_bytes)
+        return modifications
+
+    def _write_exif_shadow_transactional_v73(
+        self,
+        image_path,
+        *,
+        update_title=False,
+        title="",
+        update_description=False,
+        description="",
+        gps_coords=None,
+        gps_datetime=None,
+        force_gps_write=False,
+    ):
+        """Écriture EXIF v73 sans reconstruction globale du bloc constructeur.
+
+        Le TIFF original reste physiquement intact. Abisses ajoute à sa fin de
+        nouveaux IFD pour les seuls champs modifiés, puis fait pointer l'en-tête
+        TIFF vers le nouvel IFD0. Les MakerNotes, tags inconnus et leurs offsets
+        originaux restent donc byte-for-byte à la même place.
+        """
+        model = self._raw_exif_model_v73(image_path)
+        original_tiff = model["tiff"]
+        tiff = bytearray(original_tiff)
+        endian = model["endian"]
+
+        title = str(title or "")
+        description = str(description or "")
+
+        # GPS : pendant une simple édition texte, ne toucher à un GPS sain sous
+        # aucun prétexte. Un GPS structurellement invalide (ex. 0/0 OnePlus) est
+        # réparé depuis Abisses si des coordonnées valides existent.
+        existing_gps_present = bool(model["GPS"].get("entries"))
+        existing_gps_valid = self._raw_gps_is_valid_v73(model)
+        valid_catalog_gps = False
+        if isinstance(gps_coords, dict):
+            try:
+                lat = float(gps_coords.get("lat"))
+                lon = float(gps_coords.get("lon"))
+                valid_catalog_gps = -90 <= lat <= 90 and -180 <= lon <= 180
+            except Exception:
+                valid_catalog_gps = False
+        if force_gps_write and not valid_catalog_gps:
+            raise ValueError("Coordonnées Abisses absentes ou invalides")
+
+        gps_should_write = bool(
+            valid_catalog_gps
+            and (force_gps_write or (existing_gps_present and not existing_gps_valid))
+        )
+        gps_should_remove = bool(
+            existing_gps_present and not existing_gps_valid and not valid_catalog_gps
+        )
+        gps_expected = None
+        new_gps_offset = None
+
+        if gps_should_write:
+            gps_modifications = self._build_gps_modifications_v73(
+                gps_coords.get("lat"),
+                gps_coords.get("lon"),
+                gps_coords.get("ele"),
+                gps_datetime,
+                endian,
+            )
+            # Sur GPS sain, préserver les tags annexes non contrôlés par Abisses.
+            # Sur GPS invalide, repartir d'un IFD vide pour ne pas conserver les 0/0.
+            gps_base = model["GPS"] if existing_gps_valid else {"entries": [], "next": 0}
+            new_gps_offset = len(tiff)
+            tiff.extend(
+                self._raw_build_shadow_ifd_v73(
+                    gps_base,
+                    gps_modifications,
+                    set(),
+                    endian,
+                    new_gps_offset,
+                    next_ifd=0,
+                )
+            )
+            gps_expected = {
+                "lat": float(gps_coords.get("lat")),
+                "lon": float(gps_coords.get("lon")),
+            }
+
+        # ExifIFD : UserComment vit ici. Tous les autres tags, connus ou non,
+        # sont recopiés avec leurs 12 octets d'entrée originaux.
+        new_exif_offset = None
+        if update_description and (description or model["Exif"].get("entries")):
+            exif_modifications = {}
+            exif_removals = set()
+            if description:
+                user_comment = b"UNICODE\x00" + description.encode("utf-16be", errors="replace")
+                exif_modifications[0x9286] = (7, len(user_comment), user_comment)
+            else:
+                exif_removals.add(0x9286)
+            new_exif_offset = len(tiff)
+            tiff.extend(
+                self._raw_build_shadow_ifd_v73(
+                    model["Exif"],
+                    exif_modifications,
+                    exif_removals,
+                    endian,
+                    new_exif_offset,
+                    next_ifd=model["Exif"].get("next", 0),
+                )
+            )
+
+        # IFD0 : XPTitle / XPComment et pointeurs vers les nouveaux sous-IFD.
+        zeroth_modifications = {}
+        zeroth_removals = set()
+        if update_title:
+            if title:
+                encoded = self.encode_windows_xp_field(title)
+                zeroth_modifications[0x9C9B] = (1, len(encoded), encoded)
+            else:
+                zeroth_removals.update({0x9C9B, 0x010E, 0x9C9F})
+
+        if update_description:
+            if description:
+                encoded = self.encode_windows_xp_field(description)
+                zeroth_modifications[0x9C9C] = (1, len(encoded), encoded)
+            else:
+                zeroth_removals.add(0x9C9C)
+            if new_exif_offset is not None:
+                zeroth_modifications[0x8769] = (
+                    4,
+                    1,
+                    int(new_exif_offset).to_bytes(4, endian),
+                )
+
+        if gps_should_write:
+            zeroth_modifications[0x8825] = (
+                4,
+                1,
+                int(new_gps_offset).to_bytes(4, endian),
+            )
+        elif gps_should_remove:
+            zeroth_removals.add(0x8825)
+
+        new_zeroth_offset = len(tiff)
+        tiff.extend(
+            self._raw_build_shadow_ifd_v73(
+                model["0th"],
+                zeroth_modifications,
+                zeroth_removals,
+                endian,
+                new_zeroth_offset,
+                next_ifd=model["0th"].get("next", 0),
+            )
+        )
+        tiff[4:8] = int(new_zeroth_offset).to_bytes(4, endian)
+
+        exif_payload = b"Exif\x00\x00" + bytes(tiff)
+        # APP1 length inclut les deux octets de longueur eux-mêmes.
+        if len(exif_payload) + 2 > 65535:
+            raise ValueError("Bloc EXIF trop volumineux après modification")
+        exif_segment = b"\xff\xe1" + (len(exif_payload) + 2).to_bytes(2, "big") + exif_payload
+
+        original_jpeg = model["jpeg"]
+        if model["had_exif"]:
+            candidate_bytes = (
+                original_jpeg[:model["segment_start"]]
+                + exif_segment
+                + original_jpeg[model["segment_end"]:]
+            )
+        else:
+            insertion = self._jpeg_exif_insert_position_v73(original_jpeg)
+            candidate_bytes = original_jpeg[:insertion] + exif_segment + original_jpeg[insertion:]
+
+        folder = os.path.dirname(os.path.abspath(image_path)) or os.getcwd()
+        suffix = os.path.splitext(image_path)[1] or ".jpg"
+        fd, temp_path = tempfile.mkstemp(prefix=".abisses_meta_v73_", suffix=suffix, dir=folder)
+        os.close(fd)
+        try:
+            Path(temp_path).write_bytes(candidate_bytes)
+
+            # 1) Le flux JPEG hors EXIF doit être strictement identique.
+            original_digest = self._jpeg_without_exif_digest_v73(image_path)
+            candidate_digest = self._jpeg_without_exif_digest_v73(temp_path)
+            if not original_digest or candidate_digest != original_digest:
+                raise ValueError("validation refusée : données JPEG hors EXIF modifiées")
+
+            # 2) Dimensions et décodage JPEG doivent rester valides.
+            with Image.open(image_path) as original_image:
+                original_size = original_image.size
+            with Image.open(temp_path) as candidate_image:
+                candidate_size = candidate_image.size
+                candidate_image.verify()
+            if candidate_size != original_size:
+                raise ValueError("validation refusée : dimensions JPEG modifiées")
+
+            # 3) Sur un EXIF existant, tout le TIFF original doit être encore
+            # présent byte-for-byte. Seul le pointeur IFD0 (octets 4:8) change.
+            candidate_model = self._raw_exif_model_v73(temp_path)
+            if model["had_exif"]:
+                if len(candidate_model["tiff"]) < len(original_tiff):
+                    raise ValueError("validation refusée : EXIF original tronqué")
+                if (
+                    candidate_model["tiff"][:4] != original_tiff[:4]
+                    or candidate_model["tiff"][8:len(original_tiff)] != original_tiff[8:]
+                ):
+                    raise ValueError("validation refusée : données EXIF originales altérées")
+
+            # 4) Vérifier les valeurs demandées depuis les nouveaux IFD actifs.
+            text_values = self._raw_text_values_v73(candidate_model)
+            if update_title and text_values["title"].strip() != title.strip():
+                raise ValueError("validation refusée : titre JPG différent de la valeur demandée")
+            if update_description and text_values["description"].strip() != description.strip():
+                raise ValueError("validation refusée : description JPG différente de la valeur demandée")
+            if gps_expected is not None:
+                gps_values = self._raw_gps_coordinates_v73(candidate_model)
+                if not gps_values:
+                    raise ValueError("validation refusée : GPS JPG illisible après écriture")
+                if (
+                    abs(gps_values["lat"] - gps_expected["lat"]) > 0.00001
+                    or abs(gps_values["lon"] - gps_expected["lon"]) > 0.00001
+                ):
+                    raise ValueError("validation refusée : GPS JPG différent de la valeur demandée")
+            elif gps_should_remove and candidate_model["GPS"].get("entries"):
+                raise ValueError("validation refusée : bloc GPS invalide toujours actif")
+
+            try:
+                original_mode = os.stat(image_path).st_mode
+            except Exception:
+                original_mode = None
+            os.replace(temp_path, image_path)
+            temp_path = None
+            if original_mode is not None:
+                try:
+                    os.chmod(image_path, original_mode)
+                except Exception:
+                    pass
+            return True, "écriture EXIF chirurgicale validée"
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
+
+    def write_photo_metadata_to_jpg_v73(
+        self,
+        image_path,
+        *,
+        update_title=False,
+        title="",
+        update_description=False,
+        description="",
+        gps_coords=None,
+        gps_datetime=None,
+        force_gps_write=False,
+    ):
+        """Moteur unique v73 pour titre, description et GPS.
+
+        Aucune reconstruction globale via piexif.dump : les métadonnées
+        constructeur inconnues restent physiquement intactes.
+        """
+        if not image_path or not os.path.exists(image_path):
+            return False, "Image introuvable"
+        if not image_path.lower().endswith((".jpg", ".jpeg")):
+            return False, "Le fichier n'est pas un JPG/JPEG"
+        try:
+            return self._write_exif_shadow_transactional_v73(
+                image_path,
+                update_title=update_title,
+                title=title,
+                update_description=update_description,
+                description=description,
+                gps_coords=gps_coords,
+                gps_datetime=gps_datetime,
+                force_gps_write=force_gps_write,
+            )
+        except Exception as exc:
+            return False, str(exc)
+
+
+    def clear_description_metadata_from_jpg_v72(
+        self,
+        image_path,
+        gps_coords=None,
+        gps_datetime=None,
+    ):
+        """Efface physiquement la description avec le moteur commun v73."""
+        ok, message = self.write_photo_metadata_to_jpg_v73(
+            image_path,
+            update_description=True,
+            description="",
+            gps_coords=gps_coords,
+            gps_datetime=gps_datetime,
+        )
+        if not ok:
+            return False, message
+        return True, f"Description JPG effacée ({message})"
+
+    def photo_description_cleanup_targets_v72(self, scope):
+        if scope == "filter":
+            targets = []
+            for photo in list(self.geolocated_photos or []):
+                if (
+                    str(photo.get("description") or "").strip()
+                    or bool(photo.get("ignore_jpg_description", False))
+                ):
+                    targets.append({
+                        "catalog_index": photo.get("catalog_index"),
+                        "image_path": photo.get("image_path", ""),
+                        "filename": photo.get("filename", ""),
+                    })
+            return targets
+
+        # « Tout le bisse » inclut également les photos actives sans GPS, qui
+        # ne sont pas visibles dans la carte de l'atelier Photos.
+        catalog = self.read_catalog()
+        self.catalog_data = catalog
+        targets = []
+        for index, entry in enumerate(catalog):
+            if not isinstance(entry, dict) or entry.get("status") != "OK":
+                continue
+            image_path = self.get_entry_image_path(entry)
+            catalog_description = str(entry.get("description") or "").strip()
+            jpg_description = ""
+            if not entry.get("ignore_jpg_description", False) and image_path and os.path.exists(image_path):
+                jpg_meta = self.read_text_metadata_from_jpg(image_path)
+                if jpg_meta.get("ok"):
+                    jpg_description = str(jpg_meta.get("description") or "").strip()
+            pending_physical_cleanup = bool(entry.get("ignore_jpg_description", False))
+            if not (catalog_description or jpg_description or pending_physical_cleanup):
+                continue
+            targets.append({
+                "catalog_index": index,
+                "image_path": image_path,
+                "filename": os.path.basename(image_path) if image_path else entry.get("original_filename", ""),
+            })
+        return targets
+
+    def clean_photo_descriptions_v72(self, scope="filter"):
+        if getattr(self, "read_only_mode", False):
+            messagebox.showwarning(
+                "Lecture seule",
+                "Ce bisse est ouvert en lecture seule : les descriptions ne peuvent pas être modifiées."
+            )
+            return
+
+        if self.current_photo is not None and self.photo_title_entry is not None:
+            self.save_current_photo_metadata(silent=True)
+
+        try:
+            targets = self.photo_description_cleanup_targets_v72(scope)
+        except Exception as exc:
+            messagebox.showerror("Nettoyage impossible", str(exc))
+            return
+
+        if not targets:
+            messagebox.showinfo(
+                "Nettoyer les descriptions",
+                "Aucune description à effacer dans cette sélection."
+            )
+            return
+
+        if scope == "filter":
+            label = self.photo_filter_label_v72()
+            question = (
+                f"Effacer la description de {len(targets)} photo(s) du filtre « {label} » ?"
+            )
+        else:
+            question = (
+                f"Effacer toutes les descriptions du bisse ({len(targets)} photo(s)) ?"
+            )
+
+        if not messagebox.askyesno(
+            "Nettoyer les descriptions",
+            question
+            + "\n\nLes titres et la sélection pour la plateforme ne seront pas modifiés."
+            + "\nCette action efface aussi les descriptions rédigées manuellement."
+        ):
+            return
+
+        token = self.begin_activity("Nettoyage des descriptions…", delay_ms=0)
+        guard = None
+        changed_indices = set()
+        failures = []
+        try:
+            # Un seul garde protège la série complète. Son horodatage est rafraîchi
+            # pendant la boucle afin qu'un autre poste ne le considère jamais périmé.
+            guard = self.acquire_active_bisse_write_guard_v71()
+            self.catalog_data = self.read_catalog()
+            total = len(targets)
+            for position, target in enumerate(targets, start=1):
+                if guard:
+                    try:
+                        os.utime(guard, None)
+                    except Exception:
+                        pass
+
+                catalog_index = target.get("catalog_index")
+                if catalog_index is None or catalog_index >= len(self.catalog_data):
+                    failures.append(target.get("filename") or "photo inconnue")
+                    continue
+
+                entry = self.catalog_data[catalog_index]
+                image_path = target.get("image_path") or self.get_entry_image_path(entry)
+                # Toujours demander l'effacement physique pour une cible de nettoyage,
+                # y compris les états v72a/v72b où la description JPG avait été
+                # masquée dans Abisses. Le moteur v73 vérifie lui-même le résultat.
+                gps_payload = self._catalog_gps_payload_v73(entry)
+                ok, cleanup_message = self.clear_description_metadata_from_jpg_v72(
+                    image_path,
+                    gps_coords=gps_payload,
+                    gps_datetime=entry.get("date_taken"),
+                )
+                verify = self.read_text_metadata_from_jpg(image_path) if image_path else {"ok": False}
+                jpg_description_still_present = bool(
+                    (not ok)
+                    or (not verify.get("ok"))
+                    or str(verify.get("description") or "").strip()
+                )
+                if jpg_description_still_present:
+                    filename = target.get("filename") or os.path.basename(image_path or "")
+                    failures.append(f"{filename} — {cleanup_message}")
+                    self.log(f"⚠️ Description JPG non effacée : {filename} — {cleanup_message}")
+                else:
+                    self.log(
+                        f"🧹 Description supprimée des métadonnées JPG : "
+                        f"{target.get('filename') or os.path.basename(image_path or '')} "
+                        f"({cleanup_message})"
+                    )
+
+                # L'intention utilisateur prime : même si le JPG ne peut pas être
+                # réécrit, la description disparaît d'Abisses. Dans ce cas on
+                # mémorise explicitement que sa valeur EXIF résiduelle doit être
+                # ignorée lors des lectures futures.
+                entry["description"] = ""
+                entry["description_managed_by_abisses"] = True
+                if jpg_description_still_present:
+                    entry["ignore_jpg_description"] = True
+                    entry["text_metadata_synced_to_jpg"] = False
+                    entry["text_metadata_sync_error"] = cleanup_message
+                else:
+                    entry.pop("ignore_jpg_description", None)
+                    entry["text_metadata_synced_to_jpg"] = True
+                    entry["text_metadata_synced_to_jpg_at"] = datetime.now().isoformat(timespec="seconds")
+                    entry.pop("text_metadata_sync_error", None)
+                changed_indices.add(catalog_index)
+                self.update_activity(
+                    token,
+                    f"Nettoyage des descriptions… {position}/{total}",
+                    value=(position / total) * 100
+                )
+                self.root.update_idletasks()
+
+            if changed_indices:
+                # Le garde est déjà détenu : éviter de le réacquérir via save_catalog().
+                self._save_catalog_payload_v71()
+
+            for photo in list(getattr(self, "photo_all_geolocated_photos", []) or []):
+                catalog_index = photo.get("catalog_index")
+                if catalog_index in changed_indices:
+                    entry = (
+                        self.catalog_data[catalog_index]
+                        if isinstance(catalog_index, int) and 0 <= catalog_index < len(self.catalog_data)
+                        else {}
+                    )
+                    ignored = bool(entry.get("ignore_jpg_description", False))
+                    photo["description"] = ""
+                    photo["jpg_description"] = ""
+                    photo["catalog_description"] = ""
+                    photo["description_managed_by_abisses"] = True
+                    photo["ignore_jpg_description"] = ignored
+                    photo["metadata_source"] = (
+                        "JPG (description ignorée)"
+                        if ignored and str(photo.get("jpg_title") or "").strip()
+                        else ("JPG" if str(photo.get("jpg_title") or "").strip() else "catalogue.json")
+                    )
+
+            preferred_index = self.current_photo.get("catalog_index") if self.current_photo else None
+            # Les champs visibles contiennent encore l'ancienne description.
+            # Neutraliser l'auto-sauvegarde de select_photo_on_map() avant de
+            # recharger la vue filtrée, sinon le texte effacé serait réécrit.
+            self.current_photo = None
+            self.apply_photo_filter_v72(
+                preferred_catalog_index=preferred_index,
+                center_map=False
+            )
+
+            if failures:
+                messagebox.showwarning(
+                    "Descriptions effacées dans Abisses",
+                    f"{len(changed_indices)} description(s) effacée(s) dans Abisses.\n"
+                    f"{len(failures)} fichier(s) JPG n'ont pas pu être nettoyés physiquement ; "
+                    "leur ancienne description sera désormais ignorée par Abisses.\n\n"
+                    "Détail :\n" + "\n".join(failures[:8])
+                )
+            else:
+                messagebox.showinfo(
+                    "Nettoyer les descriptions",
+                    f"{len(changed_indices)} description(s) effacée(s)."
+                )
+        except Exception as exc:
+            messagebox.showerror("Nettoyage impossible", str(exc))
+            self.log(f"❌ Nettoyage descriptions v73 : {exc}")
+        finally:
+            if guard:
+                self.short_data_lock_release(guard)
+            self.end_activity(token, restore_status=True)
 
     def build_map_panel(self, parent):
         header = tk.Frame(parent, bg="#eeeeee")
@@ -27488,52 +28549,24 @@ namespace GestionBissesFolderPicker
             result["error"] = str(e)
             return result
 
-    def write_text_metadata_to_jpg(self, image_path, title, description):
-        if not image_path or not os.path.exists(image_path):
-            return False, "Image introuvable"
-
-        if not image_path.lower().endswith((".jpg", ".jpeg")):
-            return False, "Le fichier n'est pas un JPG"
-
-        try:
-            try:
-                exif_dict = piexif.load(image_path)
-            except Exception:
-                exif_dict = {
-                    "0th": {},
-                    "Exif": {},
-                    "GPS": {},
-                    "1st": {},
-                    "thumbnail": None
-                }
-
-            title = title or ""
-            description = description or ""
-
-            if title:
-                exif_dict["0th"][piexif.ImageIFD.XPTitle] = self.encode_windows_xp_field(title)
-            else:
-                exif_dict["0th"].pop(piexif.ImageIFD.XPTitle, None)
-
-            if description:
-                exif_dict["0th"][piexif.ImageIFD.XPComment] = self.encode_windows_xp_field(description)
-            else:
-                exif_dict["0th"].pop(piexif.ImageIFD.XPComment, None)
-
-            if description:
-                user_comment_prefix = b"UNICODE\x00"
-                user_comment_text = description.encode("utf-16be", errors="replace")
-                exif_dict["Exif"][piexif.ExifIFD.UserComment] = user_comment_prefix + user_comment_text
-            else:
-                exif_dict["Exif"].pop(piexif.ExifIFD.UserComment, None)
-
-            exif_bytes = piexif.dump(exif_dict)
-            piexif.insert(exif_bytes, image_path)
-
-            return True, "Métadonnées JPG écrites"
-
-        except Exception as e:
-            return False, str(e)
+    def write_text_metadata_to_jpg(
+        self,
+        image_path,
+        title,
+        description,
+        gps_coords=None,
+        gps_datetime=None,
+    ):
+        ok, message = self.write_photo_metadata_to_jpg_v73(
+            image_path,
+            update_title=True,
+            title=title,
+            update_description=True,
+            description=description,
+            gps_coords=gps_coords,
+            gps_datetime=gps_datetime,
+        )
+        return ok, message
 
     def diagnose_current_photo_metadata(self):
         if self.current_photo is None:
@@ -27593,7 +28626,6 @@ namespace GestionBissesFolderPicker
             return
 
         catalog_index = self.current_photo.get("catalog_index")
-
         if catalog_index is None:
             if not silent:
                 messagebox.showerror("Erreur", "Index catalogue introuvable.")
@@ -27603,28 +28635,22 @@ namespace GestionBissesFolderPicker
         requested_description = self.photo_desc_text.get("1.0", tk.END).strip()
 
         try:
-            image_path = self.current_photo.get("image_path", "")
-            jpg_ok, jpg_message = self.write_text_metadata_to_jpg(
-                image_path,
-                requested_title,
-                requested_description
-            )
-
-            jpg_meta = self.read_text_metadata_from_jpg(image_path)
-
-            if jpg_meta.get("ok"):
-                actual_title = jpg_meta.get("title", "")
-                actual_description = jpg_meta.get("description", "")
-            else:
-                actual_title = requested_title
-                actual_description = requested_description
-
+            # v73 : le catalogue est l'autorité métier. On le sauvegarde avant
+            # toute tentative de synchronisation physique vers le JPG afin qu'une
+            # incompatibilité EXIF ne puisse jamais faire perdre un texte saisi.
             self.catalog_data = self.read_catalog()
-
             if catalog_index >= len(self.catalog_data):
                 if not silent:
                     messagebox.showerror("Erreur", "Index catalogue invalide.")
                 return
+
+            entry = self.catalog_data[catalog_index]
+            old_title = str(entry.get("title") or "").strip()
+            old_description = str(entry.get("description") or "").strip()
+            text_changed = (
+                old_title != requested_title
+                or old_description != requested_description
+            )
 
             platform_selected = bool(self.platform_selected_var.get())
             try:
@@ -27632,65 +28658,128 @@ namespace GestionBissesFolderPicker
             except Exception:
                 platform_order = 0
 
-            self.catalog_data[catalog_index]["title"] = actual_title
-            self.catalog_data[catalog_index]["description"] = actual_description
-            self.catalog_data[catalog_index]["platform_selected"] = platform_selected
-            self.catalog_data[catalog_index]["platform_order"] = platform_order
-
+            entry["title"] = requested_title
+            entry["description"] = requested_description
+            # Une modification explicite, ou un clic sur Sauvegarder, transforme
+            # aussi une chaîne vide en décision volontaire et persistante.
+            if text_changed or not silent:
+                entry["title_managed_by_abisses"] = True
+                entry["description_managed_by_abisses"] = True
+            entry["platform_selected"] = platform_selected
+            entry["platform_order"] = platform_order
             self.save_catalog()
 
-            self.current_photo["title"] = actual_title
-            self.current_photo["description"] = actual_description
-            self.current_photo["jpg_title"] = jpg_meta.get("title", "")
-            self.current_photo["jpg_description"] = jpg_meta.get("description", "")
-            self.current_photo["catalog_title"] = actual_title
-            self.current_photo["catalog_description"] = actual_description
-            self.current_photo["metadata_source"] = "JPG" if jpg_ok else "catalogue.json"
+            gps_payload = self._catalog_gps_payload_v73(entry)
+            should_sync_text = bool(
+                text_changed
+                or not silent
+                or entry.get("text_metadata_synced_to_jpg") is False
+            )
+            jpg_ok = True
+            jpg_message = "aucune modification texte à synchroniser"
+            if should_sync_text:
+                jpg_ok, jpg_message = self.write_text_metadata_to_jpg(
+                    self.current_photo.get("image_path", ""),
+                    requested_title,
+                    requested_description,
+                    gps_coords=gps_payload,
+                    gps_datetime=entry.get("date_taken"),
+                )
+
+            jpg_meta = self.read_text_metadata_from_jpg(self.current_photo.get("image_path", ""))
+            jpg_title = str(jpg_meta.get("title") or "") if jpg_meta.get("ok") else ""
+            jpg_description = str(jpg_meta.get("description") or "") if jpg_meta.get("ok") else ""
+            title_matches = bool(jpg_ok and jpg_meta.get("ok") and jpg_title.strip() == requested_title)
+            description_matches = bool(
+                jpg_ok and jpg_meta.get("ok") and jpg_description.strip() == requested_description
+            )
+
+            # Recharger le catalogue : l'écriture JPG peut être longue et un seul
+            # petit état de synchronisation doit être ajouté sans perdre le reste.
+            self.catalog_data = self.read_catalog()
+            entry = self.catalog_data[catalog_index]
+            if should_sync_text:
+                if title_matches and description_matches:
+                    entry["text_metadata_synced_to_jpg"] = True
+                    entry["text_metadata_synced_to_jpg_at"] = datetime.now().isoformat(timespec="seconds")
+                    entry.pop("text_metadata_sync_error", None)
+                    entry.pop("ignore_jpg_description", None)
+                else:
+                    entry["text_metadata_synced_to_jpg"] = False
+                    entry["text_metadata_sync_error"] = jpg_message
+                    if not description_matches:
+                        # Compatibilité avec les états v72a/v72b.
+                        entry["ignore_jpg_description"] = True
+            self.save_catalog()
+
+            # L'interface suit toujours l'autorité du catalogue, jamais une vieille
+            # valeur EXIF qui aurait survécu à une écriture impossible.
+            self.current_photo["title"] = requested_title
+            self.current_photo["description"] = requested_description
+            self.current_photo["jpg_title"] = jpg_title
+            self.current_photo["jpg_description"] = jpg_description
+            self.current_photo["catalog_title"] = requested_title
+            self.current_photo["catalog_description"] = requested_description
+            self.current_photo["title_managed_by_abisses"] = bool(entry.get("title_managed_by_abisses", False))
+            self.current_photo["description_managed_by_abisses"] = bool(entry.get("description_managed_by_abisses", False))
+            self.current_photo["ignore_jpg_description"] = bool(entry.get("ignore_jpg_description", False))
+            self.current_photo["metadata_source"] = "catalogue.json"
             self.current_photo["platform_selected"] = platform_selected
             self.current_photo["platform_order"] = platform_order
 
-            for photo in self.geolocated_photos:
+            for photo in list(getattr(self, "photo_all_geolocated_photos", []) or []):
                 if photo.get("catalog_index") == catalog_index:
-                    photo["title"] = actual_title
-                    photo["description"] = actual_description
-                    photo["jpg_title"] = jpg_meta.get("title", "")
-                    photo["jpg_description"] = jpg_meta.get("description", "")
-                    photo["catalog_title"] = actual_title
-                    photo["catalog_description"] = actual_description
-                    photo["metadata_source"] = "JPG" if jpg_ok else "catalogue.json"
+                    photo["title"] = requested_title
+                    photo["description"] = requested_description
+                    photo["jpg_title"] = jpg_title
+                    photo["jpg_description"] = jpg_description
+                    photo["catalog_title"] = requested_title
+                    photo["catalog_description"] = requested_description
+                    photo["title_managed_by_abisses"] = bool(entry.get("title_managed_by_abisses", False))
+                    photo["description_managed_by_abisses"] = bool(entry.get("description_managed_by_abisses", False))
+                    photo["ignore_jpg_description"] = bool(entry.get("ignore_jpg_description", False))
+                    photo["metadata_source"] = "catalogue.json"
                     photo["platform_selected"] = platform_selected
                     photo["platform_order"] = platform_order
-                    break
 
             self.photo_title_entry.delete(0, tk.END)
-            self.photo_title_entry.insert(0, actual_title)
-
+            self.photo_title_entry.insert(0, requested_title)
             self.photo_desc_text.delete("1.0", tk.END)
-            self.photo_desc_text.insert("1.0", actual_description)
+            self.photo_desc_text.insert("1.0", requested_description)
+
+            self.refresh_photo_filter_menu_v72()
+            self.refresh_photo_cleanup_menu_v72()
+            saved_filename = self.current_photo.get("filename")
+            leaves_current_filter = (
+                not silent
+                and getattr(self, "photo_filter_mode", "all") != "all"
+                and not self.photo_matches_filter_v72(self.current_photo)
+            )
 
             if not silent:
-                if jpg_ok and jpg_meta.get("ok"):
+                if not should_sync_text:
+                    self.photo_status_var.set("✅ Catalogue déjà à jour.")
+                elif title_matches and description_matches:
                     self.photo_status_var.set(
-                        "✅ Sauvegardé dans le JPG, relu depuis le JPG, puis synchronisé avec le catalogue."
+                        "✅ Sauvegardé dans Abisses et synchronisé dans le JPG (écriture EXIF validée)."
                     )
-                    self.log(f"💾 Métadonnées JPG + catalogue sauvegardées : {self.current_photo.get('filename')}")
-                elif jpg_ok:
-                    self.photo_status_var.set(
-                        "⚠️ JPG écrit, mais relecture JPG incomplète. Catalogue mis à jour avec les valeurs demandées."
-                    )
-                    self.log(f"⚠️ JPG écrit mais relecture incomplète : {self.current_photo.get('filename')}")
+                    self.log(f"💾 Métadonnées Abisses + JPG sauvegardées : {saved_filename}")
                 else:
                     self.photo_status_var.set(
-                        f"⚠️ Catalogue sauvegardé, mais JPG non modifié : {jpg_message}"
+                        f"⚠️ Sauvegardé dans Abisses ; synchronisation JPG impossible : {jpg_message}"
                     )
                     self.log(
-                        f"⚠️ Métadonnées catalogue OK, JPG non modifié pour {self.current_photo.get('filename')} : {jpg_message}"
+                        f"⚠️ Métadonnées Abisses conservées, JPG non synchronisé pour "
+                        f"{saved_filename} : {jpg_message}"
                     )
+
+                if leaves_current_filter:
+                    self.apply_photo_filter_v72(center_map=False)
 
         except Exception as e:
             if not silent:
                 messagebox.showerror("Erreur", str(e))
-            self.log(f"❌ Erreur sauvegarde métadonnées : {e}")
+            self.log(f"❌ Erreur sauvegarde métadonnées photo : {e}")
 
     def discard_current_photo(self):
         """
@@ -27787,10 +28876,25 @@ namespace GestionBissesFolderPicker
                 p for p in self.geolocated_photos
                 if p.get("catalog_index") != catalog_index
             ]
+            self.photo_all_geolocated_photos = [
+                p for p in getattr(self, "photo_all_geolocated_photos", [])
+                if p.get("catalog_index") != catalog_index
+            ]
+            self.refresh_photo_filter_menu_v72()
+            self.refresh_photo_cleanup_menu_v72()
 
             self.current_photo = None
 
             if not self.geolocated_photos:
+                if self.photo_all_geolocated_photos:
+                    # Le filtre courant peut simplement être devenu vide ; les
+                    # autres photos du bisse restent dans l'atelier.
+                    self.apply_photo_filter_v72(center_map=False)
+                    self.photo_status_var.set(
+                        f"🗑️ Photo écartée : {filename}. "
+                        f"Aucune autre photo pour le filtre « {self.photo_filter_label_v72()} »."
+                    )
+                    return
                 messagebox.showinfo(
                     "Tri terminé",
                     "Il n'y a plus de photos géolocalisées à afficher."
