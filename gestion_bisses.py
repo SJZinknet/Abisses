@@ -44,6 +44,7 @@ pillow_heif.register_heif_opener()
 APP_VERSION = get_current_version()
 
 # v74 — sécurité atelier Photos : identité, édition, navigation et journal. Moteur EXIF v73 conservé.
+# v75 — catégories de segments portables, intégration additive et référentiel NAS rafraîchi.
 
 
 # v65 — moteur de rendu local utilisé uniquement dans le dossier temporaire de prévisualisation.
@@ -59,7 +60,7 @@ BISSES_RENDER_README = "# Bisses\n\nPlateforme statique GitHub Pages pour l’in
 class BisseManagerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Abisses - v74")
+        self.root.title("Abisses - v75")
         self.configure_application_icon()
         self.configure_main_window_geometry()
 
@@ -1352,6 +1353,7 @@ class BisseManagerApp:
             self.app_data_folder,
             "segment_categories.json"
         )
+        self.global_segment_categories = []
 
         if persist:
             settings = self.read_local_settings()
@@ -1782,7 +1784,7 @@ class BisseManagerApp:
             "pid": os.getpid(),
             "acquired_at": now,
             "heartbeat_at": now,
-            "app_version": "v74",
+            "app_version": "v75",
         }
 
     def try_create_bisse_lock(self, folder, lock_key=None):
@@ -3913,6 +3915,8 @@ class BisseManagerApp:
             normalized["scope"] = record.get("scope")
         if record.get("needs_integration"):
             normalized["needs_integration"] = True
+        if record.get("portable_v75"):
+            normalized["portable_v75"] = True
 
         return normalized
 
@@ -3966,49 +3970,63 @@ class BisseManagerApp:
         return copy.deepcopy(categories)
 
     def write_global_segment_categories(self, categories, create_backup=True):
-        normalized = []
-        seen = set()
-
-        for index, raw in enumerate(categories or [], start=1):
-            category = self.normalize_segment_category_record(raw, index * 10)
-            if category["id"] in seen:
-                continue
-            seen.add(category["id"])
-            normalized.append(category)
-
-        if "non_classe" not in seen:
-            normalized.insert(0, self.default_global_segment_categories()[0])
-
-        # « Non classé » est structurel : toujours actif et protégé.
-        for category in normalized:
-            if category.get("id") == "non_classe":
-                category["active"] = True
-                category["system"] = True
-
-        normalized.sort(key=lambda c: (int(c.get("order", 9999)), c.get("label", "").lower()))
-
-        if create_backup and os.path.exists(self.segment_categories_file):
-            backup_dir = os.path.join(self.app_data_folder, "segment_categories_backups")
-            os.makedirs(backup_dir, exist_ok=True)
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            shutil.copy2(
-                self.segment_categories_file,
-                os.path.join(backup_dir, f"segment_categories_{stamp}.json")
-            )
-
-        payload = {
-            "schema_version": "1.0",
-            "updated_at": datetime.now().isoformat(timespec="seconds"),
-            "categories": normalized
-        }
-
+        # v75 : applique uniquement les différences voulues par ce poste. Une
+        # catégorie intégrée entre la lecture et la sauvegarde ne doit pas disparaître.
+        def normalized_map(records):
+            result = {}
+            for index, raw in enumerate(records or [], start=1):
+                record = self.normalize_segment_category_record(raw, index * 10)
+                for key in ("scope", "needs_integration", "portable_v75"):
+                    record.pop(key, None)
+                result.setdefault(record["id"], record)
+            return result
+        baseline = normalized_map(self.global_segment_categories)
+        desired = normalized_map(categories)
+        if "non_classe" not in desired:
+            desired["non_classe"] = self.default_global_segment_categories()[0]
+        desired["non_classe"]["active"] = True
+        desired["non_classe"]["system"] = True
         os.makedirs(os.path.dirname(self.segment_categories_file), exist_ok=True)
         lock = self.short_data_lock_acquire("segment_categories")
         try:
-            self.atomic_write_shared_json(self.segment_categories_file, payload, indent=4)
+            if os.path.exists(self.segment_categories_file):
+                payload = self._read_segment_category_payload_v75()
+                if not create_backup and not baseline:
+                    # Initialisation concurrente : le premier fichier créé fait foi.
+                    self.read_global_segment_categories(force_reload=True)
+                    return
+            else:
+                if create_backup and baseline:
+                    raise RuntimeError("Référentiel disparu : écriture annulée.")
+                payload = {"schema_version": "1.0", "categories": []}
+            current = normalized_map(payload["categories"])
+            raw_current = {r["id"]: r for r in payload["categories"]}
+            for key in sorted(set(baseline) | set(desired)):
+                old, new = baseline.get(key), desired.get(key)
+                if old == new:
+                    continue
+                if current.get(key) != old and current.get(key) != new:
+                    raise RuntimeError(f"Catégorie {key} modifiée sur un autre poste ; actualisez le référentiel.")
+                if new is None:
+                    raw_current.pop(key, None)
+                else:
+                    raw_current[key] = {**raw_current.get(key, {}), **new}
+                    for marker in ("scope", "needs_integration", "portable_v75"):
+                        raw_current[key].pop(marker, None)
+            if "non_classe" not in raw_current:
+                raw_current["non_classe"] = desired["non_classe"]
+            raw_current["non_classe"]["active"] = True
+            raw_current["non_classe"]["system"] = True
+            normalized = sorted(raw_current.values(), key=lambda r: (self.normalize_segment_category_record(r)["order"], str(r.get("label") or r["id"]).lower()))
+            if normalized != payload["categories"] or not os.path.exists(self.segment_categories_file):
+                if create_backup:
+                    self._backup_segment_categories_v75()
+                payload["categories"] = normalized
+                payload["updated_at"] = datetime.now().isoformat(timespec="seconds")
+                self.atomic_write_shared_json(self.segment_categories_file, payload, indent=4)
+            self.read_global_segment_categories(force_reload=True)
         finally:
             self.short_data_lock_release(lock)
-        self.global_segment_categories = normalized
 
     def get_global_segment_category_by_id(self, category_id):
         for category in self.read_global_segment_categories():
@@ -4032,6 +4050,184 @@ class BisseManagerApp:
 
         return result
 
+    # v75 — Un dossier de bisse transporte les définitions de ses catégories.
+    def _read_segment_category_payload_v75(self):
+        """Lecture stricte pour toute opération susceptible d'écrire le référentiel."""
+        with open(self.segment_categories_file, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if not isinstance(payload, dict) or not isinstance(payload.get("categories"), list):
+            raise ValueError("Référentiel des catégories invalide.")
+        ids = set()
+        for record in payload["categories"]:
+            if not isinstance(record, dict) or not isinstance(record.get("id"), str):
+                raise ValueError("Définition de catégorie invalide.")
+            key = record["id"]
+            if not key or key != key.strip() or key in ids:
+                raise ValueError("Identifiant de catégorie absent ou en double.")
+            ids.add(key)
+        return payload
+
+    def _used_segment_category_ids_v75(self, container):
+        """Inclut catégories principales, bicolores et anciens GPX exportés."""
+        ids = set()
+        if not isinstance(container, dict):
+            return ids
+        def add(value):
+            if isinstance(value, str) and value.strip():
+                ids.add(value.strip())
+        workshop = container.get("gpx_workshop") or {}
+        for segment in workshop.get("segments", []) or []:
+            if not isinstance(segment, dict):
+                continue
+            add(segment.get("category_id", "non_classe"))
+            bicolor = segment.get("bicolor_categories")
+            if isinstance(bicolor, list):
+                for value in bicolor[:2]:
+                    add(value)
+        for record in (container.get("gpx_traces") or {}).get("manual_segments", []) or []:
+            if isinstance(record, dict):
+                add(record.get("category"))
+        return ids
+
+    def _snapshot_used_segment_categories_v75(self, container, global_records):
+        """Actualise les copies portables, sans toucher aux segments ni aux anciennes définitions."""
+        workshop = container.get("gpx_workshop")
+        if not isinstance(workshop, dict):
+            return False
+        original = workshop.get("categories", [])
+        if not isinstance(original, list):
+            return False
+        used = self._used_segment_category_ids_v75(container)
+        if not used and not any(isinstance(r, dict) and r.get("portable_v75") for r in original):
+            return False
+        global_by_id = {r["id"]: r for r in global_records}
+        updated = []
+        seen = set()
+        for raw in original:
+            if not isinstance(raw, dict):
+                updated.append(raw)
+                continue
+            key = raw.get("id")
+            if raw.get("portable_v75") and key not in used:
+                # Seules les copies ajoutées par v75 sont élaguées, jamais le fonds historique.
+                continue
+            if key in used and key in global_by_id:
+                record = copy.deepcopy(raw)
+                definition = self.normalize_segment_category_record(global_by_id[key])
+                definition.pop("scope", None)
+                definition.pop("needs_integration", None)
+                record.update(definition)
+                record.pop("scope", None)
+                record.pop("needs_integration", None)
+                updated.append(record)
+            else:
+                updated.append(raw)
+            if isinstance(key, str):
+                seen.add(key)
+        for key in sorted(used - seen):
+            if key not in global_by_id:
+                continue
+            record = self.normalize_segment_category_record(global_by_id[key])
+            record.pop("scope", None)
+            record.pop("needs_integration", None)
+            record["portable_v75"] = True
+            updated.append(record)
+        if updated == original:
+            return False
+        workshop["categories"] = updated
+        return True
+
+    def _refresh_and_integrate_segment_categories_v75(self, container, allow_write=True):
+        """Au changement de bisse, recharge et ajoute uniquement les définitions utilisées inconnues.
+
+        Lecture, fusion, sauvegarde et remplacement sont sérialisés sur le même verrou NAS.
+        Une consultation en lecture seule ne modifie aucun fichier.
+        """
+        used = self._used_segment_category_ids_v75(container)
+        local = {}
+        workshop = (container.get("gpx_workshop") or {}) if isinstance(container, dict) else {}
+        for raw in workshop.get("categories", []) or []:
+            if not isinstance(raw, dict):
+                continue
+            key = raw.get("id")
+            if not isinstance(key, str) or key not in used or key in local:
+                continue
+            # Ne pas inventer une définition à partir d'un simple identifiant.
+            if not (raw.get("label") or raw.get("name")) or not re.fullmatch(r"#[0-9A-Fa-f]{6}", str(raw.get("color") or "")):
+                continue
+            local[key] = raw
+        guard = None
+        added = []
+        notes = []
+        try:
+            payload = self._read_segment_category_payload_v75()
+            missing = set(local) - {r["id"] for r in payload["categories"]}
+            if allow_write and missing:
+                guard = self.short_data_lock_acquire("segment_categories")
+                # Ne jamais fusionner une ancienne version mise en cache.
+                payload = self._read_segment_category_payload_v75()
+                records = payload["categories"]
+                known = {r["id"] for r in records}
+                labels = {str(r.get("label") or r.get("name") or r["id"]).strip().casefold() for r in records}
+                for key in sorted(set(local) - known):
+                    record = self.normalize_segment_category_record(local[key])
+                    record.pop("scope", None)
+                    record.pop("needs_integration", None)
+                    record.pop("portable_v75", None)
+                    record["system"] = False
+                    # Les menus actuels identifient les catégories par leur libellé.
+                    # Deux identifiants distincts ne doivent pas devenir indiscernables.
+                    label = record["label"]
+                    if label.casefold() in labels:
+                        candidate = f"{label} [{key}]"
+                        number = 2
+                        while candidate.casefold() in labels:
+                            candidate = f"{label} [{key}] ({number})"
+                            number += 1
+                        record["label"] = candidate
+                        notes.append(f"Libellé déjà utilisé : {label} → {candidate} (identifiants distincts conservés).")
+                    labels.add(record["label"].casefold())
+                    records.append(record)
+                    added.append(record["label"])
+                if added:
+                    self._backup_segment_categories_v75()
+                    payload["updated_at"] = datetime.now().isoformat(timespec="seconds")
+                    self.atomic_write_shared_json(self.segment_categories_file, payload, indent=4)
+            # Recharger même sans import : l'autre poste a pu modifier le référentiel.
+            self.read_global_segment_categories(force_reload=True)
+        except Exception as exc:
+            self.log(f"⚠️ Catégories : intégration/rafraîchissement différé : {exc}")
+            return False
+        finally:
+            if guard:
+                self.short_data_lock_release(guard)
+        if added:
+            self.log("📦 Catégories intégrées au référentiel global : " + ", ".join(added))
+        for note in notes:
+            self.log(f"ℹ️ {note}")
+        known = {r["id"] for r in payload["categories"]}
+        unresolved = used - known - set(local)
+        if unresolved:
+            self.log("⚠️ Catégories sans définition disponible (identifiants conservés) : " + ", ".join(sorted(unresolved)))
+        return True
+
+    def _backup_segment_categories_v75(self):
+        if not os.path.exists(self.segment_categories_file):
+            return
+        backup_dir = os.path.join(self.app_data_folder, "segment_categories_backups")
+        os.makedirs(backup_dir, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        shutil.copy2(self.segment_categories_file, os.path.join(backup_dir, f"segment_categories_{stamp}.json"))
+
+    def _snapshot_segment_categories_for_save_v75(self, container):
+        """Une panne du référentiel ne doit pas bloquer les autres sauvegardes du bisse."""
+        try:
+            payload = self._read_segment_category_payload_v75()
+            return self._snapshot_used_segment_categories_v75(container, payload["categories"])
+        except Exception as exc:
+            self.log(f"⚠️ Copies portables des catégories non actualisées : {exc}")
+            return False
+
     def get_effective_gpx_categories(self, container=None, include_inactive=True, include_local=True):
         """
         Fusionne le référentiel global et les anciennes catégories locales.
@@ -4044,7 +4240,7 @@ class BisseManagerApp:
         local_categories = self.get_local_segment_categories_from_container(container)
 
         result = []
-        global_ids = set()
+        global_ids = {category.get("id") for category in global_categories}
 
         for category in global_categories:
             if not include_inactive and not category.get("active", True):
@@ -4060,7 +4256,11 @@ class BisseManagerApp:
                 if local.get("id") in global_ids:
                     continue
                 local["scope"] = "local"
-                local["active"] = True
+                if local.get("portable_v75"):
+                    if not include_inactive and not local.get("active", True):
+                        continue
+                else:
+                    local["active"] = True
                 local["needs_integration"] = True
                 local["order"] = max(int(local.get("order", 1000)), 1000)
                 result.append(local)
@@ -5731,7 +5931,7 @@ class BisseManagerApp:
         return data, stats
 
     def build_global_categories_after_cleanup_plan(self, plan):
-        categories = self.read_global_segment_categories()
+        categories = self.read_global_segment_categories(force_reload=True)
         remove_ids = set()
 
         for source_id, action in plan.items():
@@ -5965,10 +6165,7 @@ class BisseManagerApp:
                     for key in aggregated_stats:
                         aggregated_stats[key] += int(stats.get(key, 0))
 
-            old_global = self.read_json_file_safe(
-                self.segment_categories_file,
-                {"schema_version": "1.0", "categories": []}
-            )
+            old_global = self._read_segment_category_payload_v75()
             new_global_categories, removed_global_ids = (
                 self.build_global_categories_after_cleanup_plan(
                     self.category_cleanup_plan
@@ -6025,10 +6222,16 @@ class BisseManagerApp:
             written_paths = []
             try:
                 for item in prepared_writes:
-                    self.category_cleanup_atomic_write_json(
-                        item["path"],
-                        item["data"]
-                    )
+                    if item["path"] == self.segment_categories_file:
+                        category_guard = self.short_data_lock_acquire("segment_categories")
+                        try:
+                            if self._read_segment_category_payload_v75() != old_global:
+                                raise RuntimeError("Référentiel modifié sur un autre poste pendant la migration ; relancez l'analyse.")
+                            self.category_cleanup_atomic_write_json(item["path"], item["data"])
+                        finally:
+                            self.short_data_lock_release(category_guard)
+                    else:
+                        self.category_cleanup_atomic_write_json(item["path"], item["data"])
                     written_paths.append(item["path"])
             except Exception:
                 # Retour automatique à l'état précédent pour tous les fichiers
@@ -7265,6 +7468,7 @@ class BisseManagerApp:
         self.catalog_container["gpx_workshop"].setdefault("sources", [])
         self.catalog_container["gpx_workshop"].setdefault("segments", [])
         self.catalog_container["gpx_workshop"].setdefault("last_export_at", None)
+        self._snapshot_segment_categories_for_save_v75(self.catalog_container)
 
         self.catalog_container.setdefault("external_resources", [])
         self.catalog_container.setdefault("inventory_info", self.empty_inventory_info())
@@ -12290,6 +12494,13 @@ namespace GestionBissesFolderPicker
                 # Le nouveau contexte ne devient propriétaire qu'après une ouverture réussie.
                 self.activate_bisse_access(folder, access)
 
+                # v75 : le bisse peut venir d'un autre Gestion_Bisses_Data.
+                self._refresh_and_integrate_segment_categories_v75(
+                    self.catalog_container,
+                    allow_write=(not self.read_only_mode and
+                                 self.catalogue_seems_compatible_with_folder(self.catalog_container, folder)),
+                )
+
                 if not self.read_only_mode:
                     try:
                         self.migrate_legacy_global_files_if_needed()
@@ -14902,6 +15113,15 @@ namespace GestionBissesFolderPicker
             progress_callback=progress,
             log_callback=None,
         )
+        # v75 : les anciens bisses sont rendus portables à leur ouverture, même
+        # sans modification de photo ou de segment. Aucun changement en lecture seule.
+        try:
+            category_payload = self._read_segment_category_payload_v75()
+            category_changed = (self.catalogue_seems_compatible_with_folder(prepared, folder) and
+                                self._snapshot_used_segment_categories_v75(prepared, category_payload["categories"]))
+            changed = changed or category_changed
+        except Exception as exc:
+            summary.setdefault("error_messages", []).append(f"Catégories portables non actualisées : {exc}")
         if changed or not os.path.exists(catalog_path):
             guard = None
             try:
@@ -18391,7 +18611,7 @@ namespace GestionBissesFolderPicker
             include_inactive=True,
             include_local=True
         ):
-            if category.get("scope") == "global" and not category.get("active", True):
+            if not category.get("active", True):
                 continue
             label = category.get("label", category.get("id", ""))
             if label and label not in labels:
@@ -18529,6 +18749,11 @@ namespace GestionBissesFolderPicker
             self.ensure_catalog_file_exists()
             self.ensure_gpx_workshop_history_context()
             self.get_gpx_workshop_state()
+            self._refresh_and_integrate_segment_categories_v75(
+                self.catalog_container,
+                allow_write=(not self.read_only_mode and
+                             self.catalogue_seems_compatible_with_folder(self.catalog_container, self.base_folder)),
+            )
             self.gpx_workshop_photos = self.load_geolocated_photos()
         except Exception as e:
             messagebox.showerror("Erreur", f"Impossible d'ouvrir ou de créer le catalogue :\n{e}")
