@@ -43,7 +43,7 @@ pillow_heif.register_heif_opener()
 
 APP_VERSION = get_current_version()
 
-# v73 — moteur EXIF transactionnel commun : texte + GPS, GPS invalide assaini, catalogue prioritaire.
+# v74 — sécurité atelier Photos : identité, édition, navigation et journal. Moteur EXIF v73 conservé.
 
 
 # v65 — moteur de rendu local utilisé uniquement dans le dossier temporaire de prévisualisation.
@@ -59,7 +59,7 @@ BISSES_RENDER_README = "# Bisses\n\nPlateforme statique GitHub Pages pour l’in
 class BisseManagerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Abisses - v73")
+        self.root.title("Abisses - v74")
         self.configure_application_icon()
         self.configure_main_window_geometry()
 
@@ -172,6 +172,12 @@ class BisseManagerApp:
         self.photo_filter_button = None
         self.photo_cleanup_button = None
         self.current_photo = None
+        self._photo_busy_v74 = False
+        self._photo_editor_owner_v74 = None
+        self._photo_editor_baseline_v74 = None
+        self._photo_editor_ready_v74 = False
+        self._photo_editor_controls_v74 = []
+        self._photo_viewer_thread_v74 = None
 
         # Atelier Photos : les trois panneaux restent indépendants et peuvent
         # être affichés, masqués ou redimensionnés sans recharger les photos.
@@ -875,6 +881,8 @@ class BisseManagerApp:
 
     def close_application(self):
         """Ferme notamment le serveur, invalide les workers et nettoie la prévisualisation."""
+        if not self._photo_flush_before_leave_v74(allow_discard=True):
+            return
         try:
             self.release_active_bisse_lock()
         except Exception:
@@ -976,6 +984,10 @@ class BisseManagerApp:
             self._photo_workspace_open_activity_token = None
             self.end_activity(token, restore_status=False)
 
+        self._invalidate_photo_editor_v74()
+        self._photo_editor_controls_v74 = []
+        self.geolocated_photos = []
+        self.photo_all_geolocated_photos = []
         # Tout résultat d'image appartenant à l'écran précédent devient caduc.
         self._viewer_load_generation = getattr(self, "_viewer_load_generation", 0) + 1
 
@@ -1525,6 +1537,7 @@ class BisseManagerApp:
         self.active_bisse_lock = None
         self.cancel_bisse_lock_heartbeat()
         self.read_only_mode = True
+        self._invalidate_photo_editor_v74()
         self.read_only_lock_info = lock_info or {"host": "un autre poste"}
         try:
             self.show_contextual_interface(
@@ -1566,7 +1579,13 @@ class BisseManagerApp:
         ):
             return False
 
+        if self._photo_busy_v74:
+            return False
         try:
+            if not self._photo_flush_before_leave_v74():
+                raise RuntimeError("Édition photo non sauvegardée.")
+            if self.photo_workspace_paned is not None:
+                self.catalog_data = self.read_catalog()
             self.save_catalog()
         except Exception as exc:
             request["status"] = "save_error"
@@ -1763,7 +1782,7 @@ class BisseManagerApp:
             "pid": os.getpid(),
             "acquired_at": now,
             "heartbeat_at": now,
-            "app_version": "v73",
+            "app_version": "v74",
         }
 
     def try_create_bisse_lock(self, folder, lock_key=None):
@@ -1990,6 +2009,9 @@ class BisseManagerApp:
 
     def refresh_active_bisse_lock_heartbeat(self):
         self.bisse_lock_heartbeat_after_id = None
+        if getattr(self, "_photo_busy_v74", False):
+            self.bisse_lock_heartbeat_after_id = self.root.after(250, self.refresh_active_bisse_lock_heartbeat)
+            return
         info = self.active_bisse_lock
         if not isinstance(info, dict) or info.get("session_id") != self.multiuser_session_id:
             return
@@ -9609,6 +9631,8 @@ namespace GestionBissesFolderPicker
         doit être relié sur cet ordinateur.
         """
         # Retour à l'accueil = fin explicite de la session de modification du bisse.
+        if not self._photo_flush_before_leave_v74(allow_discard=True):
+            return
         try:
             self.release_active_bisse_lock()
         except Exception:
@@ -12210,6 +12234,8 @@ namespace GestionBissesFolderPicker
 
     def load_folder(self, folder):
         """Ouvre un bisse avec verrou multi-poste ; lecture seule en cas de conflit."""
+        if not self._photo_flush_before_leave_v74(allow_discard=True):
+            return
         if not folder:
             return
         folder = os.path.abspath(os.path.expanduser(folder))
@@ -12222,6 +12248,11 @@ namespace GestionBissesFolderPicker
             return
         read_only = access.get("mode") == "readonly"
 
+        self._invalidate_photo_editor_v74()
+        self.current_photo = None
+        self.geolocated_photos = []
+        self.photo_all_geolocated_photos = []
+        self._photo_workspace_load_generation += 1
         self._folder_open_generation += 1
         generation = self._folder_open_generation
 
@@ -18492,6 +18523,8 @@ namespace GestionBissesFolderPicker
         }
 
     def show_gpx_workshop(self):
+        if not self._photo_flush_before_leave_v74(allow_discard=True):
+            return
         try:
             self.ensure_catalog_file_exists()
             self.ensure_gpx_workshop_history_context()
@@ -25359,6 +25392,8 @@ namespace GestionBissesFolderPicker
                 "jpg_description": jpg_description,
                 "catalog_title": catalog_title,
                 "catalog_description": catalog_description,
+                "_catalog_edit_snapshot_v74": self._photo_catalog_snapshot_v74(entry),
+                "_photo_context_v74": (self._photo_path_v74(self.base_folder), self._photo_path_v74(self.catalog_path)),
                 "title_managed_by_abisses": title_managed,
                 "description_managed_by_abisses": description_managed,
                 "ignore_jpg_description": ignore_jpg_description,
@@ -25529,6 +25564,8 @@ namespace GestionBissesFolderPicker
         choix du dossier, catalogue, GPS, géolocalisation, ordre puis renommage.
         La visionneuse reste ainsi centrée sur l'édition des métadonnées.
         """
+        if not self._photo_flush_before_leave_v74():
+            return
         if not self.base_folder:
             messagebox.showwarning("Aucun dossier", "Ouvrez d'abord un dossier bisse.")
             return
@@ -25549,6 +25586,7 @@ namespace GestionBissesFolderPicker
         window.geometry("520x470")
         window.minsize(460, 360)
         window.transient(self.root)
+        window.grab_set()
 
         frame = tk.Frame(window, padx=14, pady=12)
         frame.pack(fill="both", expand=True)
@@ -25581,13 +25619,35 @@ namespace GestionBissesFolderPicker
         actions.grid(row=2, column=0, sticky="ew")
         actions.grid_columnconfigure(0, weight=1)
 
+        preparation_context = (self._photo_path_v74(self.base_folder), self._photo_path_v74(self.catalog_path))
+
         def close_then(callback):
             def wrapped():
+                if preparation_context != (self._photo_path_v74(self.base_folder), self._photo_path_v74(self.catalog_path)):
+                    window.destroy()
+                    return
+                if not self._photo_flush_before_leave_v74():
+                    return
+                # Les commandes de préparation peuvent modifier le catalogue ou renommer les JPG.
+                # Interdire la réutilisation d'un éditeur/corpus antérieur à ces opérations.
+                old_workspace = self.photo_workspace_paned
+                self._invalidate_photo_editor_v74()
+                self.current_photo = None
+                self.geolocated_photos = []
+                self.photo_all_geolocated_photos = []
                 try:
                     window.destroy()
                 except Exception:
                     pass
-                callback()
+                try:
+                    callback()
+                finally:
+                    # Certaines commandes (écriture GPS, annulation) restent
+                    # dans Photos. Recharger alors le corpus, jamais son cache.
+                    if (old_workspace is not None and self.photo_workspace_paned is old_workspace
+                            and not getattr(self, "_folder_open_activity_token", None)
+                            and preparation_context == (self._photo_path_v74(self.base_folder), self._photo_path_v74(self.catalog_path))):
+                        self.show_map_interface()
             return wrapped
 
         tk.Button(
@@ -25670,18 +25730,26 @@ namespace GestionBissesFolderPicker
 
     def show_map_interface(self):
         """Ouvre Photos sans bloquer Tk pendant les lectures lentes du stockage."""
-        if self._photo_workspace_loading:
+        if self._photo_workspace_loading or self._photo_busy_v74 or getattr(self, "_folder_open_activity_token", None) is not None:
             return
+        if not self._photo_flush_before_leave_v74(allow_discard=True):
+            return
+        self._invalidate_photo_editor_v74()
+        self.current_photo = None
+        self.geolocated_photos = []
+        self.photo_all_geolocated_photos = []
         self._photo_workspace_loading = True
         self._photo_workspace_load_generation += 1
         generation = self._photo_workspace_load_generation
+        context = (self._photo_path_v74(self.base_folder), self._photo_path_v74(self.catalog_path))
+        reader = copy.copy(self)  # lecture disque isolée ; aucune modification de l'état actif dans le worker
 
         def worker(report):
             report("Lecture du catalogue et des métadonnées photo…")
-            return self.load_geolocated_photos(log_errors=False)
+            return reader.load_geolocated_photos(log_errors=False)
 
         def success(photos, token):
-            if generation != self._photo_workspace_load_generation:
+            if generation != self._photo_workspace_load_generation or context != (self._photo_path_v74(self.base_folder), self._photo_path_v74(self.catalog_path)):
                 self._photo_workspace_loading = False
                 self.end_activity(token, restore_status=True)
                 return
@@ -25736,13 +25804,13 @@ namespace GestionBissesFolderPicker
             pass
 
     def _show_map_interface_ready(self, photos):
+        self.clear_main_frame()
         self.photo_all_geolocated_photos = list(photos)
         self.geolocated_photos = list(photos)
         self.photo_filter_mode = "all"
         self.current_photo = None
         self.gpx_workshop_active = False
 
-        self.clear_main_frame()
         self.status_header.config(text="Photos", fg="#2980b9")
 
         toolbar = tk.Frame(self.main_frame)
@@ -26017,6 +26085,7 @@ namespace GestionBissesFolderPicker
         )
 
     def clear_photo_display_v72(self):
+        self._invalidate_photo_editor_v74()
         self.current_photo = None
         self.photo_index_var.set("Photo 0 / 0")
         self.photo_filename_var.set("")
@@ -26029,9 +26098,12 @@ namespace GestionBissesFolderPicker
         except Exception:
             pass
         if self.photo_title_entry is not None:
+            self.photo_title_entry.config(state="normal")
             self.photo_title_entry.delete(0, tk.END)
         if self.photo_desc_text is not None:
+            self.photo_desc_text.config(state="normal")
             self.photo_desc_text.delete("1.0", tk.END)
+        self._set_photo_editor_enabled_v74(False)
         self.platform_selected_var.set(False)
         self.platform_order_var.set(0)
         if self.viewer_canvas is not None:
@@ -26068,35 +26140,32 @@ namespace GestionBissesFolderPicker
                 (p for p in filtered if p.get("catalog_index") == preferred_catalog_index),
                 None
             )
-        if target is None and old_current in filtered:
+        if target is None and any(p is old_current for p in filtered):
             target = old_current
         if target is None:
             target = filtered[0]
 
         if target is old_current:
-            index = filtered.index(target) + 1
+            index = next(i for i, p in enumerate(filtered, 1) if p is target)
             self.photo_index_var.set(f"Photo {index} / {len(filtered)}")
             self.refresh_map_markers()
         else:
-            self.select_photo_on_map(target, center_map=center_map)
+            self._select_photo_v74(target, center_map=center_map, flush=False)
 
     def set_photo_filter_v72(self, mode):
-        valid_modes = {key for key, _label in self.photo_filter_definitions_v72()}
-        if mode not in valid_modes:
-            mode = "all"
-
-        # Un changement de filtre ne doit jamais faire perdre un texte saisi.
-        current_index = None
-        if self.current_photo is not None:
-            current_index = self.current_photo.get("catalog_index")
-            if self.photo_title_entry is not None and not getattr(self, "read_only_mode", False):
-                self.save_current_photo_metadata(silent=True)
-
-        self.photo_filter_mode = mode
-        self.apply_photo_filter_v72(
-            preferred_catalog_index=current_index,
-            center_map=False
-        )
+        if self._photo_busy_v74:
+            return
+        self._photo_busy_v74 = True
+        try:
+            if not self._save_photo_editor_v74(silent=True):
+                return
+            if mode not in dict(self.photo_filter_definitions_v72()):
+                mode = "all"
+            current_index = self.current_photo.get("catalog_index") if self.current_photo else None
+            self.photo_filter_mode = mode
+            self.apply_photo_filter_v72(preferred_catalog_index=current_index, center_map=False)
+        finally:
+            self._photo_busy_v74 = False
 
     def refresh_photo_cleanup_menu_v72(self):
         button = getattr(self, "photo_cleanup_button", None)
@@ -26790,6 +26859,9 @@ namespace GestionBissesFolderPicker
                         "catalog_index": photo.get("catalog_index"),
                         "image_path": photo.get("image_path", ""),
                         "filename": photo.get("filename", ""),
+                        "identity_v74": self._photo_identity_v74(photo),
+                        "snapshot_v74": photo.get("_catalog_edit_snapshot_v74"),
+                        "file_stamp_v74": self._photo_file_stamp_v74(photo.get("image_path", "")),
                     })
             return targets
 
@@ -26815,10 +26887,22 @@ namespace GestionBissesFolderPicker
                 "catalog_index": index,
                 "image_path": image_path,
                 "filename": os.path.basename(image_path) if image_path else entry.get("original_filename", ""),
+                "identity_v74": self._photo_identity_v74({"original_filename": entry.get("original_filename"), "image_path": image_path}),
+                "snapshot_v74": self._photo_catalog_snapshot_v74(entry),
+                "file_stamp_v74": self._photo_file_stamp_v74(image_path),
             })
         return targets
 
     def clean_photo_descriptions_v72(self, scope="filter"):
+        if self._photo_busy_v74:
+            return
+        self._photo_busy_v74 = True
+        try:
+            return self._clean_photo_descriptions_v74(scope)
+        finally:
+            self._photo_busy_v74 = False
+
+    def _clean_photo_descriptions_v74(self, scope="filter"):
         if getattr(self, "read_only_mode", False):
             messagebox.showwarning(
                 "Lecture seule",
@@ -26826,8 +26910,8 @@ namespace GestionBissesFolderPicker
             )
             return
 
-        if self.current_photo is not None and self.photo_title_entry is not None:
-            self.save_current_photo_metadata(silent=True)
+        if not self._save_photo_editor_v74(silent=True):
+            return
 
         try:
             targets = self.photo_description_cleanup_targets_v72(scope)
@@ -26860,129 +26944,111 @@ namespace GestionBissesFolderPicker
         ):
             return
 
+        preferred_identity = self._photo_identity_v74(self.current_photo)
+        preferred_index = self.current_photo.get("catalog_index") if self.current_photo else None
         token = self.begin_activity("Nettoyage des descriptions…", delay_ms=0)
         guard = None
-        changed_indices = set()
+        planned = []
         failures = []
         try:
-            # Un seul garde protège la série complète. Son horodatage est rafraîchi
-            # pendant la boucle afin qu'un autre poste ne le considère jamais périmé.
             guard = self.acquire_active_bisse_write_guard_v71()
+            if not guard:
+                raise RuntimeError("Verrou de modification indisponible. Rouvrez le bisse.")
             self.catalog_data = self.read_catalog()
-            total = len(targets)
-            for position, target in enumerate(targets, start=1):
-                if guard:
-                    try:
-                        os.utime(guard, None)
-                    except Exception:
-                        pass
-
-                catalog_index = target.get("catalog_index")
-                if catalog_index is None or catalog_index >= len(self.catalog_data):
-                    failures.append(target.get("filename") or "photo inconnue")
-                    continue
-
-                entry = self.catalog_data[catalog_index]
-                image_path = target.get("image_path") or self.get_entry_image_path(entry)
-                # Toujours demander l'effacement physique pour une cible de nettoyage,
-                # y compris les états v72a/v72b où la description JPG avait été
-                # masquée dans Abisses. Le moteur v73 vérifie lui-même le résultat.
-                gps_payload = self._catalog_gps_payload_v73(entry)
-                ok, cleanup_message = self.clear_description_metadata_from_jpg_v72(
-                    image_path,
-                    gps_coords=gps_payload,
-                    gps_datetime=entry.get("date_taken"),
-                )
-                verify = self.read_text_metadata_from_jpg(image_path) if image_path else {"ok": False}
-                jpg_description_still_present = bool(
-                    (not ok)
-                    or (not verify.get("ok"))
-                    or str(verify.get("description") or "").strip()
-                )
-                if jpg_description_still_present:
-                    filename = target.get("filename") or os.path.basename(image_path or "")
-                    failures.append(f"{filename} — {cleanup_message}")
-                    self.log(f"⚠️ Description JPG non effacée : {filename} — {cleanup_message}")
-                else:
-                    self.log(
-                        f"🧹 Description supprimée des métadonnées JPG : "
-                        f"{target.get('filename') or os.path.basename(image_path or '')} "
-                        f"({cleanup_message})"
-                    )
-
-                # L'intention utilisateur prime : même si le JPG ne peut pas être
-                # réécrit, la description disparaît d'Abisses. Dans ce cas on
-                # mémorise explicitement que sa valeur EXIF résiduelle doit être
-                # ignorée lors des lectures futures.
+            # Valider l'ensemble AVANT de toucher au catalogue ou aux JPG.
+            for target in targets:
+                identity = target["identity_v74"]
+                index, entry = self._photo_resolve_entry_v74(self.catalog_data, identity)
+                if self._photo_catalog_snapshot_v74(entry) != target["snapshot_v74"]:
+                    raise RuntimeError(f"Catalogue modifié depuis l'affichage : {target['filename']}. Rouvrez Photos.")
+                if self._photo_file_stamp_v74(identity[3]) != target["file_stamp_v74"]:
+                    raise RuntimeError(f"JPG modifié pendant la confirmation : {target['filename']}.")
+                if any(item[0] == identity for item in planned):
+                    raise RuntimeError("Photo cible en double dans le catalogue.")
+                operation_id = uuid.uuid4().hex
+                planned.append((identity, index, entry, operation_id))
+            for identity, index, entry, operation_id in planned:
+                self._photo_audit_v74(identity, operation_id, "intent", "nettoyage collectif",
+                                      changes={"description": {"before": entry.get("description"), "after": ""}})
+            self._invalidate_photo_editor_v74()
+            self.current_photo = None
+            for identity, index, entry, operation_id in planned:
                 entry["description"] = ""
                 entry["description_managed_by_abisses"] = True
-                if jpg_description_still_present:
-                    entry["ignore_jpg_description"] = True
-                    entry["text_metadata_synced_to_jpg"] = False
-                    entry["text_metadata_sync_error"] = cleanup_message
-                else:
+                entry["ignore_jpg_description"] = True
+                entry["text_metadata_synced_to_jpg"] = False
+                entry["text_metadata_sync_error"] = "Nettoyage JPG en attente"
+            self._save_catalog_payload_v71()
+            results = []
+            stamps = {target["identity_v74"]: target["file_stamp_v74"] for target in targets}
+            for position, (identity, index, entry, operation_id) in enumerate(planned, 1):
+                os.utime(guard, None)
+                try:
+                    if self._photo_file_stamp_v74(identity[3]) != stamps[identity]:
+                        raise RuntimeError("JPG remplacé pendant le nettoyage ; écriture bloquée.")
+                    ok, detail = self.clear_description_metadata_from_jpg_v72(
+                        identity[3], gps_coords=self._catalog_gps_payload_v73(entry),
+                        gps_datetime=entry.get("date_taken"))
+                    verify = self.read_text_metadata_from_jpg(identity[3])
+                    ok = bool(ok and verify.get("ok") and not str(verify.get("description") or "").strip())
+                except Exception as exc:
+                    ok, detail, verify = False, str(exc), {}
+                if ok:
                     entry.pop("ignore_jpg_description", None)
-                    entry["text_metadata_synced_to_jpg"] = True
-                    entry["text_metadata_synced_to_jpg_at"] = datetime.now().isoformat(timespec="seconds")
-                    entry.pop("text_metadata_sync_error", None)
-                changed_indices.add(catalog_index)
-                self.update_activity(
-                    token,
-                    f"Nettoyage des descriptions… {position}/{total}",
-                    value=(position / total) * 100
-                )
-                self.root.update_idletasks()
-
-            if changed_indices:
-                # Le garde est déjà détenu : éviter de le réacquérir via save_catalog().
-                self._save_catalog_payload_v71()
-
-            for photo in list(getattr(self, "photo_all_geolocated_photos", []) or []):
-                catalog_index = photo.get("catalog_index")
-                if catalog_index in changed_indices:
-                    entry = (
-                        self.catalog_data[catalog_index]
-                        if isinstance(catalog_index, int) and 0 <= catalog_index < len(self.catalog_data)
-                        else {}
-                    )
-                    ignored = bool(entry.get("ignore_jpg_description", False))
-                    photo["description"] = ""
-                    photo["jpg_description"] = ""
-                    photo["catalog_description"] = ""
-                    photo["description_managed_by_abisses"] = True
-                    photo["ignore_jpg_description"] = ignored
-                    photo["metadata_source"] = (
-                        "JPG (description ignorée)"
-                        if ignored and str(photo.get("jpg_title") or "").strip()
-                        else ("JPG" if str(photo.get("jpg_title") or "").strip() else "catalogue.json")
-                    )
-
-            preferred_index = self.current_photo.get("catalog_index") if self.current_photo else None
-            # Les champs visibles contiennent encore l'ancienne description.
-            # Neutraliser l'auto-sauvegarde de select_photo_on_map() avant de
-            # recharger la vue filtrée, sinon le texte effacé serait réécrit.
-            self.current_photo = None
-            self.apply_photo_filter_v72(
-                preferred_catalog_index=preferred_index,
-                center_map=False
-            )
-
+                    # Le nettoyage ne prouve pas que le titre est synchronisé.
+                    title_ok = str(verify.get("title") or "").strip() == str(entry.get("title") or "").strip()
+                    entry["text_metadata_synced_to_jpg"] = title_ok
+                    if title_ok:
+                        entry["text_metadata_synced_to_jpg_at"] = datetime.now().isoformat(timespec="seconds")
+                        entry.pop("text_metadata_sync_error", None)
+                    else:
+                        entry["text_metadata_sync_error"] = "Titre à synchroniser"
+                else:
+                    entry["text_metadata_sync_error"] = detail
+                    failures.append(f"{os.path.basename(identity[3])} — {detail}")
+                results.append((identity, operation_id, ok, detail))
+                self.update_activity(token, f"Nettoyage des descriptions… {position}/{len(planned)}",
+                                     value=(position / len(planned)) * 100)
+            self._save_catalog_payload_v71()
+            for identity, operation_id, ok, detail in results:
+                self._photo_audit_result_v74(identity, operation_id, "nettoyage collectif",
+                                              {"catalogue": True, "jpg": ok, "detail": detail})
+            # Reconcilier uniquement les objets qui ont la même identité, jamais un index ancien.
+            updated = {identity: (index, entry) for identity, index, entry, _ in planned}
+            if preferred_identity in updated:
+                preferred_index = updated[preferred_identity][0]
+            for photo in self.photo_all_geolocated_photos:
+                match = updated.get(self._photo_identity_v74(photo))
+                if match:
+                    index, entry = match
+                    photo.update(catalog_index=index, description="", jpg_description="", catalog_description="",
+                                 description_managed_by_abisses=True,
+                                 ignore_jpg_description=bool(entry.get("ignore_jpg_description")),
+                                 _catalog_edit_snapshot_v74=self._photo_catalog_snapshot_v74(entry),
+                                 metadata_source="catalogue.json")
+            if guard:
+                self.short_data_lock_release(guard)
+                guard = None
+            self.apply_photo_filter_v72(preferred_catalog_index=preferred_index, center_map=False)
             if failures:
-                messagebox.showwarning(
-                    "Descriptions effacées dans Abisses",
-                    f"{len(changed_indices)} description(s) effacée(s) dans Abisses.\n"
-                    f"{len(failures)} fichier(s) JPG n'ont pas pu être nettoyés physiquement ; "
-                    "leur ancienne description sera désormais ignorée par Abisses.\n\n"
-                    "Détail :\n" + "\n".join(failures[:8])
-                )
+                messagebox.showwarning("Descriptions effacées dans Abisses",
+                    f"{len(planned)} description(s) effacée(s) dans Abisses.\n"
+                    f"{len(failures)} JPG non synchronisé(s).\n" + "\n".join(failures[:8]))
             else:
-                messagebox.showinfo(
-                    "Nettoyer les descriptions",
-                    f"{len(changed_indices)} description(s) effacée(s)."
-                )
+                messagebox.showinfo("Nettoyer les descriptions", f"{len(planned)} description(s) effacée(s).")
         except Exception as exc:
-            messagebox.showerror("Nettoyage impossible", str(exc))
-            self.log(f"❌ Nettoyage descriptions v73 : {exc}")
+            self._invalidate_photo_editor_v74()
+            self.current_photo = None
+            self.geolocated_photos = []
+            self.photo_all_geolocated_photos = []
+            try:
+                self.catalog_data = self.read_catalog()
+                self.clear_photo_display_v72()
+                self.refresh_photo_filter_menu_v72()
+            except Exception:
+                pass
+            messagebox.showerror("Nettoyage interrompu", f"{exc}\nRouvrez l'atelier Photos.")
+            self.log(f"❌ Nettoyage descriptions v74 : {exc}")
         finally:
             if guard:
                 self.short_data_lock_release(guard)
@@ -27333,21 +27399,23 @@ namespace GestionBissesFolderPicker
         platform_frame.grid(row=4, column=0, sticky="ew", pady=(0, 8))
         platform_frame.grid_columnconfigure(1, weight=1)
 
-        tk.Checkbutton(
+        platform_check = tk.Checkbutton(
             platform_frame,
             text="⭐ Choisie",
             variable=self.platform_selected_var,
             bg="#f4f4f4"
-        ).grid(row=0, column=0, columnspan=2, sticky="w")
+        )
+        platform_check.grid(row=0, column=0, columnspan=2, sticky="w")
 
         tk.Label(platform_frame, text="Ordre :", bg="#f4f4f4").grid(row=1, column=0, sticky="w", pady=(4, 0))
-        tk.Spinbox(
+        platform_spin = tk.Spinbox(
             platform_frame,
             from_=0,
             to=999,
             textvariable=self.platform_order_var,
             width=6
-        ).grid(row=1, column=1, sticky="w", padx=(6, 0), pady=(4, 0))
+        )
+        platform_spin.grid(row=1, column=1, sticky="w", padx=(6, 0), pady=(4, 0))
 
         tk.Label(
             platform_frame,
@@ -27361,22 +27429,27 @@ namespace GestionBissesFolderPicker
         buttons.grid(row=3, column=0, sticky="ew", pady=(8, 0))
         buttons.grid_columnconfigure(0, weight=1)
 
-        tk.Button(
+        save_button = tk.Button(
             buttons,
             text="💾 Sauvegarder titre / description / plateforme",
             command=self.save_current_photo_metadata,
             bg="#27ae60",
             fg="white",
             height=2
-        ).grid(row=0, column=0, sticky="ew", pady=(0, 5))
+        )
+        save_button.grid(row=0, column=0, sticky="ew", pady=(0, 5))
 
-        tk.Button(
+        discard_button = tk.Button(
             buttons,
             text="🗑️ Écarter cette photo du corpus",
             command=self.discard_current_photo,
             bg="#c0392b",
             fg="white"
-        ).grid(row=1, column=0, sticky="ew", pady=3)
+        )
+        discard_button.grid(row=1, column=0, sticky="ew", pady=3)
+        self._photo_editor_controls_v74 = [self.photo_title_entry, self.photo_desc_text,
+                                            platform_check, platform_spin, save_button, discard_button]
+        self._set_photo_editor_enabled_v74(False)
 
         tk.Label(
             buttons,
@@ -28173,14 +28246,163 @@ namespace GestionBissesFolderPicker
 
         self.map_widget.set_zoom(zoom)
 
+    # V74 : l'éditeur possède une identité indépendante de la sélection cartographique.
+    def _photo_path_v74(self, path):
+        return os.path.normcase(os.path.realpath(os.path.abspath(path))) if path else ""
+
+    def _photo_identity_v74(self, photo):
+        if not photo:
+            return None
+        context = photo.get("_photo_context_v74") or (self._photo_path_v74(self.base_folder), self._photo_path_v74(self.catalog_path))
+        return (*context, str(photo.get("original_filename") or ""), self._photo_path_v74(photo.get("image_path")))
+
+    def _photo_file_stamp_v74(self, path):
+        try:
+            info = os.stat(path)
+            return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+        except OSError:
+            return None
+
+    def _photo_catalog_snapshot_v74(self, entry):
+        return {k: copy.deepcopy(entry.get(k)) for k in (
+            "title", "description", "platform_selected", "platform_order",
+            "title_managed_by_abisses", "description_managed_by_abisses", "ignore_jpg_description")}
+
+    def _photo_editor_values_v74(self):
+        return {"title": self.photo_title_entry.get(),
+                "description": self.photo_desc_text.get("1.0", "end-1c"),
+                "platform_selected": bool(self.platform_selected_var.get()),
+                "platform_order": int(self.platform_order_var.get())}
+
+    def _set_photo_editor_enabled_v74(self, enabled):
+        state = "normal" if enabled and not getattr(self, "read_only_mode", False) else "disabled"
+        for widget in getattr(self, "_photo_editor_controls_v74", []):
+            try:
+                widget.config(state=state)
+            except tk.TclError:
+                pass
+
+    def _invalidate_photo_editor_v74(self):
+        self._photo_editor_owner_v74 = None
+        self._photo_editor_baseline_v74 = None
+        self._photo_editor_ready_v74 = False
+        self._viewer_load_generation += 1
+        self._set_photo_editor_enabled_v74(False)
+
+    def _photo_resolve_entry_v74(self, catalogue, identity):
+        if not identity or identity[:2] != (self._photo_path_v74(self.base_folder), self._photo_path_v74(self.catalog_path)):
+            raise RuntimeError("Le contexte du bisse a changé. Rouvrez l'atelier Photos.")
+        folder, catalogue_path, original, image_path = identity
+        allowed_roots = [folder]
+        for candidate in (getattr(self, "photos_folder", ""), getattr(self, "manual_photos_folder", ""),
+                          getattr(self, "export_folder", "")):
+            if candidate:
+                allowed_roots.append(self._photo_path_v74(candidate))
+        def within(root):
+            try:
+                return os.path.commonpath([root, image_path]) == root
+            except ValueError:
+                return False
+        if not image_path or not any(within(root) for root in allowed_roots):
+            raise RuntimeError("Le chemin de la photo est hors des dossiers autorisés du bisse.")
+        if catalogue_path != self._photo_path_v74(os.path.join(self.base_folder, "catalogue.json")):
+            raise RuntimeError("Le catalogue actif ne correspond pas au bisse.")
+        matches = [(i, e) for i, e in enumerate(catalogue) if isinstance(e, dict)
+                   and e.get("status") == "OK" and self._photo_path_v74(self.get_entry_image_path(e)) == image_path]
+        if len(matches) != 1 or str(matches[0][1].get("original_filename") or "") != original:
+            raise RuntimeError("Identité de la photo introuvable ou ambiguë. Rouvrez l'atelier Photos.")
+        return matches[0]
+
+    def _photo_audit_v74(self, identity, operation_id, phase, origin, changes=None, result=None):
+        # Journal append-only dans le dossier du bisse ; aucun journal de simple navigation.
+        record = {"at": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+                  "operation_id": operation_id, "phase": phase, "origin": origin,
+                  "host": socket.gethostname(), "bisse": identity[0],
+                  "original_filename": identity[2], "image_path": identity[3]}
+        if changes is not None:
+            record["changes"] = changes
+        if result is not None:
+            record["result"] = result
+        with open(os.path.join(identity[0], "photo_metadata_history.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+
+    def _photo_audit_result_v74(self, identity, operation_id, origin, result):
+        try:
+            self._photo_audit_v74(identity, operation_id, "result", origin, result=result)
+        except Exception as exc:
+            self.log(f"⚠️ Journal métadonnées incomplet : {exc}")
+
+    def _photo_flush_before_leave_v74(self, allow_discard=False):
+        if getattr(self, "_photo_busy_v74", False):
+            return False
+        if self.current_photo is None or not getattr(self, "_photo_editor_ready_v74", False):
+            return True
+        if self.save_current_photo_metadata(silent=True):
+            return True
+        if not allow_discard:
+            return False
+        # Seulement en cas d'échec réel : ne pas piéger l'utilisateur dans un
+        # écran périmé. Il peut rester pour copier/corriger son brouillon.
+        self._photo_busy_v74 = True
+        try:
+            if not messagebox.askyesno("Modifications non sauvegardées",
+                    "La sauvegarde a été bloquée par sécurité.\n\n"
+                    "Quitter cet écran sans les modifications encore non enregistrées ?\n"
+                    "Choisissez Non pour conserver le brouillon affiché."):
+                return False
+            self._invalidate_photo_editor_v74()
+            self.current_photo = None
+            return True
+        finally:
+            self._photo_busy_v74 = False
+
     def select_photo_on_map(self, photo, center_map=True):
-        if self.current_photo is not None and self.photo_title_entry is not None:
-            self.save_current_photo_metadata(silent=True)
+        if getattr(self, "_photo_busy_v74", False):
+            return False
+        self._photo_busy_v74 = True
+        try:
+            return self._select_photo_v74(photo, center_map)
+        finally:
+            self._photo_busy_v74 = False
 
-        self.current_photo = photo
-        self.refresh_map_markers()
+    def _select_photo_v74(self, photo, center_map=True, flush=True):
+        # Refuser les marqueurs périmés, y compris un ancien objet du même index.
+        if getattr(self, "_folder_open_activity_token", None) is not None:
+            return False
+        if not any(candidate is photo for candidate in self.geolocated_photos):
+            return False
+        if self._photo_identity_v74(photo)[:2] != (self._photo_path_v74(self.base_folder), self._photo_path_v74(self.catalog_path)):
+            return False
+        if flush and not self._save_photo_editor_v74(silent=True):
+            return False
+        if not any(candidate is photo for candidate in self.geolocated_photos):
+            return False
+        self._invalidate_photo_editor_v74()
+        self.current_photo = None
+        try:
+            if self.viewer_canvas is not None:
+                self.viewer_canvas.delete("all")
+            self.viewer_original_image = None
+            self.viewer_display_image = None
+            self.viewer_image_on_canvas = None
+            self.current_photo = photo
+            self._populate_photo_editor_v74(photo, center_map)
+            return True
+        except Exception as exc:
+            self._invalidate_photo_editor_v74()
+            self.current_photo = None
+            try:
+                self.clear_photo_display_v72()
+            except Exception:
+                pass
+            self.photo_status_var.set(f"Affichage interrompu : {exc}. Resélectionnez la photo sur la carte.")
+            self.log(f"⚠️ Transition Photos annulée : {exc}")
+            return False
 
-        current_index = self.geolocated_photos.index(photo) + 1
+    def _populate_photo_editor_v74(self, photo, center_map):
+        current_index = next(i for i, p in enumerate(self.geolocated_photos, 1) if p is photo)
         total = len(self.geolocated_photos)
 
         filename = photo.get("filename", "")
@@ -28244,6 +28466,8 @@ namespace GestionBissesFolderPicker
                     pass
             self.photo_technical_summary_var.set(" · ".join(summary_parts))
 
+        self.photo_title_entry.config(state="normal")
+        self.photo_desc_text.config(state="normal")
         self.photo_title_entry.delete(0, tk.END)
         self.photo_title_entry.insert(0, title)
 
@@ -28256,15 +28480,25 @@ namespace GestionBissesFolderPicker
         except Exception:
             self.platform_order_var.set(0)
 
+        self._photo_editor_baseline_v74 = self._photo_editor_values_v74()
+        self._photo_editor_owner_v74 = self._photo_identity_v74(photo)
+        self._photo_editor_file_stamp_v74 = self._photo_file_stamp_v74(image_path)
+        self._set_photo_editor_enabled_v74(False)
         self.photo_status_var.set("")
-
         self.load_photo_in_viewer(image_path)
 
-        if center_map:
-            self.center_map_on_photo_if_needed(self.map_widget, lat, lon)
+        # Une erreur de carte ne peut pas invalider l'association photo/champs.
+        try:
+            self.refresh_map_markers()
+            if center_map:
+                self.center_map_on_photo_if_needed(self.map_widget, lat, lon)
+        except Exception as exc:
+            self.log(f"⚠️ Rafraîchissement de carte Photos : {exc}")
 
         try:
-            self.root.after(20, self.restore_photo_navigation_focus)
+            generation = self._viewer_load_generation
+            self.root.after(20, lambda: self.restore_photo_navigation_focus()
+                            if generation == self._viewer_load_generation else None)
         except Exception:
             pass
 
@@ -28273,6 +28507,11 @@ namespace GestionBissesFolderPicker
         generation = self._viewer_load_generation
         self.viewer_original_image = None
         self.viewer_display_image = None
+        self._photo_editor_ready_v74 = False
+        self._set_photo_editor_enabled_v74(False)
+        if self.viewer_canvas is not None:
+            self.viewer_canvas.delete("all")
+        owner = self._photo_editor_owner_v74
 
         if not os.path.exists(image_path):
             self.viewer_info_var.set("Image introuvable")
@@ -28293,8 +28532,6 @@ namespace GestionBissesFolderPicker
             except Exception as exc:
                 result_queue.put(("error", exc))
 
-        threading.Thread(target=worker, daemon=True).start()
-
         def poll():
             try:
                 kind, value = result_queue.get_nowait()
@@ -28307,7 +28544,7 @@ namespace GestionBissesFolderPicker
                 return
 
             # Une navigation plus récente gagne toujours.
-            if generation != self._viewer_load_generation:
+            if generation != self._viewer_load_generation or owner != self._photo_editor_owner_v74:
                 return
 
             if kind == "error":
@@ -28321,16 +28558,46 @@ namespace GestionBissesFolderPicker
             filename = os.path.basename(image_path)
             w, h = self.viewer_original_image.size
             self.viewer_info_var.set(f"{filename} · {w} × {h}px")
-            try:
-                self.viewer_canvas.after(100, self.viewer_fit_to_panel)
-            except Exception:
-                pass
-            self._finish_photo_open_activity_if_pending()
+            def present(attempt=0):
+                if (generation != self._viewer_load_generation or owner != self._photo_editor_owner_v74
+                        or owner != self._photo_identity_v74(self.current_photo)):
+                    return
+                if self._photo_busy_v74:
+                    self.root.after(30, lambda: present(attempt))
+                    return
+                try:
+                    visible = "viewer" in self.photo_workspace_visible_keys()
+                    if visible:
+                        if self.viewer_canvas.winfo_width() <= 1 or self.viewer_canvas.winfo_height() <= 1:
+                            if attempt < 100:
+                                self.root.after(30, lambda: present(attempt + 1))
+                                return
+                            raise RuntimeError("zone image indisponible")
+                        self.viewer_fit_to_panel()
+                    self._photo_editor_ready_v74 = True
+                    self._set_photo_editor_enabled_v74(True)
+                except Exception as exc:
+                    self._photo_editor_ready_v74 = False
+                    self._set_photo_editor_enabled_v74(False)
+                    self.photo_status_var.set(f"Image non affichable : {exc}")
+                finally:
+                    self._finish_photo_open_activity_if_pending()
+            present()
 
-        try:
+        def start_latest():
+            if generation != self._viewer_load_generation or owner != self._photo_editor_owner_v74:
+                return
+            running = getattr(self, "_photo_viewer_thread_v74", None)
+            if running is not None and running.is_alive():
+                self.root.after(40, start_latest)
+                return
+            thread = threading.Thread(target=worker, daemon=True)
+            self._photo_viewer_thread_v74 = thread
+            thread.start()
             self.root.after(60, poll)
-        except Exception:
-            pass
+
+        # Coalescer les demandes rapides : un seul décodage lourd à la fois.
+        self.root.after(60, start_latest)
 
 
     def viewer_render_image(self):
@@ -28617,171 +28884,168 @@ namespace GestionBissesFolderPicker
         )
 
     def save_current_photo_metadata(self, silent=False):
-        if self.current_photo is None:
-            if not silent:
-                messagebox.showwarning("Aucune photo", "Aucune photo sélectionnée.")
-            return
-
-        if self.photo_title_entry is None or self.photo_desc_text is None:
-            return
-
-        catalog_index = self.current_photo.get("catalog_index")
-        if catalog_index is None:
-            if not silent:
-                messagebox.showerror("Erreur", "Index catalogue introuvable.")
-            return
-
-        requested_title = self.photo_title_entry.get().strip()
-        requested_description = self.photo_desc_text.get("1.0", tk.END).strip()
-
+        if getattr(self, "_photo_busy_v74", False):
+            return False
+        self._photo_busy_v74 = True
         try:
-            # v73 : le catalogue est l'autorité métier. On le sauvegarde avant
-            # toute tentative de synchronisation physique vers le JPG afin qu'une
-            # incompatibilité EXIF ne puisse jamais faire perdre un texte saisi.
+            return self._save_photo_editor_v74(silent=silent)
+        finally:
+            self._photo_busy_v74 = False
+
+    def _save_photo_editor_v74(self, silent=False):
+        if self.current_photo is None or not self._photo_editor_ready_v74:
+            # Pas d'édition possible pendant un chargement ou après une invalidation.
+            return bool(silent)
+        if getattr(self, "read_only_mode", False):
+            return bool(silent)
+        owner = self._photo_editor_owner_v74
+        photo = self.current_photo
+        baseline = self._photo_editor_baseline_v74
+        guard = None
+        operation_id = None
+        origin = "navigation" if silent else "sauvegarde explicite"
+        catalogue_committed = False
+        try:
+            if owner is None or baseline is None or owner != self._photo_identity_v74(photo):
+                raise RuntimeError("Les champs ne correspondent pas à la photo active. Aucune écriture.")
+            values = self._photo_editor_values_v74()
+            changes = {k: {"before": baseline[k], "after": v} for k, v in values.items() if v != baseline[k]}
+            if not changes and silent:
+                return True
+            # Clic explicite : autorise une resynchronisation des textes en attente,
+            # sans réécriture de textes déjà synchronisés ou d'autres champs.
+            guard = self.acquire_active_bisse_write_guard_v71()
+            if not guard:
+                raise RuntimeError("Verrou de modification du bisse indisponible. Rouvrez le bisse.")
+            if owner != self._photo_editor_owner_v74 or owner != self._photo_identity_v74(self.current_photo):
+                raise RuntimeError("Contexte photo modifié avant la sauvegarde.")
             self.catalog_data = self.read_catalog()
-            if catalog_index >= len(self.catalog_data):
-                if not silent:
-                    messagebox.showerror("Erreur", "Index catalogue invalide.")
-                return
-
-            entry = self.catalog_data[catalog_index]
-            old_title = str(entry.get("title") or "").strip()
-            old_description = str(entry.get("description") or "").strip()
-            text_changed = (
-                old_title != requested_title
-                or old_description != requested_description
-            )
-
-            platform_selected = bool(self.platform_selected_var.get())
-            try:
-                platform_order = int(self.platform_order_var.get())
-            except Exception:
-                platform_order = 0
-
-            entry["title"] = requested_title
-            entry["description"] = requested_description
-            # Une modification explicite, ou un clic sur Sauvegarder, transforme
-            # aussi une chaîne vide en décision volontaire et persistante.
-            if text_changed or not silent:
-                entry["title_managed_by_abisses"] = True
-                entry["description_managed_by_abisses"] = True
-            entry["platform_selected"] = platform_selected
-            entry["platform_order"] = platform_order
-            self.save_catalog()
-
-            gps_payload = self._catalog_gps_payload_v73(entry)
-            should_sync_text = bool(
-                text_changed
-                or not silent
-                or entry.get("text_metadata_synced_to_jpg") is False
-            )
-            jpg_ok = True
-            jpg_message = "aucune modification texte à synchroniser"
-            if should_sync_text:
-                jpg_ok, jpg_message = self.write_text_metadata_to_jpg(
-                    self.current_photo.get("image_path", ""),
-                    requested_title,
-                    requested_description,
-                    gps_coords=gps_payload,
-                    gps_datetime=entry.get("date_taken"),
-                )
-
-            jpg_meta = self.read_text_metadata_from_jpg(self.current_photo.get("image_path", ""))
-            jpg_title = str(jpg_meta.get("title") or "") if jpg_meta.get("ok") else ""
-            jpg_description = str(jpg_meta.get("description") or "") if jpg_meta.get("ok") else ""
-            title_matches = bool(jpg_ok and jpg_meta.get("ok") and jpg_title.strip() == requested_title)
-            description_matches = bool(
-                jpg_ok and jpg_meta.get("ok") and jpg_description.strip() == requested_description
-            )
-
-            # Recharger le catalogue : l'écriture JPG peut être longue et un seul
-            # petit état de synchronisation doit être ajouté sans perdre le reste.
-            self.catalog_data = self.read_catalog()
-            entry = self.catalog_data[catalog_index]
-            if should_sync_text:
-                if title_matches and description_matches:
-                    entry["text_metadata_synced_to_jpg"] = True
+            index, entry = self._photo_resolve_entry_v74(self.catalog_data, owner)
+            expected = photo.get("_catalog_edit_snapshot_v74")
+            if expected is None or self._photo_catalog_snapshot_v74(entry) != expected:
+                raise RuntimeError("Les métadonnées du catalogue ont changé. Rouvrez l'atelier avant de modifier cette photo.")
+            pending = not silent and not changes and (entry.get("text_metadata_synced_to_jpg") is False or entry.get("ignore_jpg_description"))
+            text_fields = {k for k in ("title", "description") if k in changes}
+            if pending:
+                text_fields.update(k for k in ("title", "description") if entry.get(k + "_managed_by_abisses")
+                                   or str(entry.get(k) or "").strip()
+                                   or (k == "description" and entry.get("ignore_jpg_description")))
+            if not changes and not text_fields:
+                self.photo_status_var.set("Catalogue déjà à jour.")
+                return True
+            if not self._photo_editor_file_stamp_v74 or self._photo_file_stamp_v74(owner[3]) != self._photo_editor_file_stamp_v74:
+                raise RuntimeError("Le fichier image a changé depuis son affichage. Rouvrez Photos.")
+            operation_id = uuid.uuid4().hex
+            audit_changes = {k: dict(v, catalogue_before=entry.get(k)) for k, v in changes.items()}
+            self._photo_audit_v74(owner, operation_id, "intent", origin, changes=audit_changes)
+            for key in changes:
+                entry[key] = values[key]
+                if key in ("title", "description"):
+                    entry[key + "_managed_by_abisses"] = True
+            if text_fields:
+                entry["text_metadata_synced_to_jpg"] = False
+                entry["text_metadata_sync_error"] = "Synchronisation JPG en attente"
+                if "description" in text_fields:
+                    entry["ignore_jpg_description"] = True
+            if changes or text_fields:
+                self._save_catalog_payload_v71()
+                catalogue_committed = True
+            if owner != self._photo_identity_v74(self.current_photo) or owner != self._photo_editor_owner_v74:
+                raise RuntimeError("Contexte photo modifié pendant la sauvegarde.")
+            # L'éditeur reste lié au même instantané, y compris si l'EXIF échoue.
+            photo.update({k: values[k] for k in changes})
+            photo["catalog_title"] = entry.get("title", "")
+            photo["catalog_description"] = entry.get("description", "")
+            photo["_catalog_edit_snapshot_v74"] = self._photo_catalog_snapshot_v74(entry)
+            self._photo_editor_baseline_v74 = dict(values)
+            jpg_ok, jpg_message = True, "JPG inchangé"
+            if text_fields:
+                try:
+                    if self._photo_file_stamp_v74(owner[3]) != self._photo_editor_file_stamp_v74:
+                        raise RuntimeError("Le JPG a changé pendant la sauvegarde ; synchronisation annulée.")
+                    if guard:
+                        os.utime(guard, None)
+                    jpg_ok, jpg_message = self.write_photo_metadata_to_jpg_v73(
+                        owner[3], update_title="title" in text_fields, title=values["title"],
+                        update_description="description" in text_fields, description=values["description"],
+                        gps_coords=self._catalog_gps_payload_v73(entry), gps_datetime=entry.get("date_taken"))
+                    self._photo_editor_file_stamp_v74 = self._photo_file_stamp_v74(owner[3])
+                    jpg_meta = self.read_text_metadata_from_jpg(owner[3])
+                    jpg_ok = bool(jpg_ok and jpg_meta.get("ok") and all(
+                        str(jpg_meta.get(k) or "").strip() == str(values[k]).strip() for k in text_fields))
+                    if not jpg_ok and (not jpg_message or "validée" in jpg_message):
+                        jpg_message = "Relecture JPG non conforme"
+                except Exception as exc:
+                    jpg_ok, jpg_message = False, str(exc)
+                    jpg_meta = {}
+                # Un succès partiel ne doit pas effacer une divergence ancienne de l'autre champ.
+                all_text_matches = bool(jpg_ok and all(str(jpg_meta.get(k) or "").strip() == str(values[k]).strip()
+                                                     for k in ("title", "description")))
+                entry["text_metadata_synced_to_jpg"] = all_text_matches
+                if all_text_matches:
                     entry["text_metadata_synced_to_jpg_at"] = datetime.now().isoformat(timespec="seconds")
                     entry.pop("text_metadata_sync_error", None)
+                else:
+                    entry["text_metadata_sync_error"] = jpg_message if not jpg_ok else "Autre champ texte non synchronisé"
+                if "description" in text_fields and jpg_ok:
                     entry.pop("ignore_jpg_description", None)
-                else:
-                    entry["text_metadata_synced_to_jpg"] = False
-                    entry["text_metadata_sync_error"] = jpg_message
-                    if not description_matches:
-                        # Compatibilité avec les états v72a/v72b.
-                        entry["ignore_jpg_description"] = True
-            self.save_catalog()
-
-            # L'interface suit toujours l'autorité du catalogue, jamais une vieille
-            # valeur EXIF qui aurait survécu à une écriture impossible.
-            self.current_photo["title"] = requested_title
-            self.current_photo["description"] = requested_description
-            self.current_photo["jpg_title"] = jpg_title
-            self.current_photo["jpg_description"] = jpg_description
-            self.current_photo["catalog_title"] = requested_title
-            self.current_photo["catalog_description"] = requested_description
-            self.current_photo["title_managed_by_abisses"] = bool(entry.get("title_managed_by_abisses", False))
-            self.current_photo["description_managed_by_abisses"] = bool(entry.get("description_managed_by_abisses", False))
-            self.current_photo["ignore_jpg_description"] = bool(entry.get("ignore_jpg_description", False))
-            self.current_photo["metadata_source"] = "catalogue.json"
-            self.current_photo["platform_selected"] = platform_selected
-            self.current_photo["platform_order"] = platform_order
-
-            for photo in list(getattr(self, "photo_all_geolocated_photos", []) or []):
-                if photo.get("catalog_index") == catalog_index:
-                    photo["title"] = requested_title
-                    photo["description"] = requested_description
-                    photo["jpg_title"] = jpg_title
-                    photo["jpg_description"] = jpg_description
-                    photo["catalog_title"] = requested_title
-                    photo["catalog_description"] = requested_description
-                    photo["title_managed_by_abisses"] = bool(entry.get("title_managed_by_abisses", False))
-                    photo["description_managed_by_abisses"] = bool(entry.get("description_managed_by_abisses", False))
-                    photo["ignore_jpg_description"] = bool(entry.get("ignore_jpg_description", False))
-                    photo["metadata_source"] = "catalogue.json"
-                    photo["platform_selected"] = platform_selected
-                    photo["platform_order"] = platform_order
-
-            self.photo_title_entry.delete(0, tk.END)
-            self.photo_title_entry.insert(0, requested_title)
-            self.photo_desc_text.delete("1.0", tk.END)
-            self.photo_desc_text.insert("1.0", requested_description)
-
-            self.refresh_photo_filter_menu_v72()
-            self.refresh_photo_cleanup_menu_v72()
-            saved_filename = self.current_photo.get("filename")
-            leaves_current_filter = (
-                not silent
-                and getattr(self, "photo_filter_mode", "all") != "all"
-                and not self.photo_matches_filter_v72(self.current_photo)
-            )
-
+                if jpg_meta.get("ok"):
+                    photo["jpg_title"] = jpg_meta.get("title", "")
+                    photo["jpg_description"] = jpg_meta.get("description", "")
+                self._save_catalog_payload_v71()
+            for key in ("title_managed_by_abisses", "description_managed_by_abisses", "ignore_jpg_description"):
+                photo[key] = bool(entry.get(key))
+            photo["_catalog_edit_snapshot_v74"] = self._photo_catalog_snapshot_v74(entry)
+            photo["metadata_source"] = "catalogue.json"
+            photo["catalog_index"] = index
+            self._photo_audit_result_v74(owner, operation_id, origin, {"catalogue": True, "jpg": jpg_ok if text_fields else None, "detail": jpg_message})
             if not silent:
-                if not should_sync_text:
-                    self.photo_status_var.set("✅ Catalogue déjà à jour.")
-                elif title_matches and description_matches:
-                    self.photo_status_var.set(
-                        "✅ Sauvegardé dans Abisses et synchronisé dans le JPG (écriture EXIF validée)."
-                    )
-                    self.log(f"💾 Métadonnées Abisses + JPG sauvegardées : {saved_filename}")
-                else:
-                    self.photo_status_var.set(
-                        f"⚠️ Sauvegardé dans Abisses ; synchronisation JPG impossible : {jpg_message}"
-                    )
-                    self.log(
-                        f"⚠️ Métadonnées Abisses conservées, JPG non synchronisé pour "
-                        f"{saved_filename} : {jpg_message}"
-                    )
-
-                if leaves_current_filter:
+                self.photo_status_var.set("Sauvegardé dans Abisses" + (" et dans le JPG." if text_fields and jpg_ok else "."))
+            if not jpg_ok:
+                self.photo_status_var.set(f"Sauvegardé dans Abisses ; JPG non synchronisé : {jpg_message}")
+                self.log(f"⚠️ JPG non synchronisé : {owner[3]} — {jpg_message}")
+            # Libérer le verrou avant toute transition d'interface.
+            if guard:
+                self.short_data_lock_release(guard)
+                guard = None
+            try:
+                self.refresh_photo_filter_menu_v72()
+                self.refresh_photo_cleanup_menu_v72()
+                if not silent and not self.photo_matches_filter_v72(photo):
                     self.apply_photo_filter_v72(center_map=False)
-
-        except Exception as e:
+            except Exception as exc:
+                self.log(f"⚠️ Actualisation Photos : {exc}")
+            return True
+        except Exception as exc:
+            if operation_id is not None:
+                try:
+                    if owner[:2] == (self._photo_path_v74(self.base_folder), self._photo_path_v74(self.catalog_path)):
+                        self.catalog_data = self.read_catalog()
+                        # After partial success, refresh the comparison snapshot without losing the draft.
+                        _, actual = self._photo_resolve_entry_v74(self.catalog_data, owner)
+                        photo["_catalog_edit_snapshot_v74"] = self._photo_catalog_snapshot_v74(actual)
+                except Exception:
+                    pass
+                self._photo_audit_result_v74(owner, operation_id, origin, {"catalogue": catalogue_committed, "error": str(exc)})
+            self.photo_status_var.set(f"Sauvegarde interrompue : {exc}")
+            self.log(f"⚠️ Sauvegarde Photos bloquée : {exc}")
             if not silent:
-                messagebox.showerror("Erreur", str(e))
-            self.log(f"❌ Erreur sauvegarde métadonnées photo : {e}")
+                messagebox.showerror("Sauvegarde Photos", str(exc))
+            return False
+        finally:
+            if guard:
+                self.short_data_lock_release(guard)
 
     def discard_current_photo(self):
+        if self._photo_busy_v74 or not self._photo_editor_ready_v74 or self.read_only_mode:
+            return
+        self._photo_busy_v74 = True
+        try:
+            return self._discard_current_photo_v74()
+        finally:
+            self._photo_busy_v74 = False
+
+    def _discard_current_photo_v74(self):
         """
         Écarte la photo actuellement affichée.
 
@@ -28811,6 +29075,7 @@ namespace GestionBissesFolderPicker
             return
 
         filename = os.path.basename(image_path)
+        owner = self._photo_editor_owner_v74
 
         if not messagebox.askyesno(
             "Écarter cette photo ?",
@@ -28823,15 +29088,21 @@ namespace GestionBissesFolderPicker
         ):
             return
 
+        guard = None
+        moved = False
+        committed = False
+        target_path = None
         try:
             # Sauvegarde silencieuse des métadonnées en cours avant déplacement.
-            self.save_current_photo_metadata(silent=True)
-
-            self.catalog_data = self.read_catalog()
-
-            if catalog_index >= len(self.catalog_data):
-                messagebox.showerror("Erreur", "Index catalogue invalide.")
+            if owner != self._photo_identity_v74(self.current_photo) or not self._save_photo_editor_v74(silent=True):
                 return
+            guard = self.acquire_active_bisse_write_guard_v71()
+            if not guard:
+                raise RuntimeError("Verrou de modification indisponible.")
+            self.catalog_data = self.read_catalog()
+            catalog_index, entry = self._photo_resolve_entry_v74(self.catalog_data, owner)
+            if not self._photo_editor_file_stamp_v74 or self._photo_file_stamp_v74(image_path) != self._photo_editor_file_stamp_v74:
+                raise RuntimeError("Le JPG a changé depuis l'affichage ; écartement bloqué.")
 
             trash_folder = os.path.join(self.base_folder, "Photos_supprimees")
             os.makedirs(trash_folder, exist_ok=True)
@@ -28854,6 +29125,7 @@ namespace GestionBissesFolderPicker
                     counter += 1
 
             os.rename(image_path, target_path)
+            moved = True
 
             entry = self.catalog_data[catalog_index]
 
@@ -28865,24 +29137,28 @@ namespace GestionBissesFolderPicker
 
             # On garde les métadonnées, mais la photo n'apparaîtra plus dans la carte,
             # car load_geolocated_photos ignore les entrées dont status != OK.
-            self.save_catalog()
+            self._save_catalog_payload_v71()
+            committed = True
+            self.short_data_lock_release(guard)
+            guard = None
 
             self.log(f"🗑️ Photo écartée : {filename} -> {self.relative_to_base(target_path)}")
 
             old_photo = self.current_photo
-            old_index = self.geolocated_photos.index(old_photo)
+            old_index = next(i for i, p in enumerate(self.geolocated_photos) if p is old_photo)
 
             self.geolocated_photos = [
                 p for p in self.geolocated_photos
-                if p.get("catalog_index") != catalog_index
+                if self._photo_identity_v74(p) != owner
             ]
             self.photo_all_geolocated_photos = [
                 p for p in getattr(self, "photo_all_geolocated_photos", [])
-                if p.get("catalog_index") != catalog_index
+                if self._photo_identity_v74(p) != owner
             ]
             self.refresh_photo_filter_menu_v72()
             self.refresh_photo_cleanup_menu_v72()
 
+            self._invalidate_photo_editor_v74()
             self.current_photo = None
 
             if not self.geolocated_photos:
@@ -28899,21 +29175,37 @@ namespace GestionBissesFolderPicker
                     "Tri terminé",
                     "Il n'y a plus de photos géolocalisées à afficher."
                 )
-                self.load_folder(self.base_folder)
+                self.clear_photo_display_v72()
+                folder = self.base_folder
+                self.root.after_idle(lambda: self.load_folder(folder) if self.base_folder == folder else None)
                 return
 
             new_index = min(old_index, len(self.geolocated_photos) - 1)
 
-            self.refresh_map_markers()
-            self.select_photo_on_map(self.geolocated_photos[new_index])
+            self._select_photo_v74(self.geolocated_photos[new_index], flush=False)
 
             self.photo_status_var.set(
                 f"🗑️ Photo écartée dans Photos_supprimees : {filename}"
             )
 
         except Exception as e:
-            messagebox.showerror("Erreur", str(e))
+            if moved and not committed:
+                try:
+                    self.catalog_data = self.read_catalog()
+                    # Si le statut est resté OK, la transaction catalogue n'a pas abouti.
+                    if self.catalog_data[catalog_index].get("status") == "OK" and not os.path.exists(image_path):
+                        os.rename(target_path, image_path)
+                except Exception as exc:
+                    self.log(f"⚠️ Vérifier le déplacement {image_path} : {exc}")
+            self._invalidate_photo_editor_v74()
+            self.current_photo = None
+            self.geolocated_photos = []
+            self.photo_all_geolocated_photos = []
+            messagebox.showerror("Erreur", f"{e}\nRouvrez l'atelier Photos.")
             self.log(f"❌ Erreur lors de l'écartement de la photo : {e}")
+        finally:
+            if guard:
+                self.short_data_lock_release(guard)
 
     def center_on_current_photo(self):
         if self.current_photo is None or not self.map_widget:
@@ -28986,28 +29278,22 @@ namespace GestionBissesFolderPicker
         ).grid(row=2, column=0, sticky="e", pady=(10, 0))
 
     def select_previous_photo(self):
-        if not self.geolocated_photos or self.current_photo is None:
+        if self._photo_busy_v74 or not self.geolocated_photos:
             return
+        current_index = next((i for i, p in enumerate(self.geolocated_photos) if p is self.current_photo), None)
+        if current_index is None:
+            return
+        self.select_photo_on_map(self.geolocated_photos[(current_index + (-1)) % len(self.geolocated_photos)])
 
-        current_index = self.geolocated_photos.index(self.current_photo)
-        new_index = current_index - 1
-
-        if new_index < 0:
-            new_index = len(self.geolocated_photos) - 1
-
-        self.select_photo_on_map(self.geolocated_photos[new_index])
 
     def select_next_photo(self):
-        if not self.geolocated_photos or self.current_photo is None:
+        if self._photo_busy_v74 or not self.geolocated_photos:
             return
+        current_index = next((i for i, p in enumerate(self.geolocated_photos) if p is self.current_photo), None)
+        if current_index is None:
+            return
+        self.select_photo_on_map(self.geolocated_photos[(current_index + (1)) % len(self.geolocated_photos)])
 
-        current_index = self.geolocated_photos.index(self.current_photo)
-        new_index = current_index + 1
-
-        if new_index >= len(self.geolocated_photos):
-            new_index = 0
-
-        self.select_photo_on_map(self.geolocated_photos[new_index])
 
 
 def run_packaged_self_test():
